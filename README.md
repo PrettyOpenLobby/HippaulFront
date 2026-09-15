@@ -13,8 +13,8 @@ client install; the game's own tables are rebuilt from it (below).
 
 ## What it does today
 
-Worked out and played on a private deployment with a PC client. On this
-stack a pilot can:
+Tested on a private deployment with a PC client. On this stack a pilot
+can:
 
 - log in through the core, watch the opening cutscene with its cast, and walk
   the headquarters lobby with its NPCs and name tags;
@@ -29,11 +29,13 @@ stack a pilot can:
 
 What it does not do: combat itself. The practice target cannot be destroyed
 (hits are applied client-side to units the shooter owns, and no exchange
-between two clients has been closed on a screen), so a sortie is an entry,
-a walk and an exit. The campaign cutscenes are staged, not watched through.
+between two clients has been seen on a screen), so a sortie is a walk
+around the arena and back out. The campaign cutscenes are set up but have
+not been watched through.
 Play between two humans in one lobby works; two in one battle is untested.
-The PlayStation 2 client reaches the lobby but renders its lobby map as a
-void (it ships a different map set); that is an open question, not a setting.
+The PlayStation 2 client reaches the lobby but renders its lobby map as an
+empty void. It ships a different map set from the PC client, and which map
+numbers it has is still unknown.
 
 ## How it fits the core
 
@@ -78,8 +80,8 @@ catalogue beyond the built-in rows, no editor overlays.
 
 ## Configuration
 
-Front Mission Online on this server grew up as a probe harness: about three
-hundred `FMO_*` environment knobs decide what is served. The values a fresh
+About three hundred `FMO_*` environment variables decide what this server
+serves; they were added one at a time while the protocol was worked out. The values a fresh
 server runs with are the private deployment's, listed in `services/fmo.py`
 (`RELEASE_DEFAULTS`); `docker-compose.yml` carries only the deployment-shaped
 ones. To change a knob, set it in `.env` and add it to the `fmo` service's
