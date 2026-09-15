@@ -1,0 +1,47 @@
+event	p1	answer	set	note
+# fmo-events.tsv -- what the SERVER does with a script's server call (0x0159).
+#
+# A lobby script calls syscall 0xE220 {event, params[16]}; the client sends the
+# record as 0x0159 and the script's 0xE222 reads the 16 params back out of the
+# record AFTER our reply -- so SE's server answered by pushing the processed
+# record in 0x015A (+0xAD8 = 0) and then acking. The rule for each event lived
+# on SE's server and is not in the client; this file is where it lives now.
+#
+# Columns (tab-separated):
+#   event   the u32 at record+0x000 (decimal or 0x..)
+#   p1      the first param the row matches, or * for any
+#   answer  pN=<expr>[;pN=<expr>]   rewrite param N in the answered record;
+#           <expr> = int | pM | flag[pM] | flag[<idx>]  (the pilot's flag byte)
+#   set     FMO_STATUS_FLAGS grammar on the pilot's flags: 128=99 (byte), 173
+#           (bit); pM is allowed as an index, so p1=99 = "set the byte the
+#           script named to 99"
+#   note    free text, logged when the row fires
+# A row that changes nothing for a pilot is a plain ack. Rows starting with #
+# are comments. There are NO active rows shipped: every candidate below is
+# INFERRED from the captures + the missions table and enabling one is a live
+# test whose bar is the script's next branch, not the log line.
+#
+# The helper library (D87/D63/D65 0x740..) classifies the events by whether the script
+# READS the answer (fmoscriptdis, 2026-09-11):
+#   NOTIFY (one arg, answer never read): 200, 201, 204, 205, 208 -- server-side effects
+#   QUERY  (answer read):  101 () -> p1 ; 104 (p1) -> p1 ; 105 (p1) -> p1, p2
+# So a `set` row fits a NOTIFY event and an `answer` row fits a QUERY event.
+#
+# What the captures say (logs/captures/fmo-0159-*.bin, 2026-09-05..09-11):
+#   101  []               at lobby entry (srv_101 in every script's helper
+#                         library, AI/F00/D87.DAT 0x740): the script tests the
+#                         answered p1 != 0 and only then runs a second call.
+#   104  [130]            Kwangsu Son: 130 = own_byte of "Enemy Unit
+#                         Annihilation" (fmo-missions.tsv). srv_104(p) RETURNS
+#                         the answered p1 to its caller. Candidate: the server
+#                         answers the mission's progress byte.
+#   200  [16, 104, 130]   the Map Selector (tag_mapslct_01) with Son's mission
+#   205  [34, 104, 130]   the senior sergeant (tag_senior / registration)
+#   102  [0, row, col, a, b]  a sector (row*1000+col tile) -- the war map
+#
+# Candidates (uncomment ONE, recreate fmo, talk to the NPC, read the branch):
+#104	*	p1=flag[p1]		answer a mission's progress byte (0 = not started, 99 = done)
+# ARMED 2026-09-11 (live test): a pilot whose byte 128 != 99 talks to the sergeant -> the
+# answered 0x015A carries 128=99 -> the next counter talks. Existing pilots already at 99
+# get a plain ack (the row changes nothing for them).
+205	*		128=99	the sergeant registers the pilot (byte 128 == 99 is every counter's gate)

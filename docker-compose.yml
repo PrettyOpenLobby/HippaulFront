@@ -1,0 +1,90 @@
+# Front Mission Online game service. Requires the core lobby stack (openlobby)
+# running on the same Docker host: this compose joins its data volume (the
+# shared account and session database, and this title's own player database
+# beside it) and its logs volume.
+#
+#   1. python tools/gen_blowfish_tables.py                        (once)
+#   2. python tools/fmodata_build.py --client <your FMO install>  (once)
+#   3. cp .env.example .env    # set POL_ADVERTISE to your server's LAN/VPN IP
+#      docker compose up -d --build
+#
+# The client discovers this service through the core lobby (content id 4 in
+# the games menu) and dials fmo01.pol.com:61300, which the core's DNS answers
+# with the advertised address.
+
+# fmo owns the image build; the optional services consume it with
+# pull_policy: never so parallel builds cannot race on the tag.
+x-app: &app
+  image: crystalfront:latest
+  pull_policy: never
+  restart: unless-stopped
+  environment: &appenv
+    POL_ADVERTISE: "${POL_ADVERTISE:-}"
+    POL_ACCOUNTS_DB: /data/accounts.db
+    POL_LOG_DIR: /logs
+    PYTHONUNBUFFERED: "1"
+  volumes:
+    - pol-data:/data
+    - pol-logs:/logs
+
+volumes:
+  pol-data:
+    external: true
+    name: openlobby_pol-data
+  pol-logs:
+    external: true
+    name: openlobby_pol-logs
+  fmo-board-state:
+
+services:
+  # THE WORLD RESPONDER: the TCP session the client holds for the whole of
+  # its time in the lobby, and the UDP world channel beside it (both 61300).
+  # Every FMO_* game knob has its release default inside fmo.py; only the
+  # deployment-shaped values are set here. To override a knob, add it to
+  # this list (compose enumerates what reaches the container) and set it in
+  # .env.
+  fmo:
+    <<: *app
+    build: ./services
+    pull_policy: build
+    entrypoint: ["python", "fmo.py"]
+    environment:
+      <<: *appenv
+      # the endpoints handed to the client in the join grant
+      FMO_BATTLE_HOST: "${POL_ADVERTISE:-127.0.0.1}"
+      FMO_NEXT_HOST: "${POL_ADVERTISE:-127.0.0.1}"
+      # the player database, the character store and the war state
+      FMO_DB: /data/fmo.db
+      FMO_CHAR_STORE: /data/fmo_characters.json
+      FMO_WAR_STATE: /data/fmowar.json
+      FMO_NPC_LAYOUT: /data/fmo_npc_layout.json
+      # the lobby NPC editor: set FMO_DEVTOOL_PORT=8798 and use --profile
+      # editor to reach it; it refuses a LAN bind without FMO_DEVTOOL_TOKEN
+      FMO_DEVTOOL_PORT: "${FMO_DEVTOOL_PORT:-}"
+      FMO_DEVTOOL_BIND: "${FMO_DEVTOOL_BIND:-}"
+      FMO_DEVTOOL_TOKEN: "${FMO_DEVTOOL_TOKEN:-}"
+    ports:
+      - "61300:61300"
+      - "61300:61300/udp"
+      - "127.0.0.1:8798:8798"
+
+  # Optional: the City Control board, a web page of the war (the nineteen
+  # cities, who holds them, the phase clock), read-only over the war state.
+  # The backdrop needs art baked from your own client (README.md).
+  #   docker compose --profile board up -d
+  board:
+    <<: *app
+    profiles: ["board"]
+    entrypoint: ["python", "polboards.py", "--bind", "0.0.0.0",
+                 "--fmo-port", "8792"]
+    environment:
+      <<: *appenv
+      POL_DATA_DIR: /data
+      POL_BOARDS_STATE_DIR: /state
+      POL_BOARDS_FMO_URL: "${POL_BOARDS_FMO_URL:-}"
+      POL_BOARDS_FMO_DISCORD_WEBHOOK: "${POL_BOARDS_FMO_DISCORD_WEBHOOK:-}"
+    ports:
+      - "127.0.0.1:8792:8792"
+    volumes:
+      - pol-data:/data:ro
+      - fmo-board-state:/state
