@@ -69,6 +69,16 @@ cp .env.example .env      # set POL_ADVERTISE to your server's LAN/VPN IP
 docker compose up -d --build
 ```
 
+Without building: the image is published to
+`ghcr.io/prettyopenlobby/crystalfront` on every push (it carries the cipher
+tables, so step 1 is not needed); step 2 still runs on the host, and the
+override mounts your `services/fmodata/` (and the baked board art) into the
+containers:
+
+```
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
+```
+
 Step 2 writes `services/fmodata/`: the rank ladder and class experience
 curve (`fmo-ranks.tsv`, `fmo-class-exp.tsv`), the cosmetics, insignia,
 mission and cutscene catalogues, and the lobby editor's floor plans, NPC keys
