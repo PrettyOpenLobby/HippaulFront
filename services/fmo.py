@@ -3682,6 +3682,89 @@ GROUP_HOST = os.environ.get("FMO_GROUP_HOST", BATTLE_HOST)
 GROUP_PORT = _env_int("FMO_GROUP_PORT", "61300", 10)
 
 
+# ---- the address a client is handed, chosen per client ---------------------
+# FMO_NEXT_HOST / FMO_BATTLE_HOST are ONE address, and on prod that is the
+# box's Tailscale address. A PC on the tailnet reaches it. A console on the
+# LAN does not: measured 2026-09-21 with a real PS2 on the LAN, which
+# sent 0x0065 and 0x0321, was answered "REDIRECT to 127.0.0.1:61300" and sat
+# on "connecting" for good. The login service learned this on 2026-09-18
+# (srvcore.advertise_for); this is the same rule, kept local because this
+# module imports nothing of ours:
+#
+#   1. POL_ADVERTISE_LAN, when set, for a peer inside POL_ADVERTISE_LAN_CLIENTS
+#      (default RFC1918).
+#   2. otherwise, when the configured address is OFF the LAN and the peer is
+#      RFC1918: the local address the kernel would use to reach that peer. A
+#      UDP connect() sends nothing; it only resolves the route. On prod (host
+#      networking) that is 127.0.0.1 for the console.
+#   3. otherwise the configured address, exactly as before.
+#
+# The UDP keys are a hash of the endpoint the client was handed, so whatever
+# is chosen here has to be chosen again where the keys are derived
+# (WorldChannel.candidates), from the datagram's own source address.
+import ipaddress as _ipaddress
+
+_RFC1918_NETS = tuple(_ipaddress.ip_network(n) for n in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))  # generic RFC1918 example; polcheck: allow
+
+
+def _ip_or_none(text):
+    try:
+        a = _ipaddress.ip_address(text)
+    except (ValueError, TypeError):
+        return None
+    return getattr(a, "ipv4_mapped", None) or a
+
+
+def _is_rfc1918(a):
+    return a is not None and any(a in n for n in _RFC1918_NETS)
+
+
+def _lan_client_nets():
+    nets = []
+    for c in (os.environ.get("POL_ADVERTISE_LAN_CLIENTS") or "").split(","):
+        c = c.strip()
+        if not c:
+            continue
+        try:
+            nets.append(_ipaddress.ip_network(c, strict=False))
+        except ValueError:
+            pass
+    return nets or list(_RFC1918_NETS)
+
+
+def host_for(default, peer_ip):
+    """The host to write into a reply for the client at `peer_ip`. Never raises."""
+    peer = _ip_or_none(peer_ip)
+    if peer is None or peer.is_loopback:
+        return default
+    # Rule 0 (2026-09-21, the edge VPS -- deploy/edge, and the same rule in
+    # srvcore.advertise_for): the VPS forwards internet players with their own
+    # source address, so a GLOBAL peer came through it and can only dial it.
+    # Tailnet (127.0.0.1/10 is not global) and LAN peers fall through. The UDP
+    # side stays in step because WorldChannel.candidates calls this too, with
+    # the datagram's source, which the edge also leaves intact.
+    public_ip = (os.environ.get("POL_ADVERTISE_PUBLIC") or "").strip()
+    if public_ip and peer.is_global:
+        return public_ip
+    lan_ip = (os.environ.get("POL_ADVERTISE_LAN") or "").strip()
+    if lan_ip and any(peer in n for n in _lan_client_nets()):
+        return lan_ip
+    if _is_rfc1918(peer) and not _is_rfc1918(_ip_or_none(default)):
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect((str(peer), 9))
+                src = probe.getsockname()[0]
+            finally:
+                probe.close()
+        except OSError:
+            return default
+        if _is_rfc1918(_ip_or_none(src)):
+            return src
+    return default
+
+
 #: The MapKind bands, transcribed from the five predicate functions listed in the
 #: 0x0150 note. This is the client's own arithmetic, so it is the one thing here
 #: that can be asserted rather than probed -- and its real job is to make an
@@ -4033,7 +4116,7 @@ def advance_sweep():
 
 
 def reply_0153(fill=None, mapkind=None, mapno=None, pilotpos=None, csn=None,
-               field18=None):
+               field18=None, host=None):
     """The 380-byte 0x0153 payload. `fill=False` is the all-zero control.
 
     `field18` overrides the +0x18 zone kind (globals+0x1AC: 0 lobby, 1 room,
@@ -4042,7 +4125,9 @@ def reply_0153(fill=None, mapkind=None, mapno=None, pilotpos=None, csn=None,
         return bytes(REPLY_0153_LEN)
     b = bytearray(REPLY_0153_LEN)
     _ep = endpoint_net if EP_0153_NET else endpoint
-    b[R153_ENDPOINT:R153_ENDPOINT + ENDPOINT_LEN] = _ep(BATTLE_HOST,
+    # `host` is the per-client address (host_for); None keeps the global one,
+    # which is what every selftest and tool caller wants.
+    b[R153_ENDPOINT:R153_ENDPOINT + ENDPOINT_LEN] = _ep(host or BATTLE_HOST,
                                                              BATTLE_PORT)
     struct.pack_into("<H", b, R153_MAPKIND,
                      (MAPKIND if mapkind is None else mapkind) & 0xFFFF)
@@ -11175,7 +11260,8 @@ class Session:
                     f"of 0 on a slot names the id that does not exist")
             outs = [build(MSG_0150_REPLY,
                            reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
-                                      csn=csn),
+                                      csn=csn,
+                                      host=host_for(BATTLE_HOST, self.ip)),
                            self.reply_seq(), p["conn"])]
             # KEY: MEASURED TWICE, 2026-09-04. This is WORLD ENTRY, a different
             # grant from the Move handler's, and it runs the same lobby reset
@@ -11571,7 +11657,8 @@ class Session:
                     f"send the day this needs to fail cleanly.")
             outs = [build(MSG_0150_REPLY,
                           reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
-                                     csn=csn, field18=kind),
+                                     csn=csn, field18=kind,
+                                     host=host_for(BATTLE_HOST, self.ip)),
                           self.reply_seq(), p["conn"])]
             # KEY: CITY-TABLE ORDERING (measured 2026-08-27 03:56Z): the client's
             # 0x01AC came IN THE LOBBY, so the 0x019A push filled lobby+0x6C36
@@ -11759,7 +11846,8 @@ class Session:
             payload = bytearray(CRED_REPLY_LEN)
             # payload +0x08 == packet +0x1C == field D == key bytes 16..19.
             payload[0x08:0x0C] = SERVER_KEY_TAIL
-            ep = endpoint(NEXT_HOST, NEXT_PORT)
+            next_host = host_for(NEXT_HOST, self.ip)
+            ep = endpoint(next_host, NEXT_PORT)
             payload[EP1_OFF:EP1_OFF + ENDPOINT_LEN] = ep
             payload[EP2_OFF:EP2_OFF + ENDPOINT_LEN] = ep
             if SESSION_TOKEN:
@@ -11773,7 +11861,8 @@ class Session:
                     f"path builders, and 0x0130's Start Game path uses "
                     f"lobby+0x1DC, not this. FMO_SESSION_TOKEN=0 sends 0.")
             log(f"{self.peer}   -> cred-reply 0x0322: REDIRECT to "
-                f"{NEXT_HOST}:{NEXT_PORT} in both endpoints; key tail "
+                f"{next_host}:{NEXT_PORT} in both endpoints"
+                f"{'' if next_host == NEXT_HOST else ' (per-client: FMO_NEXT_HOST is ' + NEXT_HOST + ')'}; key tail "
                 f"{SERVER_KEY_TAIL.hex()}")
             log(f"{self.peer}   WARNING: both endpoints get the same address on purpose "
                 f"-- endpoint 2's role is NOT known. Pointing them here means a "
@@ -11871,7 +11960,8 @@ class Session:
                 f"terrain is one of the 281 TYPE-1 files and is reached "
                 f"through the sortie, not through this grant.")
             outs = [build(MSG_0150_REPLY,
-                          reply_0153(mapkind=zone, mapno=_mn),
+                          reply_0153(mapkind=zone, mapno=_mn,
+                                     host=host_for(BATTLE_HOST, self.ip)),
                           p["seq"], p["conn"])]
             # KEY: MEASURED 2026-09-05 (static, 0x611796EF): after copying the
             # block the Change Area arm DESTROYS the world manager
@@ -12717,7 +12807,8 @@ class Session:
                     and time.time() - getattr(self, "sortie_push_grant_at", 0)
                     >= SORTIE_PUSH_DELAY):
                 self.sortie_push_pending = False
-                push = sortie_push_packet(p["conn"])
+                push = sortie_push_packet(p["conn"], host=host_for(
+                    SORTIE_HOST or BATTLE_HOST, self.ip))
                 if push is None:
                     _mn, _src = sortie_push_mapno()
                     log(f"{self.peer}   WARNING: 0x{MSG_SORTIE_PUSH:04X} AUTO-SORTIE "
@@ -13503,7 +13594,8 @@ class Session:
             # RESUME, or the war map never opened) this is FMO_SORTIE_MAPNO,
             # exactly as every sortie before 2026-09-08.
             _mn = str(self.sector[2]) if self.sector else None
-            body = reply_013a(mapno=_mn)
+            body = reply_013a(mapno=_mn, host=host_for(
+                SORTIE_HOST or BATTLE_HOST, self.ip))
             if body is None:
                 why = next(s for l, _o, r, s in sortie_fields(mapno=_mn)
                            if l == "MapNo")
@@ -18176,7 +18268,10 @@ class WorldChannel:
             self.tx_base = peer_ack
 
     def candidates(self):
-        ep = (endpoint_net if EP_0153_NET else endpoint)(BATTLE_HOST, BATTLE_PORT)
+        # The host this datagram's sender was handed in 0x0153: the same
+        # choice, made from the same address, so the keys agree.
+        _h = host_for(BATTLE_HOST, self.addr[0] if self.addr else None)
+        ep = (endpoint_net if EP_0153_NET else endpoint)(_h, BATTLE_PORT)
         ids = UDP_KEY_IDS or list(range(1, max(LIST_COUNT, 1) + 1)) + [0]
         # Scene 4's battle UDP manager keys "%xbattle" from the SAME endpoint
         # struct (served again in the 0x014E push, FMO_SORTIE_HOST/PORT
