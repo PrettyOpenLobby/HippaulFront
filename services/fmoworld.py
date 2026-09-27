@@ -1618,10 +1618,16 @@ def parse_hit_batch(body):
 
 
 def record_hit(target, part=0, value=0, flags=0, died=False, extra=b""):
-    """cmd 29 -- ONE 0x24-byte hit record authored by the server: the path an
-    NPC (or the referee) damages a PLAYER by, since a client applies a received
-    record only to its own unit. Fields per the layout above; `extra` overlays
-    bytes we have not decoded (+0x10.., +0x1C..) for a probe."""
+    """cmd 29 -- ONE 0x24-byte hit record authored by the server. Fields per
+    the layout above; `extra` overlays bytes we have not decoded (+0x10..,
+    +0x1C..) for a probe.
+
+    WARNING: CORRECTED (static decode):
+    this is NOT a way to damage the PLAYER. A received cmd 29 is applied only
+    to NETWORK-DRIVEN copies ([unit+0x1340] == 2, 0x611EE878), and the
+    player's own unit is 1340 == 1, not 2 as this module used to say. It CAN
+    damage a server-popped enemy (a mode-2 copy on the player's screen). The
+    player is hurt by its own client resolving an incoming cmd 30 shot."""
     b = bytearray(HIT_LEN)
     b[HIT_KIND] = 1
     struct.pack_into("<h", b, HIT_VALUE, int(value))

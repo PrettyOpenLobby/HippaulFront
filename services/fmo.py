@@ -1372,6 +1372,20 @@ MB_ARMYDIRECT = 0x01C                  # 4 x f32
 MB_RECTGROUPCNT = 0x02C                # u32
 MB_RECTDATACNT = 0x030                 # u32
 MB_START_GAMETIME = 0x048              # u32
+#: KEY: THE BATTLE START, Unix SECONDS -> lobby+0x5CC6 (static 2026-09-27). The
+#: client records the Battle Review itself (kycli_btlreview.cpp, recorder
+#: 0x613C0AAC -> /btlreview/<token>/brdata000.dat), stamping every 5 s frame
+#: with clock_ms - start*1000 (0x61160F70, clamped at 0). We served 0, so each
+#: frame carried the low 32 bits of the Unix-ms clock -- NEGATIVE from about
+#: 09-09 to 10-02, i.e. every frame 0 -- and the reader (0x61161480), whose
+#: bounds are the first and last frame times, stopped on its first tick (live
+#: playback: it stops at once and the points do not move). A constant 0 also
+#: made every battle's header match the old file (state 4 -> 8), so battles
+#: APPENDED to one file. Stamped on every sortie block (FMO_BATTLE_START_TIME,
+#: default on); never later than the real start or frames clamp back to 0.
+#: Also feeds the HUD elapsed clock (0x61164600) and, once nonzero, can make
+#: the client upload a text log as 0x01A5 (0x6115FAE3 -> 0x61174510).
+BATTLE_START_TIME = os.environ.get("FMO_BATTLE_START_TIME", "1") not in ("0", "")
 MB_LD = 0x05A                          # u8, 'ld=%u00ms'
 MB_PENALTY = 0x05B                     # u8, 'penalty=%u000ms'
 #: VERIFIED:KEY: THE BATTLE TIME LIMIT, decoded 2026-09-08 live. NOT in SE's own debug
@@ -1427,6 +1441,12 @@ MB_TIMELIMIT = 0x04C                   # u32 SECONDS -> lobby+0x5CCA
 #: only) is false EVERYWHERE, the map centre included. That is the whole of
 #: "OUT OF BATTLE AREA", and the whole of the withdraw -- see 0x610CAC50.
 MB_AREA_MINX = 0xC48                   # s16 -> lobby+0x68C6
+#: KEY: THE LOCAL BATTLE SIDE (static 2026-09-27): u8 -> lobby+0x68D3, read by
+#: 0x61175A90 (the enemy side is the other of {1, 2}, 0x61175AC0). The
+#: debrief (0x61192780), radar and join banner compare each unit+0x80 (POP
+#: body+0x7C, the nation) against it. We served 0, so neither side matched
+#: and the Battle Review drew the enemy squad as FRIENDLY.
+MB_BATTLE_SIDE = 0xC55
 MB_AREA_MINZ = 0xC4A                   # s16 -> lobby+0x68C8
 MB_AREA_MAXX = 0xC4C                   # s16 -> lobby+0x68CA
 MB_AREA_MAXZ = 0xC4E                   # s16 -> lobby+0x68CC
@@ -2335,6 +2355,8 @@ def sortie_fields(mapno=None, ep_enable=None, host=None, port=None, **knobs):
     mn, src = sortie_mapno(mapno)
     out.append(("MapNo", R13A_BLOCK + MB_MAPNO,
                 struct.pack("<I", mn) if mn is not None else b"", src))
+    if BATTLE_START_TIME and "start_time" not in knobs:
+        knobs["start_time"] = int(time.time())
     for label, off, raw, s in mission_fields(mapno=0, **knobs):
         out.append((label, R13A_BLOCK + off, raw, s))
     return out
@@ -2517,6 +2539,8 @@ def sortie_push_fields(mapno=None, time_s=None, dest=None, ep_enable=None,
     raw = d.encode("cp932", "replace")[:R14E_DEST_LEN - 1] + b"\0"
     out.append(("dest", R14E_DEST, raw,
                 f"{d!r} -- the %s of 8:80 'Your destination is %s.'"))
+    if BATTLE_START_TIME and "start_time" not in knobs:
+        knobs["start_time"] = int(time.time())
     for label, off, raw2, s in mission_fields(mapno=0, **knobs):
         out.append((label, R14E_BLOCK + off, raw2, s))
     return out
@@ -4593,6 +4617,148 @@ PAY_KINDS = {1: "Base pay", 2: "Kill bonus", 3: "Mission participation bonus",
              13: "Arena reward", 14: "Arena hosting cancellation"}
 DAY = 86400
 
+# --------------------------------------------------------------------------- #
+# THE CEASEFIRE BONUS and THE OFFICER REVIEW (2026-09-27). SE's RULES, OUR
+# NUMBERS: the archived pages give the mechanisms and almost no figures
+# (SE's guide pages: phase, topics20060406,
+# update/050719qk2ld8). Every amount, period and count below is ours and is
+# named as ours in the knob comments.
+# --------------------------------------------------------------------------- #
+#: SE (phase:48-53): at each phase end First Sergeant and above get a rank-
+#: based ceasefire bonus whatever the result -- First Sergeant..Captain H$ +
+#: contribution, Major..Colonel H$ + MP, below First Sergeant nothing. Both
+#: sides are paid the SAME amount unless the economic-city points differ by
+#: 6:4 or more, then each side's share follows the ratio (topics20060406:50-52).
+#: FMO_CEASEFIRE=1 pays it at the Personnel Officer after a judged phase, as a
+#: paybook "City control adjustment" line (kind 7: SE scales it by the city
+#: points) plus the contribution banked. A pilot's first check only records
+#: the phases already judged, so nobody is back-paid for wars they missed.
+CEASEFIRE = (os.environ.get("FMO_CEASEFIRE", "").strip() or "0") != "0"
+#: OURS: H$ = this many days of the rank's base pay (D15.DAT's pay column).
+CEASEFIRE_DAYS = _env_int("FMO_CEASEFIRE_DAYS", "5")
+#: OURS: contribution (First Sergeant..Captain) = this % of the rank's bar.
+CEASEFIRE_CONTRIB_PCT = _env_int("FMO_CEASEFIRE_CONTRIB_PCT", "2")
+#: OURS: MP (Major..Colonel) = this many times the rank's MP pay.
+CEASEFIRE_MP_DAYS = _env_int("FMO_CEASEFIRE_MP_DAYS", "5")
+RANK_FIRST_SERGEANT, RANK_CAPTAIN, RANK_MAJOR, RANK_COLONEL = 10, 20, 21, 23
+PAY_CITY = 7                   #: paybook kind 7 = "City control adjustment"
+
+
+def ceasefire_share(rec, nation):
+    """The multiplier for `nation`'s pilots from one judged phase record
+    {ocu, usn}: 1.0 below a 6:4 split, else own share / 0.5. Pure."""
+    ocu, usn = int(rec.get("ocu") or 0), int(rec.get("usn") or 0)
+    tot = ocu + usn
+    if tot <= 0 or max(ocu, usn) / tot < 0.6:
+        return 1.0
+    own = ocu if nation == 1 else usn if nation == 2 else tot / 2
+    return own / tot / 0.5
+
+
+def ceasefire_bonus(rank, nation, rec, ladder=None):
+    """(H$, contribution, MP) one pilot is owed for one judged phase, or None
+    below First Sergeant / above Colonel. Pure."""
+    rank = int(rank or 0)
+    if not RANK_FIRST_SERGEANT <= rank <= RANK_COLONEL:
+        return None
+    m = ceasefire_share(rec, nation)
+    pay, mp = rank_pay(rank)
+    hs = int(round(pay * CEASEFIRE_DAYS * m))
+    if rank <= RANK_CAPTAIN:
+        bar = rank_threshold(rank, ladder) or 0
+        return hs, int(round(max(0, bar) * CEASEFIRE_CONTRIB_PCT / 100 * m)), 0
+    return hs, 0, int(round(mp * CEASEFIRE_MP_DAYS * m))
+
+
+def ceasefire_owed(char, phases):
+    """[(phase number, record)] judged phases this pilot has not been paid.
+    MUTATES char["ceasefire_paid"]: the first call only records what is
+    already judged (returns []), so the bonus starts with the NEXT phase."""
+    judged = sorted((int(k), v) for k, v in (phases or {}).items())
+    paid = char.get("ceasefire_paid")
+    if not isinstance(paid, list):
+        char["ceasefire_paid"] = [n for n, _r in judged]
+        return []
+    return [(n, r) for n, r in judged if n not in paid]
+
+
+#: SE (update 050719qk2ld8:58-71): contribution promotes only up to Captain.
+#: Above it a periodic review decides: Captain KEEPS the rank with one
+#: SECTOR-mission success in the period, is PROMOTED to Major with "the
+#: prescribed count or more", and with none is DEMOTED to First Lieutenant
+#: with the contribution bar at about 90%; Major and above the same on AREA
+#: missions. Every rank has a headcount limit and a promotion needs a free
+#: slot. FMO_REVIEW: 0 (default) off; 'promote' = keep/promote only (no
+#: demotion); 'full' = SE's rule with demotion. WARNING: 'full' DEMOTES seeded
+#: pilots who never ran a mission -- arm it deliberately.
+REVIEW = (os.environ.get("FMO_REVIEW", "").strip() or "0").lower()
+REVIEW_DAYS = _env_int("FMO_REVIEW_DAYS", "7")           #: OURS: SE says only "a set period"
+REVIEW_PROMOTE = _env_int("FMO_REVIEW_PROMOTE", "3")     #: OURS: SE's count is not published
+#: OURS: "rank:cap,..." pilots allowed per rank and nation; empty = no cap.
+REVIEW_CAPS_SPEC = os.environ.get("FMO_REVIEW_CAPS", "").strip()
+
+
+def parse_review_caps(spec):
+    out = {}
+    for piece in (spec or "").split(","):
+        if piece.strip():
+            r, c = piece.split(":")
+            out[int(r, 0)] = int(c, 0)
+    return out
+
+
+try:
+    REVIEW_CAPS = parse_review_caps(REVIEW_CAPS_SPEC)
+except ValueError:
+    REVIEW_CAPS = {}
+
+
+def _iso_unix(s):
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def review_successes(char, rank, since, now):
+    """Completed missions that count for this rank's review in [since, now]:
+    SECTOR (category 2) for Captain, AREA (category 3) for Major+."""
+    cat = 2 if int(rank) <= RANK_CAPTAIN else 3
+    n = 0
+    for m in (char or {}).get("missions") or ():
+        if not isinstance(m, dict) or m.get("status") != "complete":
+            continue
+        if int(m.get("cat") or 0) != cat:
+            continue
+        t = _iso_unix(m.get("reported"))
+        if t is not None and since <= t <= now:
+            n += 1
+    return n
+
+
+def review_verdict(rank, successes, mode, promote_n=None, slot_free=True):
+    """'promote' / 'keep' / 'demote' / None (not reviewed). Pure."""
+    rank = int(rank)
+    if mode not in ("promote", "full", "1") or not RANK_CAPTAIN <= rank <= RANK_COLONEL:
+        return None
+    need = REVIEW_PROMOTE if promote_n is None else promote_n
+    if successes >= need and rank < RANK_COLONEL and slot_free:
+        return "promote"
+    if successes >= 1 or mode == "promote":
+        return "keep"
+    return "demote"
+
+
+def review_demoted_contribution(new_rank, ladder=None):
+    """SE: a demoted officer's contribution bar sits at about 90% toward the
+    rank they lost, so contribution alone cannot promote them straight back."""
+    lo = rank_threshold(new_rank, ladder) or 0
+    hi = rank_threshold(new_rank + 1, ladder)
+    if hi is None or hi <= lo:
+        return lo
+    return int(lo + 0.9 * (hi - lo))
+
 
 def _now_unix(now=None):
     return (float(now) if now is not None
@@ -5234,7 +5400,7 @@ def mission_area_fields(area=None, seconds=None):
 
 
 def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
-                   battleticket=None):
+                   battleticket=None, side=None, start_time=None):
     """(label, block offset, raw bytes, source) for every field that is ON.
 
     Returns nothing with every knob at its default -- that is what makes the
@@ -5265,6 +5431,15 @@ def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
         pair = _u8_pair(spec) if isinstance(spec, str) else spec
         if pair:
             out.append((label, off, bytes(pair), f"knob '{spec}'"))
+    if start_time:
+        out.append(("StartGameTime", MB_START_GAMETIME,
+                    struct.pack("<I", int(start_time) & 0xFFFFFFFF),
+                    f"Unix {int(start_time)} = the battle start -> lobby+0x5CC6; "
+                    f"the Battle Review's frames are ms since it"))
+    if side in (1, 2):
+        out.append(("BattleSide", MB_BATTLE_SIDE, bytes([side]),
+                    f"the pilot's nation {side} -> lobby+0x68D3 (0x61175A90): "
+                    f"units whose POP nation equals it are friendly"))
     return out
 
 
@@ -9131,6 +9306,7 @@ PLAYTIME_BASE = _env_int("FMO_PLAYTIME_BASE", 0)
 #: sequence 0x7FFFFFFE, and it is NOT one of the objects above -- nothing polls
 #: for a reply to it. Named here only so the log stops calling it "unknown".
 MSG_KEEPALIVE = 0x0198
+MSG_LOG_UPLOAD = 0x01A5              # see the 0x01A5 arm in on_packet
 
 #: The generic FAILURE reply. Any id the waiting request is not expecting takes
 #: the failure arm; 2 is the one the client's own paths use (0x0130's failure is
@@ -9564,7 +9740,9 @@ def resupply_body(money, rows=()):
 #:           +0x108 u32 RESULT: won when it equals 1 with +0x144 == 1, else
 #:           when it equals 2 (the won flag picks 0x610E6E70 over 0x610E6EA0
 #:           at the transition); +0x10C u8 bit0 = SKIP the experience rows;
-#:           +0x110 u32 == 1 -> 0x610D1C30(block, tail) (a replay/record
+#:           +0x110 u32 == 1 -> 0x610D1C30(block, tail) (NOT the replay: a top-10
+#:           record/ranking table, 0x610D1580; the Battle Review is
+#:           recorded client-side, see MB_START_GAMETIME) (was: a replay/record
 #:           hook behind global 0x613B9028); +0x140 bytes indexed by +0x144;
 #:           +0x17E u8 -> 8:108 "An experience bonus from the operation
 #:           conditions was applied."; block+0x8D (= lobby+0x6A53) nonzero
@@ -9749,10 +9927,13 @@ def parse_objective(spec):
                 raise ValueError
             return "hold", (x, z, w, h), secs
         if kind == "destroy" and len(parts) == 2:
+            if parts[1].strip().lower() == "all":
+                return "destroy", "all", None
             return "destroy", int(parts[1], 0), None
     except ValueError:
         pass
-    raise ValueError(f"FMO_OBJECTIVE={spec!r}: want hold:x,z,w,h:secs or destroy:<unitid>")
+    raise ValueError(f"FMO_OBJECTIVE={spec!r}: want hold:x,z,w,h:secs, "
+                     f"destroy:<unitid> or destroy:all")
 
 
 try:
@@ -9782,6 +9963,82 @@ def parse_exp_rows(spec):
     if len(out) > S14C_EXP_MAX:
         raise ValueError(f"FMO_BATTLE_END_EXP: {len(out)} rows, the arm walks 5")
     return out
+
+
+#: PERFORMANCE PAY (2026-09-26). Until now one battle paid the same flat
+#: FMO_RESULT_MONEY / FMO_RESULT_CONTRIB whatever happened in it, so nothing a
+#: pilot did in a fight changed what they got. SE paid two kinds of
+#: contribution (intro/flow3.html:15-18): SORTIE contribution for sortieing at
+#: all (the flat knob, still paid on a loss or a withdraw) and DESTRUCTION
+#: contribution for kills (撃破貢献値) -- FMO_KILL_CONTRIB per enemy destroyed.
+#: The paybook has its own "Kill bonus" line (group 11 kind 2, PAY_KILL):
+#: FMO_KILL_BONUS_HS per kill is owed there and collected at the Personnel
+#: Officer like every other line. FMO_WIN_MONEY / FMO_WIN_CONTRIB are paid on a
+#: WIN only; FMO_KILL_EXP ("kind:amount,...") is class exp per kill, SE's
+#: "direct exp, shared by every unit involved in a kill" (flow3:9-13).
+#: WARNING: SE's amounts are not on any page we hold: every number here is OURS.
+#: All default 0 = the flat pay exactly as before.
+#: A kill counts only when its target is a unit THIS server popped as an enemy
+#: on this sortie (battle_state()["enemies"]): the DIED records the client
+#: authors also name the pilot's own unit when it is destroyed.
+KILL_CONTRIB = _env_int("FMO_KILL_CONTRIB", "0")
+KILL_BONUS_HS = _env_int("FMO_KILL_BONUS_HS", "0")
+WIN_MONEY = _env_int("FMO_WIN_MONEY", "0")
+WIN_CONTRIB = _env_int("FMO_WIN_CONTRIB", "0")
+KILL_EXP = os.environ.get("FMO_KILL_EXP", "").strip()
+
+
+def battle_kills(st):
+    """The distinct enemy UnitIDs destroyed this sortie, in kill order: targets
+    of st['kills'] that are in st['enemies']. Pure."""
+    enemies = set((st or {}).get("enemies") or ())
+    out = []
+    for target, _when in (st or {}).get("kills") or ():
+        if target in enemies and target not in out:
+            out.append(target)
+    return out
+
+
+def battle_pay(kills, won, money=0, contrib=0, exp_rows=(), kill_contrib=None,
+               kill_bonus_hs=None, win_money=None, win_contrib=None,
+               kill_exp=None):
+    """What one battle pays, from what happened in it. Pure.
+
+    `kills` is the count of distinct enemies destroyed, `won` the verdict,
+    money/contrib/exp_rows the flat per-sortie pay. The per-kill and win knobs
+    default to the module's. Returns {money, contribution, exp_rows,
+    kill_bonus_hs, parts} where parts is a readable breakdown for the log.
+    Experience rows are merged by kind (the arm walks at most S14C_EXP_MAX)."""
+    kc = KILL_CONTRIB if kill_contrib is None else kill_contrib
+    kb = KILL_BONUS_HS if kill_bonus_hs is None else kill_bonus_hs
+    wm = WIN_MONEY if win_money is None else win_money
+    wc = WIN_CONTRIB if win_contrib is None else win_contrib
+    kx = parse_exp_rows(KILL_EXP) if kill_exp is None else list(kill_exp)
+    kills = max(0, int(kills))
+    parts = []
+    if money or contrib:
+        parts.append(f"sortie H$ {money:+d} / contribution {contrib:+d}")
+    if kills and kc:
+        contrib += kills * kc
+        parts.append(f"{kills} kill(s) x {kc} = destruction contribution "
+                     f"{kills * kc:+d}")
+    if won and (wm or wc):
+        money += wm
+        contrib += wc
+        parts.append(f"win H$ {wm:+d} / contribution {wc:+d}")
+    merged = {}
+    for kind, amount in exp_rows:
+        merged[int(kind)] = merged.get(int(kind), 0) + int(amount)
+    if kills and kx:
+        for kind, amount in kx:
+            merged[int(kind)] = merged.get(int(kind), 0) + kills * int(amount)
+        parts.append(f"kill exp {', '.join(f'{k}:+{kills * a}' for k, a in kx)}")
+    rows = list(merged.items())[:S14C_EXP_MAX]
+    bonus = kills * kb if kb > 0 else 0
+    if bonus:
+        parts.append(f"Kill bonus H$ {bonus} owed at the Personnel Officer")
+    return {"money": money, "contribution": contrib, "exp_rows": rows,
+            "kill_bonus_hs": bonus, "parts": parts}
 
 
 def battle_end_body(hangar_rank=0, contrib_new=0, contrib_old=0, exp_rows=(),
@@ -9965,7 +10222,10 @@ def trade_state_record(state, first="", last="", mine=None, partner=None,
     if partner:
         b[TRADE_PARTNER_BLOCK:TRADE_PARTNER_BLOCK + TRADE_BLOCK_LEN] = \
             bytes(partner[:TRADE_BLOCK_LEN]).ljust(TRADE_BLOCK_LEN, b"\0")
-    struct.pack_into("<I", b, 0x198, partner_id & 0xFFFFFFFF)
+    if partner_id:
+        # WARNING: +0x198 is the PARTNER BLOCK's +0xC8 (their money offer), not an
+        # id: only written when asked for explicitly.
+        struct.pack_into("<I", b, 0x198, partner_id & 0xFFFFFFFF)
     b[TRADE_STATE_OFF] = state & 0xFF
     for off, text in ((TRADE_REPLY_FIRST, first), (TRADE_LAST, last)):
         s = text.encode("cp932", "replace")[:TRADE_NAME_LEN - 1]
@@ -12384,6 +12644,8 @@ class Session:
             # wrong map -- FMO_MAPNO's, not theirs.
             _cur = WORLD_MAPS.get(_host, next_mapno())
             _mn, _why = area_change_mapno(zone, _cur)
+            # WARNING: the PS2 gate: this third emit site never had it (2026-09-21)
+            _mn = self.build_mapno(_mn, "the Change Area destination")
             log(f"{self.peer}   -> 0x0153 granting MapKind={zone} MapNo={_mn} "
                 f"({_why})"
                 + f". WARNING: 0x61179716 writes "
@@ -12887,6 +13149,18 @@ class Session:
             # FMO_ANSWER_0175=fail sends message 2 (graceful refusal), 0
             # stays silent (the hang, on purpose).
             _char = (self.playing_char() or {}) if CHAR_STORE else {}
+            # SE's review above Captain and the phase-end ceasefire bonus are
+            # both the Personnel Officer's (REVIEW / CEASEFIRE); the review
+            # runs first so the reply carries the rank it leaves.
+            try:
+                _rv = self.officer_review(_char) if _char else None
+                _cf = self.pay_ceasefire(_char) if _char else []
+            except Exception as _e:
+                _rv, _cf = None, []
+                log(f"{self.peer}   WARNING: review / ceasefire skipped ({_e!r})")
+            if _rv or _cf:
+                log(f"{self.peer}   PERSONNEL: review {_rv or 'not due'}; "
+                    f"ceasefire bonus {_cf or 'none owed'}")
             _blk, _sr = service_record_block(_char)
             log(f"{self.peer}   0x0175 = the SERVICE RECORD / promotion request "
                 f"(mission-result machine 0x61192780, empty body). "
@@ -12940,6 +13214,26 @@ class Session:
             if _pass:
                 _outs.append(_pass)
             return _outs
+
+        if p["msg"] == MSG_LOG_UPLOAD:
+            # 0x01A5 (0x61174510, up to 0x39D0 B): a TEXT LOG the client
+            # uploads once the battle start (block+0x48) is nonzero and the
+            # elapsed time passes lobby+0x7DF8 minutes (0x6115FAE3). Unread
+            # until 2026-09-27; answered with message 1 like the other
+            # upload-only requests, so a poller can never park, and kept.
+            _pl = bytes(p["payload"])
+            try:
+                _cd = os.path.join(LOG_DIR, "captures")
+                os.makedirs(_cd, exist_ok=True)
+                with open(os.path.join(_cd, "fmo-01a5-%s.bin" % time.strftime(
+                        "%Y%m%dT%H%M%SZ", time.gmtime())), "wb") as _fh:
+                    _fh.write(_pl)
+            except OSError:
+                pass
+            _txt = _pl.split(b"\0")[0][:300].decode("cp932", "replace")
+            log(f"{self.peer}   0x01A5 = CLIENT LOG UPLOAD, {len(_pl)}B (saved to "
+                f"captures/): {_txt!r} -> message 1")
+            return [build(1, b"", self.reply_seq(), p["conn"])]
 
         if p["msg"] == MSG_0159_REQ:
             # THE SCRIPT'S SERVER CALL (S159_EVENT): syscall 0xE220's record --
@@ -13148,7 +13442,8 @@ class Session:
                     # Gain" screen -> its 0x0150 (0xFFFD) re-entry, no 0x013D.
                     # The PAY rides with it: 0x015A used to fire only on the
                     # withdraw path, so that first end paid nothing.
-                    _rp = self.battle_result_push(p["conn"], f"the battle end ({_trig[0]})")
+                    _rp = self.battle_result_push(
+                        p["conn"], f"the battle end ({_trig[0]})", won=_trig[1])
                     if _rp:
                         outs.append(_rp)
                     _be = self.battle_end_push(p["conn"], why=_trig[0],
@@ -14036,17 +14331,27 @@ class Session:
             # RESUME, or the war map never opened) this is FMO_SORTIE_MAPNO,
             # exactly as every sortie before 2026-09-08.
             _mn = str(self.sector[2]) if self.sector else None
+            _side = nation_for_session(self.playing_char() if CHAR_STORE
+                                       else None, STATUS_NATION,
+                                       "FMO_STATUS_NATION")[0]
+            _t0 = int(time.time())          # ONE stamp: block+0x48 AND cmd 138
             body = reply_013a(mapno=_mn, host=host_for(
-                SORTIE_HOST or BATTLE_HOST, self.ip))
+                SORTIE_HOST or BATTLE_HOST, self.ip), side=_side,
+                start_time=(_t0 if BATTLE_START_TIME else 0))
             if body is None:
                 why = next(s for l, _o, r, s in sortie_fields(mapno=_mn)
                            if l == "MapNo")
+            else:
+                # WARNING: the PS2 gate: the console's type-1 set is unknown
+                why = self.ps2_type1_refusal(sortie_mapno(_mn)[0])
         if why:
             log(f"{self.peer}   -> 0x{MSG_FAIL:04X} FAILURE, code {FAIL_CODE}: "
                 f"{why}. The poller posts UI event 0x106F (10:6 \"Failed to "
                 f"select the battle map\"), kycli shows 8:27; NO scene change.")
             return [build(MSG_FAIL, b"", self.reply_seq(), FAIL_CODE)]
-        fields = sortie_fields(mapno=_mn)
+        fields = sortie_fields(mapno=_mn, side=locals().get("_side"),
+                               start_time=(locals().get("_t0") or 0)
+                               if BATTLE_START_TIME else 0)
         if self.sector:
             log(f"{self.peer}   sortie map comes from the SECTOR this "
                 f"connection picked: selector {MAPKIND} sector "
@@ -14073,9 +14378,14 @@ class Session:
         self.battle_end_done = False
         self.battle_settlement = None          # one settlement per sortie
         # the battle map this sortie went to: the war map's census key
-        battle_state(self.ip, reset=True)["mapno"] = next(
+        _bsr0 = battle_state(self.ip, reset=True)
+        _bsr0["mapno"] = next(
             struct.unpack_from("<I", r)[0] for l, _o, r, _s in fields
             if l == "MapNo")
+        # the block+0x48 stamp, so BM cmd 138 can repeat it (see below)
+        _bsr0["start_unix"] = next(
+            (struct.unpack_from("<I", r)[0] for l, _o, r, _s in fields
+             if l == "StartGameTime" and r), None)
         if PROGRESS_ADVANCE:
             _pc = (self.playing_char() or {}) if CHAR_STORE else {}
             _fr = progress_frontier(_pc) if _pc else []
@@ -14169,7 +14479,8 @@ class Session:
             f"answers with a 0x0153 -- the client leaves the battle for the "
             f"granted lobby map. Empty body: 0x611766DC reads only the id.")
         outs = [build(MSG_SESSION_START, b"", self.reply_seq(), p["conn"])]
-        push = self.battle_result_push(p["conn"], "the battle withdraw")
+        # a withdraw is never a win: sortie pay only, whatever was destroyed
+        push = self.battle_result_push(p["conn"], "the battle withdraw", won=False)
         if push is not None:
             outs.append(push)
         return outs
@@ -14518,7 +14829,109 @@ class Session:
                      squadron_insignia_push_body(group_id, insignia, mc[0]),
                      QUEUE_SEQ, conn_id)
 
-    def settle_battle(self, why):
+    def officer_review(self, char, now=None):
+        """SE's periodic review above Captain (REVIEW). Runs at the Personnel
+        Officer: the first visit starts the period, a visit after
+        FMO_REVIEW_DAYS judges it and starts the next. Changes char["rank"]
+        (and, on a demotion, "contribution") and commits. Returns the verdict
+        or None."""
+        if REVIEW == "0" or not char:
+            return None
+        now = int(_now_unix(now))
+        rank = int(_econ_value("rank", None, START_RANK, "FMO_RANK", char)[0] or 0)
+        if not RANK_CAPTAIN <= rank <= RANK_COLONEL:
+            return None
+        since = char.get("review_at")
+        if not isinstance(since, int):
+            char["review_at"] = now
+            self.commit(f"officer review: period opened for "
+                        f"{rank_name(rank)} ({REVIEW_DAYS} days, FMO_REVIEW_DAYS)")
+            return None
+        if now - since < REVIEW_DAYS * DAY:
+            return None
+        wins = review_successes(char, rank, since, now)
+        slot = True
+        cap = REVIEW_CAPS.get(rank + 1)
+        if cap is not None:
+            nat = nation_for_session(char, STATUS_NATION, "FMO_STATUS_NATION")[0]
+            held = sum(1 for _a, ro in self.all_rosters() for c in ro
+                       if int(c.get("rank") or 0) == rank + 1
+                       and nation_for_session(c, None, "")[0] == nat)
+            slot = held < cap
+        verdict = review_verdict(rank, wins, REVIEW, slot_free=slot)
+        char["review_at"] = now
+        what = ("sector" if rank <= RANK_CAPTAIN else "area") + " mission(s)"
+        if verdict == "promote":
+            char["rank"] = rank + 1
+        elif verdict == "demote":
+            char["rank"] = rank - 1
+            char["contribution"] = review_demoted_contribution(rank - 1)
+        self.commit(f"officer review: {rank_name(rank)}, {wins} {what} in "
+                    f"{REVIEW_DAYS} days (promote at {REVIEW_PROMOTE}"
+                    + ("" if slot else f"; {rank_name(rank + 1)} is FULL")
+                    + f") -> {verdict.upper()}"
+                    + (f" to {rank_name(char['rank'])}" if verdict != "keep" else ""))
+        return verdict
+
+    def pay_ceasefire(self, char):
+        """Owe every judged phase's ceasefire bonus this pilot has not had
+        (CEASEFIRE): a kind-7 paybook line for the H$/MP, the contribution
+        banked now. Returns [(phase, (H$, contribution, MP))]."""
+        if not CEASEFIRE or not char:
+            return []
+        war = war_state()
+        if war is None:
+            return []
+        _war_tick(war)
+        had = isinstance(char.get("ceasefire_paid"), list)
+        owed = ceasefire_owed(char, war.data.get("phases"))
+        if not had:
+            self.commit(f"ceasefire: {len(char['ceasefire_paid'])} phase(s) "
+                        f"already judged recorded as paid (no back-pay)")
+        if not owed:
+            return []
+        rank = int(_econ_value("rank", None, START_RANK, "FMO_RANK", char)[0] or 0)
+        nat = nation_for_session(char, STATUS_NATION, "FMO_STATUS_NATION")[0]
+        out = []
+        for n, rec in owed:
+            b = ceasefire_bonus(rank, nat, rec)
+            char.setdefault("ceasefire_paid", []).append(n)
+            if b is None:
+                continue
+            hs, contrib, mp = b
+            if hs or mp:
+                prev = char.get("mission_pay")
+                char["mission_pay"] = (prev if isinstance(prev, list) else []) + [{
+                    "id": 0, "name": f"Ceasefire bonus, phase {n}", "hs": hs,
+                    "mp": mp, "at": int(_now_unix()), "kind": PAY_CITY}]
+            if contrib:
+                self.credit_money(f"ceasefire bonus, phase {n}",
+                                  contribution=contrib)
+            out.append((n, b))
+        self.commit("ceasefire bonus: " + ("; ".join(
+            f"phase {n}: H$ {b[0]}, contribution {b[1]}, MP {b[2]}"
+            for n, b in out) or "nothing owed at this rank"))
+        return out
+
+    def owe_kill_bonus(self, hs, kills):
+        """Owe one paybook "Kill bonus" line (kind PAY_KILL) for this sortie's
+        kills; the Personnel Officer pays it with the rest of the book."""
+        char = self.playing_char() if CHAR_STORE else None
+        if char is None:
+            log(f"{self.peer}   WARNING: Kill bonus H$ {hs} for {kills} kill(s) NOT "
+                f"owed: no pilot on this connection.")
+            return
+        owed = char.get("mission_pay")
+        char["mission_pay"] = (owed if isinstance(owed, list) else []) + [{
+            "id": 0, "name": "Kill bonus", "hs": int(hs), "mp": 0,
+            "at": int(_now_unix()), "kind": PAY_KILL}]
+        try:
+            self.commit(f"Kill bonus H$ {hs} owed for {kills} kill(s) "
+                        f"(FMO_KILL_BONUS_HS)")
+        except Exception as e:
+            log(f"{self.peer}   WARNING: Kill bonus NOT banked ({e!r})")
+
+    def settle_battle(self, why, won=None):
         """ONE settlement per sortie: what this battle pays, banked ONCE.
 
         WARNING: Until 2026-09-11 the two end-of-battle pushes each credited the
@@ -14535,12 +14948,18 @@ class Session:
         logged). Money is FMO_RESULT_MONEY. Class exp is FMO_BATTLE_END_EXP.
         KEY: That per-sortie contribution IS SE's 出撃貢献値 -- "sortie
         contribution, earned by sortieing at all" (intro/flow3.html:15-18);
-        the other kind, 撃破貢献値 for destroying key points, has no source
-        here yet. So a battle with zero kills must still credit this delta.
+        the other kind, 撃破貢献値 for destroying enemies, is FMO_KILL_CONTRIB
+        per kill (battle_pay). So a battle with zero kills must still credit
+        this delta.
+
+        `won` is the verdict; None = FMO_BATTLE_END_WON. The FIRST caller in a
+        sortie decides it, so every caller that knows the verdict passes it
+        (the end trigger's, and False for a withdraw).
         Returns the cached dict on every later call in the same sortie."""
         cached = getattr(self, "battle_settlement", None)
         if cached is not None:
             return cached
+        _won = BATTLE_END_WON if won is None else bool(won)
         try:
             rows = parse_exp_rows(BATTLE_END_EXP)
         except ValueError as e:
@@ -14551,16 +14970,27 @@ class Session:
             log(f"{self.peer}   WARNING: FMO_RESULT_CONTRIB={RESULT_CONTRIB} and "
                 f"FMO_BATTLE_END_CONTRIB={BATTLE_END_CONTRIB} disagree -- they "
                 f"name ONE delta; using {contrib}. Set one of them.")
+        kills = battle_kills(BATTLE_STATE.get(getattr(self, "ip", None)))
+        try:
+            pay = battle_pay(len(kills), _won, money=RESULT_MONEY,
+                             contrib=contrib, exp_rows=rows)
+        except ValueError as e:
+            log(f"{self.peer}   WARNING: FMO_KILL_EXP: {e} -- no kill exp this battle")
+            pay = battle_pay(len(kills), _won, money=RESULT_MONEY,
+                             contrib=contrib, exp_rows=rows, kill_exp=())
+        money, contrib, rows = pay["money"], pay["contribution"], pay["exp_rows"]
         mc = self.stored_money()
         old_money = mc[0] if mc else 0
         old = mc[1] if mc else 0
         banked = False
-        new_money, new = old_money + RESULT_MONEY, old + contrib
-        if RESULT_MONEY or contrib:
-            now = self.credit_money(why, money=RESULT_MONEY, contribution=contrib)
+        new_money, new = old_money + money, old + contrib
+        if money or contrib:
+            now = self.credit_money(why, money=money, contribution=contrib)
             if now is not None:
                 new_money, new = now
                 banked = True
+        if pay["kill_bonus_hs"]:
+            self.owe_kill_bonus(pay["kill_bonus_hs"], len(kills))
         if rows:
             # Banked BEFORE the push, like the money: the 0x014C rows are
             # deltas the client adds to its lobby+0xF08 copy, and the next
@@ -14568,12 +14998,17 @@ class Session:
             # cannot disagree after a relog.
             self.credit_class_exp(why, rows)
         self.battle_settlement = {
-            "money": RESULT_MONEY, "contribution": contrib, "exp_rows": rows,
+            "money": money, "contribution": contrib, "exp_rows": rows,
             "contrib_old": old, "contrib_new": new,
             "money_old": old_money, "money_new": new_money,
-            "banked": banked, "why": why,
+            "banked": banked, "why": why, "won": _won, "kills": kills,
+            "kill_bonus_hs": pay["kill_bonus_hs"],
         }
-        log(f"{self.peer}   BATTLE SETTLEMENT ({why}): money {RESULT_MONEY:+d} "
+        log(f"{self.peer}   BATTLE SETTLEMENT ({why}): "
+            f"{'WON' if _won else 'LOST'}, {len(kills)} enemy kill(s)"
+            + (f" ({', '.join(f'{k:#x}' for k in kills)})" if kills else "")
+            + f" -> {'; '.join(pay['parts']) or 'nothing to pay'}. "
+            f"Money {money:+d} "
             f"({old_money} -> {new_money}), contribution {contrib:+d} "
             f"({old} -> {new}), class exp {rows or 'none'} -- "
             f"{'BANKED on the pilot' if banked else 'NOT banked (no pilot in the store): the pushes move the display only'}"
@@ -14845,10 +15280,15 @@ class Session:
         char = self.playing_char() if CHAR_STORE else None
         n, src = nation_for_session(char, STATUS_NATION, "FMO_STATUS_NATION")
         tile = self.sector[0]
-        s, what = st.settle(tile, n, won=bool(won))
+        # SE: a win over other PILOTS moves the front more than one over NPCs
+        # (fmowar weight 2). Set when a hostile room-mate popped in this
+        # battle (room_queue -> battle_room_hostile).
+        pvp = bool((BATTLE_STATE.get(getattr(self, "ip", None)) or {}).get("pvp"))
+        s, what = st.settle(tile, n, won=bool(won), pvp=pvp)
         log(f"{self.peer}   WAR STATE: tile {tile} (selector {MAPKIND} sector "
             f"{self.sector[1]}, map {self.sector[2]}), nation {n} ({src}) "
-            f"{'WON' if won else 'LOST'} -> {what}; the sector is now nation "
+            f"{'WON' if won else 'LOST'}{' a PvP battle (counts double)' if pvp else ''}"
+            f" -> {what}; the sector is now nation "
             f"{s['nation']} at {s['control']}% (counter {s['counter']}); "
             f"{st.summary()}. The war map sees it on its next kind-7 query "
             f"once FMO_WAR_MAP binds the fields.")
@@ -14857,9 +15297,9 @@ class Session:
     def battle_end_push(self, conn_id, why="the FMO_BATTLE_END timer", won=None):
         """ONE 0x014C from the battle settlement (settle_battle), which is
         where the pay is banked -- this push only SHOWS it."""
-        st = self.settle_battle(f"battle end ({why})")
+        st = self.settle_battle(f"battle end ({why})", won=won)
         rows, old, new = st["exp_rows"], st["contrib_old"], st["contrib_new"]
-        _won = BATTLE_END_WON if won is None else bool(won)
+        _won = st["won"]
         self.war_settle(_won)
         self.mission_battle_settle(_won)
         pkt = battle_end_packet(conn_id, contrib_new=new, contrib_old=old,
@@ -14876,7 +15316,7 @@ class Session:
             f"in the lobby with NO 0x013D on the wire.")
         return pkt
 
-    def battle_result_push(self, conn_id, occasion):
+    def battle_result_push(self, conn_id, occasion, won=None):
         """A 0x015A RESULT push, or None when FMO_RESULT_PUSH is off.
 
         This is the only thing on this server that pays a player for playing.
@@ -14896,17 +15336,25 @@ class Session:
         """
         if not RESULT_PUSH:
             return None
-        if not RESULT_MONEY and not (RESULT_CONTRIB or BATTLE_END_CONTRIB):
-            log(f"{self.peer}   FMO_RESULT_PUSH=1 but FMO_RESULT_MONEY and "
-                f"FMO_RESULT_CONTRIB / FMO_BATTLE_END_CONTRIB are all 0 -- a "
-                f"result that pays nothing is indistinguishable on screen from "
-                f"one that never arrived, so nothing is sent. Set one of them.")
+        if not (RESULT_MONEY or RESULT_CONTRIB or BATTLE_END_CONTRIB
+                or KILL_CONTRIB or WIN_MONEY or WIN_CONTRIB):
+            log(f"{self.peer}   FMO_RESULT_PUSH=1 but FMO_RESULT_MONEY, "
+                f"FMO_RESULT_CONTRIB / FMO_BATTLE_END_CONTRIB and the "
+                f"performance knobs (FMO_KILL_CONTRIB, FMO_WIN_MONEY, "
+                f"FMO_WIN_CONTRIB) are all 0 -- a result that pays nothing is "
+                f"indistinguishable on screen from one that never arrived, so "
+                f"nothing is sent. Set one of them.")
             return None
         record = getattr(self, "last_0159", b"")
         # ONE settlement per sortie (settle_battle): banked there, once,
         # whether 0x014C or this push asks first.
-        st = self.settle_battle(f"battle result ({occasion})")
+        st = self.settle_battle(f"battle result ({occasion})", won=won)
         _money, _contrib = st["money"], st["contribution"]
+        if not (_money or _contrib):
+            log(f"{self.peer}   0x{MSG_RESULT_PUSH:04X} not sent: this battle "
+                f"pays nothing ({'WON' if st['won'] else 'LOST'}, "
+                f"{len(st['kills'])} kill(s)); the 0x014C still shows it.")
+            return None
         if not st["banked"]:
             log(f"{self.peer}   WARNING: the push below therefore moves the display "
                 f"only and will NOT survive a relog.")
@@ -17641,6 +18089,22 @@ BATTLE_DUMMY_KIND = _env_int("FMO_BATTLE_DUMMY_CLIENT_KIND", "1")
 #: (unit+0x80, compared in the objective/beacon arms) is fed from is read
 #: only as far as the unit ctor's argument; this is the cheap test of it.
 BATTLE_DUMMY_NATION = _env_int("FMO_BATTLE_DUMMY_NATION", "0")
+#: VERIFIED:KEY: FMO_BATTLE_DUMMY_AI=<brain n> -- let the CLIENT run the enemy
+#: (static decode). The client has a
+#: per-unit KGR "brain" (resource 83285+n) that moves, targets and fires, and
+#: the POP switches it on: client_kind 1 (an NPC, no peer stream), body+0x2C =
+#: the UnitID of the client that runs it (the player's own battle id: owner ==
+#: my id -> unit+0x1340 = 3 and a controller at unit+0xE75), body+0x118 = n.
+#: Our dummy was popped 0/0/0 -- a remote player's copy -- which is why it
+#: stood still. Real brains are n = 101..2295; 101 first. With it set the
+#: dummy's nation defaults to the pilot's ENEMY (the body+0x7C friend/foe
+#: byte) unless FMO_BATTLE_DUMMY_NATION says otherwise. 0 (default) = off.
+#: Bar: the enemy moves by itself and the log shows cmd 24 naming its id;
+#: then it fires (cmd 30), the player's HP drops, and shooting it sends cmd 29
+#: with DIED -- which battle_kills pays.
+BATTLE_DUMMY_AI = _env_int("FMO_BATTLE_DUMMY_AI", "0")
+POP_AI_OWNER = 0x2C                    # u32 UnitID of the simulating client
+POP_AI_BRAIN = 0x118                   # u32 brain n (KGR 83285 + n)
 #: FMO_BATTLE_DUMMY_SIDE: the dummy's body+0x27 (fmoworld.POP_SIDE) -- the
 #: byte both unit creators hand the unit ctor as its SIDE (unit+0x80), which
 #: is what the friend/foe compares read. The self-POP sends 0 there, so any
@@ -19225,6 +19689,405 @@ def room_prune(chan, now):
                 f"them again.")
 
 
+#: FMO_BATTLE_ROOM_WANZER: '1' (default) = a room-mate on a BATTLE channel is
+#: popped with THEIR OWN battle POP (chan.pop_args: UnitType, nation at
+#: body+0x7C, side, garage parts), alive (client_kind 0), instead of the
+#: lobby's UnitType-4 human with no parts and no nation -- which is what two
+#: pilots in one battle saw of each other until 2026-09-26, and which cannot
+#: be fought (no wanzer, and nation 0 is nobody's enemy). Only fires when the
+#: other pilot's own pop is a non-human UnitType, i.e. FMO_UDP_POP_BATTLE is
+#: armed; '0' reverts to the human.
+BATTLE_ROOM_WANZER = os.environ.get("FMO_BATTLE_ROOM_WANZER", "1") not in ("0", "")
+#: How recent (seconds) a room-mate's last shot must be for a pilot's own
+#: death to be credited to them as a kill (battle_room_killer).
+BATTLE_KILL_WINDOW = 10.0
+
+
+def _is_battle_chan(c):
+    return bool(getattr(c, "key", None)) and c.key.endswith(b"battle")
+
+
+def battle_room_pop_args(chan, other, name1, name2):
+    """The pop args by which `chan`'s client should know room-mate `other` in
+    a battle, or None to keep the lobby human (see BATTLE_ROOM_WANZER). Pure."""
+    if not (BATTLE_ROOM_WANZER and _is_battle_chan(chan)
+            and _is_battle_chan(other)):
+        return None
+    theirs = getattr(other, "pop_args", None)
+    if not theirs or theirs.get("unit_type") == 4:
+        return None
+    args = dict(theirs, name1=name1, name2=name2, client_kind=0,
+                pos=tuple(other.pos[:3]) + (0.0,))
+    if args.get("parts"):
+        args.pop("model_flags", None)      # body+0x8E is part 0's kind byte
+        args.pop("model_sub", None)
+    return args
+
+
+def battle_room_hostile(chan, other):
+    """True when the two pilots' battle pops carry different nations (the
+    body+0x7C -> unit+0x80 compare the join banner and the hit test use)."""
+    a = (getattr(chan, "pop_args", None) or {}).get("nation")
+    b = (getattr(other, "pop_args", None) or {}).get("nation")
+    return bool(a) and bool(b) and a != b
+
+
+def battle_room_killer(victim, now, mates=None):
+    """The room-mate most likely to have destroyed `victim`'s own unit: a
+    hostile battle channel that fired within BATTLE_KILL_WINDOW, the most
+    recent first. None when nobody qualifies.
+    WARNING: A HEURISTIC. Under the P2P authority model the victim's client decides
+    its own death and names no shooter; with two pilots it is exact, with more
+    it credits whoever shot last."""
+    best = None
+    for o in (room_mates(victim) if mates is None else mates):
+        if not (_is_battle_chan(o) and battle_room_hostile(victim, o)):
+            continue
+        t = getattr(o, "last_fire", None)
+        if t is None or now - t > BATTLE_KILL_WINDOW:
+            continue
+        if best is None or t > best.last_fire:
+            best = o
+    return best
+
+
+#: VERIFIED:KEY: THE ENEMY SQUAD. With
+#: FMO_BATTLE_DUMMY_AI set, FMO_BATTLE_ENEMIES="<n>[:<spread>]" pops n AI
+#: enemies (ids FMO_BATTLE_DUMMY's id, +1, ...) in a ring of radius <spread>
+#: world units round the drop point. ONE squad per battle room, ONE OWNER:
+#: the first pilot in runs the brains (POP body+0x2C = its own battle id);
+#: every other pilot gets the same ids as network copies (body+0x2C = the
+#: owner's alias on their client, so 1340 = 2 and no brain) and the owner's
+#: movement / fire / damage records (cmd 23 / 24 / 30 / 29) are relayed to
+#: them. A squad lives for the owner's sortie (battle_state granted_at); if
+#: the owner leaves the room the next pilot to pop starts a fresh one.
+#: WARNING: All static. The ring spread is a guess at world units (the referee's
+#: 40 was never measured either).
+BATTLE_ENEMIES_SPEC = os.environ.get("FMO_BATTLE_ENEMIES", "").strip() or "1"
+
+
+def parse_battle_enemies(spec):
+    """'3:40' -> (3, 40.0); '3' -> (3, 30.0). n is clamped to 1..8. An
+    optional third field is the gap between enemies in the line (squad_gap)."""
+    parts = (spec or "1").split(":")
+    try:
+        n = int(parts[0], 0)
+        spread = float(parts[1]) if len(parts) > 1 and parts[1] else 30.0
+        if len(parts) > 2 and parts[2]:
+            float(parts[2])
+    except ValueError:
+        raise ValueError(f"FMO_BATTLE_ENEMIES={spec!r}: want <n>[:<distance>[:<gap>]]")
+    return max(1, min(8, n)), spread
+
+
+def squad_gap(spec=None):
+    """The line's gap from FMO_BATTLE_ENEMIES' third field, default 40."""
+    parts = ((BATTLE_ENEMIES_SPEC if spec is None else spec) or "").split(":")
+    try:
+        return float(parts[2]) if len(parts) > 2 and parts[2] else 40.0
+    except ValueError:
+        return 40.0
+
+
+try:
+    BATTLE_ENEMIES = parse_battle_enemies(BATTLE_ENEMIES_SPEC)
+    _BATTLE_ENEMIES_ERR = ""
+except ValueError as _e:
+    BATTLE_ENEMIES, _BATTLE_ENEMIES_ERR = (1, 30.0), str(_e)
+#: FMO_BATTLE_FIRE_RELAY: '1' (default) = a pilot's own FIRE (cmd 30) is
+#: relayed to every other pilot in the battle on the shooter's alias stream,
+#: with the record's source id (+0x08) rewritten to that alias. Under SE's
+#: P2P model a client is hurt by resolving an INCOMING shot itself, and an
+#: owner's client resolves hits on the enemies it runs -- so without this no
+#: pilot can hurt another pilot, and a non-owner cannot hurt the squad.
+BATTLE_FIRE_RELAY = os.environ.get("FMO_BATTLE_FIRE_RELAY", "1") not in ("0", "")
+#: {room key: squad dict}; see battle_squad_for.
+BATTLE_SQUADS = {}
+#: host -> when its BATTLE stream last verified. WARNING: during a battle
+#: the client keeps its LOBBY stream running on the same socket, our one
+#: channel per address flips between the two keys, and every flip back to the
+#: lobby key re-popped the 12-NPC lobby cast (every ~5 s). Those entities
+#: landed in the battle's unit list (the review file recorded 18 units for a
+#: 4-unit fight) and their name tags flashed over the battlefield. The lobby
+#: cast is held while the battle stream is live (lobby_cast_paused).
+BATTLE_SEEN = {}
+BATTLE_CAST_HOLD = 15.0
+
+
+def lobby_cast_paused(host, now=None):
+    return (now or time.time()) - BATTLE_SEEN.get(host, 0) < BATTLE_CAST_HOLD
+#: cmd ids the squad owner's client sends about the units it runs.
+CMD_BM_MOVE_ONE, CMD_BM_MOVE_BATCH, CMD_BM_FIRE = 23, 24, 30
+
+
+def battle_room_key(ip):
+    """The room a battle channel of `ip` stands in, as room_mates groups it."""
+    return (WORLD_MAPS.get(ip), WORLD_ZONES.get(ip),
+            WORLD_PLACES.get(ip) if PLACES else None)
+
+
+def squad_positions(base, n, spread, gap=40.0):
+    """n drop points in a LINE ABREAST `spread` world units out along +x from
+    `base` (x, y, z[, w]), `gap` apart along z, in the same tuple shape. Pure.
+    WARNING: NOT a ring: a ring round the pilot put each enemy in the
+    others' line of fire -- a shot takes the NEAREST unit on its ray -- and
+    two of the three were killed by their own side. From one side they all
+    fire the same way."""
+    base = tuple(base) if base else (0.0, 0.0, 0.0, 0.0)
+    out = []
+    for i in range(n):
+        p = list(base)
+        p[0] = float(base[0]) + spread
+        p[2] = float(base[2]) + (i - (n - 1) / 2.0) * gap
+        out.append(tuple(p))
+    return out
+
+
+def battle_squad_for(chan, base, nation, parts, now=None, mates=None):
+    """(squad, owner channel or None) for the room `chan` stands in. Creates a
+    squad owned by `chan`'s host when there is none, when its owner has left
+    the room, or when the owner's sortie is not the one it was made for."""
+    ip = chan.addr[0]
+    key = battle_room_key(ip)
+    sq = BATTLE_SQUADS.get(key)
+    mates = [o for o in (room_mates(chan) if mates is None else mates)
+             if _is_battle_chan(o)]
+    owner_chan = None
+    if sq is not None:
+        granted = (BATTLE_STATE.get(sq["owner"]) or {}).get("granted_at")
+        if sq["owner"] != ip:
+            owner_chan = next((o for o in mates if o.addr[0] == sq["owner"]), None)
+        if (sq["owner"] != ip and owner_chan is None) or granted != sq["granted"]:
+            sq = None
+    if sq is None:
+        n, spread = BATTLE_ENEMIES
+        uid0 = BATTLE_DUMMY[0] if BATTLE_DUMMY else 0x2222
+        sq = {"owner": ip, "ids": [uid0 + i for i in range(n)],
+              "pos": squad_positions(base, n, spread, squad_gap()),
+              "dead": set(), "last_hit": {},
+              "granted": (BATTLE_STATE.get(ip) or {}).get("granted_at"),
+              "nation": nation, "parts": parts, "made": now or time.time()}
+        BATTLE_SQUADS[key] = sq
+    return sq, owner_chan
+
+
+def move_state_len(state, at=0):
+    """Byte length of one motion-state record starting at `at` (decoder
+    0x6104C2F0), or None if it runs short."""
+    if at + 2 > len(state):
+        return None
+    f = state[at + 1]
+    n = (8 + 6 * bool(f & 0x01) + 2 * bool(f & 0x02) + 4 * bool(f & 0x04)
+         + 4 * bool(f & 0x08) + 2 * bool(f & 0x10) + 6 * bool(f & 0x20)
+         + 12 * bool(f & 0x40))
+    return n if at + n <= len(state) else None
+
+
+def squad_batch_filter(body, keep):
+    """A cmd-24 batch (u16 n, then n x {u32 id, state}) with only the entries
+    whose id is in `keep`, or None when none is kept or it does not parse."""
+    if len(body) < 2:
+        return None
+    n = struct.unpack_from("<H", body, 0)[0]
+    at, out = 2, []
+    for _ in range(n):
+        if at + 4 > len(body):
+            return None
+        uid = struct.unpack_from("<I", body, at)[0]
+        ln = move_state_len(body, at + 4)
+        if ln is None:
+            return None
+        if uid in keep:
+            out.append(body[at:at + 4 + ln])
+        at += 4 + ln
+    if not out:
+        return None
+    return struct.pack("<H", len(out)) + b"".join(out)
+
+
+#: KEY: cmd 43 = THE PER-SHOT HIT LIST (static 2026-09-27, the missing half of
+#: combat). The fire processor 0x61058CB0 ray-tests each shot (0x6104A460),
+#: lists the units it hit and SENDS the list as cmd 43 (0x6105A3AC) -- it
+#: never applies a gun/melee hit itself. Damage happens only when a cmd 43
+#: comes IN (receiver 0x611EEEA0, case 43 of 0x611EF2E0): each entry's target
+#: is looked up, skipped if it is a network copy (1340 == 2), otherwise the
+#: hit is built (0x611F0CD0), applied (0x611F1120 -> 0x61060EE0) and reported
+#: as cmd 42/29. In retail every peer got the shooter's list and each applied
+#: the hits on the units IT owns; we dropped it, so nothing ever took damage
+#: (one test battle: 148 shots, zero cmd 29/42). Body: u8 1, u8 n, u8 weapon slot
+#: (never rewrite: 0x611EEEF4 derefs NULL out of range), u8 type; then n x
+#: {u32 target, u16 damage, u8 angle, u8 part (0x80 = guard)}. Header +0x08 =
+#: the shooter. FMO_BATTLE_HIT_ECHO=0 turns the echo off.
+CMD_BM_HITLIST = 43
+BATTLE_HIT_ECHO = os.environ.get("FMO_BATTLE_HIT_ECHO", "1") not in ("0", "")
+
+
+def parse_hitlist(body):
+    """{'slot', 'type', 'hits': [(target, damage, angle, part)]} or None."""
+    if len(body) < 4 or body[0] != 1:
+        return None
+    n, out = body[1], []
+    for i in range(n):
+        at = 4 + i * 8
+        if at + 8 > len(body):
+            return None
+        t, d = struct.unpack_from("<IH", body, at)
+        out.append((t, d, body[at + 6], body[at + 7]))
+    return {"slot": body[2], "type": body[3], "hits": out}
+
+
+def id_for_viewer(uid, sender, viewer):
+    """The id `viewer`'s client knows the unit `sender`'s client calls `uid`
+    by: the sender's own unit -> the viewer's alias for the sender; the
+    sender's alias for some pilot X -> the viewer's own id when X is the
+    viewer, else the viewer's alias for X; anything else (squad ids, NPCs) is
+    the same number on every client."""
+    if uid == sender.self_unit():
+        return viewer.alias_for(sender.addr)
+    for other_addr, a in getattr(sender, "alias_of", {}).items():
+        if a == uid:
+            return (viewer.self_unit() if other_addr == viewer.addr
+                    else viewer.alias_for(other_addr))
+    return uid
+
+
+def hitlist_for_viewer(body, sender, viewer):
+    """A cmd-43 body with every target id rewritten for `viewer`."""
+    b = bytearray(body)
+    for i in range(b[1] if len(b) >= 2 else 0):
+        at = 4 + i * 8
+        if at + 4 > len(b):
+            break
+        t = struct.unpack_from("<I", b, at)[0]
+        struct.pack_into("<I", b, at, id_for_viewer(t, sender, viewer) & 0xFFFFFFFF)
+    return bytes(b)
+
+
+def hitlist_echo(chan, addr, body, arg8):
+    """Send a shooter's cmd 43 back to the shooter (self stream, verbatim) and
+    to every other battle pilot in the room (ids rewritten for each), so the
+    owner of each target applies the hit. Returns how many OTHER pilots got it."""
+    if not BATTLE_HIT_ECHO or arg8 is None or parse_hitlist(body) is None:
+        return 0
+    chan.pending.append(fmoworld.record(CMD_BM_HITLIST, body, arg8=arg8))
+    n = 0
+    for o in room_mates(chan):
+        if not _is_battle_chan(o):
+            continue
+        o.pending.append(fmoworld.record(
+            CMD_BM_HITLIST, hitlist_for_viewer(body, chan, o),
+            arg8=id_for_viewer(arg8, chan, o)))
+        n += 1
+    return n
+
+
+def squad_relay(chan, addr, cmd, body, arg8):
+    """The squad OWNER's records about the units it runs, to every other
+    pilot in the same squad, on their self stream, header +0x08 kept. The
+    owner's records about its OWN unit are never forwarded (a receiver would
+    look them up as ITS own unit). Returns how many pilots got it."""
+    sq = (BATTLE_STATE.get(addr[0]) or {}).get("squad")
+    if not sq or sq["owner"] != addr[0]:
+        return 0
+    ids = set(sq["ids"])
+    if cmd == CMD_BM_MOVE_BATCH:
+        body = squad_batch_filter(body, ids)
+        if body is None:
+            return 0
+    elif cmd in (CMD_BM_MOVE_ONE, CMD_BM_FIRE):
+        if arg8 not in ids:
+            return 0
+    elif cmd == fmoworld.CMD_BM_HIT:
+        h = fmoworld.parse_hit(body)
+        if not h or h["target"] not in ids:
+            return 0
+    else:
+        return 0
+    rec = fmoworld.record(cmd, body, arg8=arg8)
+    n = 0
+    for o in room_mates(chan):
+        if _is_battle_chan(o) and (BATTLE_STATE.get(o.addr[0]) or {}).get("squad") is sq:
+            o.pending.append(rec)
+            n += 1
+    return n
+
+
+def fire_relay(chan, addr, body, arg8):
+    """A pilot's OWN shot (cmd 30 naming its own unit) to every other battle
+    pilot in the room, on the shooter's alias stream there, with +0x08
+    rewritten to that alias. Returns how many got it."""
+    if not BATTLE_FIRE_RELAY or arg8 != chan.self_unit():
+        return 0
+    n = 0
+    for o in room_mates(chan):
+        if not _is_battle_chan(o):
+            continue
+        alias = o.alias_for(chan.addr)
+        rs = o.remotes.get(alias)
+        if rs is None or not rs.popped:
+            continue
+        rs.pending.append(fmoworld.record(CMD_BM_FIRE, body, arg8=alias))
+        n += 1
+    return n
+
+
+def squad_note_hits(chan, body, arg8):
+    """Remember who last HIT each squad unit, from a cmd-43 hit list: a squad
+    id (an enemy hit its own side) or the host whose pilot fired. Returns
+    [(target, shooter)] noted."""
+    sq = (BATTLE_STATE.get(chan.addr[0]) or {}).get("squad")
+    hl = parse_hitlist(body)
+    if not sq or not hl or arg8 is None:
+        return []
+    ids = set(sq["ids"])
+    if arg8 in ids:
+        who = ("npc", arg8)
+    elif arg8 == chan.self_unit():
+        who = ("host", chan.addr[0])
+    else:
+        who = next((("host", a[0]) for a, al in getattr(chan, "alias_of", {}).items()
+                    if al == arg8), ("npc", arg8))
+    out = []
+    for t, _d, _a, _p in hl["hits"]:
+        if t in ids:
+            sq.setdefault("last_hit", {})[t] = who
+            out.append((t, who))
+    return out
+
+
+def squad_credit_kill(sq, target, reporter, now=None, chans=None):
+    """The owner reported squad unit `target` DIED: mark it dead ONCE and
+    credit the kill. KEY: The hit list names the shooter (squad_note_hits): a
+    pilot's hit is that pilot's kill; an enemy's hit is FRIENDLY FIRE and pays
+    nobody (in one test battle two of three enemies were killed by their own side
+    and the old "whoever fired last" rule paid the pilot for both). Only when
+    no hit was seen does it fall back to the pilot who fired most recently.
+    Returns the credited host, or None (already dead, or friendly fire)."""
+    if target in sq["dead"]:
+        return None
+    sq["dead"].add(target)
+    now = now or time.time()
+    who = (sq.get("last_hit") or {}).get(target)
+    if who and who[0] == "npc":
+        sq.setdefault("friendly_fire", []).append((target, who[1]))
+        return None
+    if who and who[0] == "host":
+        battle_state(who[1]).setdefault("kills", []).append((target, now))
+        return who[1]
+    pool = [reporter] + [o for o in (room_mates(reporter) if chans is None else chans)
+                         if _is_battle_chan(o)]
+    best = None
+    for o in pool:
+        t = getattr(o, "last_fire", None)
+        if t is None or now - t > BATTLE_KILL_WINDOW:
+            continue
+        if best is None or t > best.last_fire:
+            best = o
+    host = (best or reporter).addr[0]
+    battle_state(host).setdefault("kills", []).append((target, now))
+    return host
+
+
 def room_queue(chan):
     """Introduce, then relay. Called once per inbound datagram on `chan`.
 
@@ -19284,6 +20147,24 @@ def room_queue(chan):
                 pos=tuple(other.pos[:3]) + (0.0,),
                 model_flags=_rf, model_sub=_rs,
                 type4_model=getattr(other, "type4_model", POP_SEX))
+            _bwz = battle_room_pop_args(chan, other, n1, n2)
+            if _bwz is not None:
+                # A room-mate in a BATTLE is their wanzer, not the lobby human.
+                rs.pop_args = _bwz
+                _rlook_now, rs.look_due = None, None     # the parts are the look
+                _hostile = battle_room_hostile(chan, other)
+                if _hostile:
+                    _bs = battle_state(chan.addr[0])
+                    _bs.setdefault("enemies", set()).add(alias)
+                    _bs["pvp"] = True            # war_settle weighs it double
+                log(f"[udp {chan.addr[0]}:{chan.addr[1]}] BATTLE ROOM: "
+                    f"{other.addr[0]} pops here as UnitID {alias:#x} with THEIR "
+                    f"battle POP (UnitType {_bwz.get('unit_type')}, nation "
+                    f"{_bwz.get('nation')}, {len(_bwz.get('parts') or ())} "
+                    f"part(s), client_kind 0 = alive) -> "
+                    + ("an ENEMY (nations differ): destroying it pays "
+                       "(battle_kills)" if _hostile else
+                       "FRIENDLY (same nation)"))
             try:
                 chan.pending.append(fmoworld.record_pop(
                     alias, look=_rlook_now, **rs.pop_args,
@@ -19466,6 +20347,7 @@ def battle_state(host, reset=False):
             "hold_since": None,          # entered the hold zone at
             "hold_said": None,           # last banner threshold announced
             "kills": [],                 # (target, when) from DIED hit records
+            "enemies": set(),            # UnitIDs this server popped as enemies
             "objective_banner": False,   # the opening banner went out
         }
     return st
@@ -19490,7 +20372,8 @@ def objective_tick(st, chan, now, objective=None):
         if kind == "hold":
             banners.append(f"OBJECTIVE: hold the zone for {obj[2]}s")
         else:
-            banners.append(f"OBJECTIVE: destroy unit {obj[1]:#x}")
+            banners.append("OBJECTIVE: destroy every enemy" if obj[1] == "all"
+                           else f"OBJECTIVE: destroy unit {obj[1]:#x}")
     if kind == "hold":
         inside = objective_zone_contains(obj[1], getattr(chan, "pos", None))
         if inside and st.get("hold_since") is None:
@@ -19510,6 +20393,12 @@ def objective_tick(st, chan, now, objective=None):
                         st["hold_said"] = mark
                         banners.append(f"{mark}s to hold")
                         break
+    elif kind == "destroy" and obj[1] == "all":
+        sq = st.get("squad")
+        if sq and sq["ids"] and set(sq["ids"]) <= sq["dead"]:
+            st["objective_done"] = (f"all {len(sq['ids'])} enemies were "
+                                    f"destroyed", now)
+            banners.append("OBJECTIVE COMPLETE")
     elif kind == "destroy":
         if any(t == obj[1] for t, _w in st.get("kills", [])):
             st["objective_done"] = (f"unit {obj[1]:#x} was destroyed", now)
@@ -19548,6 +20437,29 @@ def battle_end_trigger(st, triggers, now, limit_secs):
     return None
 
 
+def _credit_room_kill(victim, addr):
+    """`victim`'s client reported its OWN unit destroyed: credit the kill to
+    the hostile room-mate who shot last (battle_room_killer), under the alias
+    that pilot's client knows the victim by -- which is the id in its
+    battle_state "enemies", so battle_kills pays it. Once per victim alias."""
+    killer = battle_room_killer(victim, time.time())
+    if killer is None:
+        log(f"[udp {addr[0]}:{addr[1]}]   PvP: this pilot's own unit was "
+            f"DESTROYED; no hostile room-mate fired in the last "
+            f"{BATTLE_KILL_WINDOW:.0f}s, so no kill is credited.")
+        return None
+    alias = killer.alias_for(victim.addr)
+    kst = battle_state(killer.addr[0])
+    if any(t == alias for t, _w in kst.get("kills", [])):
+        return None
+    kst.setdefault("kills", []).append((alias, time.time()))
+    log(f"[udp {addr[0]}:{addr[1]}]   PvP: this pilot's own unit was DESTROYED "
+        f"-> kill credited to {killer.addr[0]} (their unit {alias:#x} for this "
+        f"pilot; they fired last). WARNING: Heuristic: the victim's client names no "
+        f"shooter.")
+    return killer
+
+
 def _note_battle_record(chan, addr, cmd, body):
     """Inbound records on the BATTLE channel that the loop should remember,
     not just log. Silent on the lobby channel."""
@@ -19562,6 +20474,17 @@ def _note_battle_record(chan, addr, cmd, body):
             f"build the cmd-0x64 receiver + cmd-128 damage relay + cmd-8 kill to "
             f"make the player's own shots destroy it.")
         return
+    if (cmd in (23, 24, 30) and BATTLE_DUMMY_AI and getattr(chan, "dummy_id", None)
+            and struct.pack("<I", chan.dummy_id) in bytes(body)
+            and not getattr(chan, "ai_seen", None)):
+        # VERIFIED: the CLIENT is running the enemy (FMO_BATTLE_DUMMY_AI): its
+        # movement batch (24/23) or a fire (30) names the enemy's id
+        chan.ai_seen = cmd
+        log(f"[udp {addr[0]}:{addr[1]}]   VERIFIED: ENEMY AI RUNNING: cmd {cmd} "
+            f"({'movement' if cmd != 30 else 'FIRE'}) carries the enemy "
+            f"{chan.dummy_id:#x} -- the client's brain "
+            f"{BATTLE_DUMMY_AI} drives it. Logged "
+            f"once per battle.")
     if cmd in (fmoworld.CLI_ESCAPE, fmoworld.CLI_ESCAPE_B):
         esc = fmoworld.parse_escape(body)
         st = battle_state(addr[0])
@@ -19582,6 +20505,8 @@ def _note_battle_record(chan, addr, cmd, body):
                 f"per-part damage table, +0x04.. body, +0x14.. weapons)")
         # VERIFIED: kind 3 offset >=0x14 = a WEAPON-slot wear sync = the player FIRED
         # (the only server-visible fire event). Feed the shoot-to-kill referee.
+        if kind == 3 and off >= 0x14:
+            chan.last_fire = time.time()          # battle_room_killer
         if REFEREE and kind == 3 and off >= 0x14:
             for _b in referee_shot(chan, addr):
                 hud_banner(chan, _b)
@@ -19592,9 +20517,27 @@ def _note_battle_record(chan, addr, cmd, body):
                 else fmoworld.parse_hit_batch(body))
         hits = [h for h in hits if h]
         st = battle_state(addr[0])
+        _sq = st.get("squad")
         for h in hits:
             if h["died"]:
+                if _sq and h["target"] in _sq["ids"]:
+                    if _sq["owner"] == addr[0]:
+                        _who = squad_credit_kill(_sq, h["target"], chan)
+                        if _who is None and h["target"] in _sq["dead"] and any(
+                                t == h["target"] for t, _s in _sq.get("friendly_fire", [])):
+                            log(f"[udp {addr[0]}:{addr[1]}]   SQUAD: enemy "
+                                f"{h['target']:#x} DESTROYED BY ITS OWN SIDE "
+                                f"(friendly fire) -- no kill credited; "
+                                f"{len(_sq['dead'])}/{len(_sq['ids'])} down")
+                        if _who:
+                            log(f"[udp {addr[0]}:{addr[1]}]   SQUAD: enemy "
+                                f"{h['target']:#x} DESTROYED, kill credited to "
+                                f"{_who} (fired last); "
+                                f"{len(_sq['dead'])}/{len(_sq['ids'])} down")
+                    continue
                 st["kills"].append((h["target"], time.time()))
+                if h["target"] == chan.self_unit():
+                    _credit_room_kill(chan, addr)
         log(f"[udp {addr[0]}:{addr[1]}]   cmd {cmd} = HIT"
             + (" BATCH" if cmd == fmoworld.CMD_BM_HIT_BATCH else "")
             + f": " + ("; ".join(f"target {h['target']:#x} part {h['part']} value "
@@ -19797,6 +20740,8 @@ def _serve_datagram(sock, peers, dg, addr):
                                    body=b"".join(alias_rs.pending)), addr)
         alias_rs.adopted = True
         return
+    if _is_battle_chan(chan):
+        BATTLE_SEEN[addr[0]] = time.time()      # see lobby_cast_paused
     chan.seen += 1
     if got["records"] or chan.seen <= 3:
         log(f"[udp {addr[0]}:{addr[1]}] peer={got['peer']} hid={got['hid']} "
@@ -19806,8 +20751,30 @@ def _serve_datagram(sock, peers, dg, addr):
             n = chan.cmd_seen.get(cmd, 0) + 1
             chan.cmd_seen[cmd] = n
             _note_battle_record(chan, addr, cmd, body)
+            _a8 = struct.unpack_from("<I", got["plain"], off + 8)[0] \
+                if off + 12 <= len(got["plain"]) else None
+            if _is_battle_chan(chan):
+                _nr = squad_relay(chan, addr, cmd, body, _a8)
+                if cmd == CMD_BM_HITLIST:
+                    squad_note_hits(chan, body, _a8)
+                    _ne = hitlist_echo(chan, addr, body, _a8)
+                    if chan.cmd_seen.get(cmd, 0) <= 3:
+                        _hl = parse_hitlist(body)
+                        log(f"[udp {addr[0]}:{addr[1]}]   cmd 43 HIT LIST from "
+                            f"{_a8:#x}: "
+                            + (", ".join(f"{t:#x} dmg {d} part {pt:#x}"
+                                         for t, d, _an, pt in _hl["hits"])
+                               if _hl else "(short)")
+                            + f" -> echoed to the shooter + {_ne} other "
+                            f"pilot(s); the TARGET's owner applies it")
+                if cmd == CMD_BM_FIRE:
+                    _nr += fire_relay(chan, addr, body, _a8)
+                if _nr and chan.cmd_seen.get(cmd, 0) <= 3:
+                    log(f"[udp {addr[0]}:{addr[1]}]   -> cmd {cmd} (source "
+                        f"{_a8:#x}) relayed to {_nr} other battle pilot(s)")
             log(f"[udp {addr[0]}:{addr[1]}]   +{off:03x} cmd {cmd} "
-                f"{size}B {body[:24].hex(' ')}")
+                f"{size}B src {(_a8 if _a8 is not None else 0):#x} "
+                f"{body[:24].hex(' ')}")
             # WARNING: THE 24-BYTE LINE ABOVE ONCE HID A WHOLE MESSAGE. 2026-08-22:
             # the client sent cmd 115, 100 bytes, and all we recorded was its
             # first 24 -- enough to see the sender's NAME and nothing of what
@@ -20241,7 +21208,8 @@ def _serve_datagram(sock, peers, dg, addr):
     # battle map does not hold misses that lookup and keeps our UnitType. This
     # is the only way to exercise the dressing chain without first breaking the
     # client_kind circle.
-    if (BATTLE_DUMMY and chan.popped and not chan.dummy_popped
+    if (BATTLE_DUMMY and not BATTLE_DUMMY_AI and chan.popped
+            and not chan.dummy_popped
             and chan.key and chan.key.endswith(b"battle")):
         chan.dummy_popped = True        # once, whatever happens below
         _duid, _dutype, _dpos = BATTLE_DUMMY
@@ -20273,6 +21241,8 @@ def _serve_datagram(sock, peers, dg, addr):
                 chan.pending.append(_drec)
                 chan.dummy_id = _duid
                 chan.dummy_pos = tuple(_dp[:3]) if _dp else None
+                # an enemy whose destruction pays (battle_kills)
+                battle_state(addr[0]).setdefault("enemies", set()).add(_duid)
                 if BATTLE_DUMMY_KILL > 0:
                     chan.dummy_kill_due = time.time() + BATTLE_DUMMY_KILL
                     chan.dummy_kill_sent = False
@@ -20301,6 +21271,54 @@ def _serve_datagram(sock, peers, dg, addr):
                     f"wreck (0x28) the self unit gets. Bar: `--wanzer` shows a "
                     f"SECOND unit, model class {_dutype}, with NON-ZERO part "
                     f"slots. It is not drivable and is not meant to be.")
+
+    # VERIFIED:KEY: THE ENEMY SQUAD (FMO_BATTLE_DUMMY_AI + FMO_BATTLE_ENEMIES): see
+    # battle_squad_for. Popped once per battle channel, after the self-POP.
+    if (BATTLE_DUMMY and BATTLE_DUMMY_AI and chan.popped
+            and not getattr(chan, "squad_popped", False)
+            and _is_battle_chan(chan)):
+        chan.squad_popped = True
+        if _BATTLE_ENEMIES_ERR:
+            log(f"[udp {addr[0]}:{addr[1]}] WARNING: {_BATTLE_ENEMIES_ERR} -- one enemy")
+        _selfuid = (POP_BATTLE or POP or (None,))[0] or 0
+        _base = (BATTLE_DUMMY[2] or (chan.pop_args or {}).get("pos")
+                 or next_pop_pos(WORLD_MAPS.get(addr[0]))[0])
+        _snat = BATTLE_DUMMY_NATION or {1: 2, 2: 1}.get(
+            pop_nation_for(addr[0])[0], 2)
+        _sparts = pop_parts_for(addr[0])[0]
+        _sq, _och = battle_squad_for(chan, _base, _snat, _sparts)
+        _mine = _sq["owner"] == addr[0]
+        _owner = _selfuid if _mine else (chan.alias_for(_och.addr) if _och else 0)
+        _bst = battle_state(addr[0])
+        _bst["squad"] = _sq
+        _bst.setdefault("enemies", set())
+        for _i, (_eid, _epos) in enumerate(zip(_sq["ids"], _sq["pos"])):
+            if _eid == _selfuid or _eid in _sq["dead"]:
+                continue
+            try:
+                chan.pending.append(fmoworld.record_pop(
+                    _eid, unit_type=BATTLE_DUMMY[1], pos=_epos, client_kind=1,
+                    name1="Enemy", name2=str(_i + 1), nation=_sq["nation"],
+                    side=enemy_side_for(addr[0])[0],
+                    parts=(_sq["parts"] or None),
+                    extra={POP_AI_OWNER: struct.pack("<I", _owner),
+                           POP_AI_BRAIN: struct.pack("<I", BATTLE_DUMMY_AI)}))
+            except ValueError as e:
+                log(f"[udp {addr[0]}:{addr[1]}] WARNING: SQUAD POP {_eid:#x} REFUSED "
+                    f"BY OUR OWN GUARD: {e}")
+                continue
+            _bst["enemies"].add(_eid)
+        chan.dummy_id = _sq["ids"][0]
+        chan.dummy_pos = tuple(_sq["pos"][0][:3])
+        log(f"[udp {addr[0]}:{addr[1]}] -> ENEMY SQUAD: {len(_sq['ids'])} AI "
+            f"wanzer(s) {', '.join(f'{i:#x}' for i in _sq['ids'])} (nation "
+            f"{_sq['nation']}, brain {BATTLE_DUMMY_AI}) round {tuple(_base[:3])}; "
+            + ("THIS client OWNS them (body+0x2C = its own id "
+               f"{_selfuid:#x}): it runs the brains, its cmd 23/24/30/29 about "
+               "them are relayed to the rest of the room."
+               if _mine else
+               f"owned by {_sq['owner']} (body+0x2C = its alias {_owner:#x} "
+               "here): network copies, moved by the owner's relayed records."))
 
     # VERIFIED: THE DUMMY KILL (FMO_BATTLE_DUMMY_KILL). Once, this many seconds after the
     # dummy was popped, DESTROY it with a cmd-8 DEPOP status 2 on the battle self
@@ -20379,7 +21397,17 @@ def _serve_datagram(sock, peers, dg, addr):
         _bst = battle_state(addr[0])
         _bst["start_sent"] = True
         try:
-            _bsr = fmoworld.record_battle_start(BATTLE_START)
+            # WARNING: cmd 138's +0x00 is WRITTEN to block+0x48 (0x611EFB2B,
+            # unconditionally). Sending 0 there wiped the sortie's battle
+            # start right after the Battle Review recorder had written its
+            # header, so every frame measured from 0 and clamped (seen in
+            # the recorded file: header start correct, all 20 frame times 0).
+            # Repeat the sortie's stamp; a sortie without one (the 0x014E
+            # push) gets "now", slightly early rather than late.
+            _stamp = ((_bst.get("start_unix") or int(time.time()) - 5)
+                      if BATTLE_START_TIME else 0)
+            _bsr = fmoworld.record_battle_start(BATTLE_START,
+                                                start_gametime=_stamp)
         except ValueError as e:
             log(f"[udp {addr[0]}:{addr[1]}] WARNING: FMO_BATTLE_START={BATTLE_START} "
                 f"refused: {e}")
@@ -20434,7 +21462,8 @@ def _serve_datagram(sock, peers, dg, addr):
     # POPs. Not on a battle channel (the arm's ranges are the lobby cast).
     # See POP_NPC.
     if (npc_cast_configured() and chan.popped and not chan.npcs_popped
-            and chan.key and not chan.key.endswith(b"battle")):
+            and chan.key and not chan.key.endswith(b"battle")
+            and not lobby_cast_paused(addr[0])):
         _self_pos = ((chan.pop_args or {}).get("pos")
                      or next_pop_pos(WORLD_MAPS.get(addr[0]))[0])
         _n_ok = 0
@@ -20498,7 +21527,8 @@ def _serve_datagram(sock, peers, dg, addr):
     if ((POP_NPC_RELOOK > 0 or POP_NPC_REPOP > 0) and chan.npcs_popped
             and not chan.npc_relook_sent
             and chan.npc_relook_due and time.time() >= chan.npc_relook_due
-            and chan.key and not chan.key.endswith(b"battle")):
+            and chan.key and not chan.key.endswith(b"battle")
+            and not lobby_cast_paused(addr[0])):
         _rl_self = ((chan.pop_args or {}).get("pos")
                     or next_pop_pos(WORLD_MAPS.get(addr[0]))[0])
         _rl_n = 0
@@ -21890,7 +22920,8 @@ def selftest():
     ok &= s_off
     # Explicit MapNo 38, endpoint on: those two fields and NOTHING else.
     body = reply_013a(mapno="38", ep_enable=True, host="203.0.113.3", port=61300,
-                      leader="", bgcostmax="", totalbgcost="", battleticket="")
+                      leader="", bgcostmax="", totalbgcost="", battleticket="",
+                      start_time=0)  # the stamp has its own check
     want_ep = (endpoint_net if EP_0153_NET else endpoint)("203.0.113.3", 61300)
     scrub = bytearray(body)
     scrub[R13A_ENDPOINT:R13A_ENDPOINT + ENDPOINT_LEN] = bytes(ENDPOINT_LEN)
@@ -21977,7 +23008,8 @@ def selftest():
     # their readers look and nothing else moves.
     body = reply_014e(mapno="418", time_s=10, dest="Oak Hills City",
                       ep_enable=True, host="203.0.113.3", port=61300,
-                      leader="", bgcostmax="", totalbgcost="", battleticket="")
+                      leader="", bgcostmax="", totalbgcost="", battleticket="",
+                      start_time=0)  # the stamp has its own check
     want_ep = (endpoint_net if EP_0153_NET else endpoint)("203.0.113.3", 61300)
     want_dest = "Oak Hills City".encode("cp932")[:R14E_DEST_LEN - 1] + b"\0"
     scrub = bytearray(body)
@@ -28798,6 +29830,403 @@ def selftest():
           f"-> ONE credit (+500 H$, +40 contribution), 10 -> 50 on both "
           f"packets: {'OK' if _one_ok else 'FAIL'} ({len(_credits)} credit(s))")
     ok &= _one_ok
+    # PERFORMANCE PAY: kills and the verdict move the settlement.
+    _st_k = {"enemies": {0x2222, 0x3333},
+             "kills": [(1, 0.0), (0x2222, 1.0), (0x2222, 2.0), (0x3333, 3.0)]}
+    _pp_ok = battle_kills(_st_k) == [0x2222, 0x3333]      # own unit + repeat dropped
+    _pp_ok &= battle_kills(None) == [] and battle_kills({"kills": [(5, 0)]}) == []
+    _knobs = dict(kill_contrib=100, kill_bonus_hs=250, win_money=1000,
+                  win_contrib=300, kill_exp=[(1, 5)])
+    _pw = battle_pay(2, True, money=500, contrib=40, exp_rows=[(1, 10), (2, 3)],
+                     **_knobs)
+    _pl2 = battle_pay(2, False, money=500, contrib=40, exp_rows=[(1, 10)], **_knobs)
+    _p0 = battle_pay(0, False, money=500, contrib=40, **_knobs)
+    _pflat = battle_pay(3, True, money=500, contrib=40, kill_contrib=0,
+                        kill_bonus_hs=0, win_money=0, win_contrib=0, kill_exp=())
+    _pp_ok &= (_pw["money"] == 1500 and _pw["contribution"] == 540
+               and dict(_pw["exp_rows"]) == {1: 20, 2: 3}
+               and _pw["kill_bonus_hs"] == 500
+               and _pl2["money"] == 500 and _pl2["contribution"] == 240
+               and _p0["money"] == 500 and _p0["contribution"] == 40
+               and _p0["kill_bonus_hs"] == 0 and _p0["exp_rows"] == []
+               and _pflat["money"] == 500 and _pflat["contribution"] == 40)
+    # ...and through the session: the end trigger's verdict + the kill ledger
+    # reach the ONE credit, and a withdraw settles as a loss.
+    _saved = {k: _g[k] for k in ("RESULT_PUSH", "RESULT_MONEY", "RESULT_CONTRIB",
+                                 "BATTLE_END_CONTRIB", "BATTLE_END_EXP",
+                                 "KILL_CONTRIB", "KILL_BONUS_HS", "WIN_MONEY",
+                                 "WIN_CONTRIB", "KILL_EXP")}
+    _credits, _owed = [], []
+    try:
+        _g.update(RESULT_PUSH=True, RESULT_MONEY=500, RESULT_CONTRIB=40,
+                  BATTLE_END_CONTRIB=0, BATTLE_END_EXP="", KILL_CONTRIB=100,
+                  KILL_BONUS_HS=250, WIN_MONEY=1000, WIN_CONTRIB=300, KILL_EXP="")
+        for _won_in in (True, False):
+            BATTLE_STATE["selftest-perf"] = {"enemies": {0x2222},
+                                             "kills": [(0x2222, 1.0)]}
+            _s = Session.__new__(Session)
+            _s.peer, _s.ip = "selftest-perf", "selftest-perf"
+            _s.battle_settlement = None
+            _s.last_0159 = b""
+            _s.playing_char = lambda: {"money": 100, "contribution": 10}
+            _s.stored_money = lambda: (100, 10)
+            _s.credit_money = (lambda why, money=0, contribution=0:
+                               (_credits.append((money, contribution)),
+                                (100 + money, 10 + contribution))[1])
+            _s.credit_class_exp = lambda why, rows: {}
+            _s.owe_kill_bonus = lambda hs, n: _owed.append((hs, n))
+            _s.battle_result_push(0x1234, "the selftest", won=_won_in)
+            _s.battle_end_push(0x1234, why="selftest", won=_won_in)
+        _pp_ok &= (_credits == [(1500, 440), (500, 140)]
+                   and _owed == [(250, 1), (250, 1)])
+    finally:
+        _g.update(_saved)
+        BATTLE_STATE.pop("selftest-perf", None)
+    print(f"  performance pay: kills count only popped enemies, once each; a "
+          f"win adds FMO_WIN_*, each kill FMO_KILL_CONTRIB / FMO_KILL_EXP and a "
+          f"Kill bonus line; a loss keeps the kill pay, the knobs at 0 are the "
+          f"flat pay: {'OK' if _pp_ok else 'FAIL'} (credits {_credits})")
+    ok &= _pp_ok
+    # TWO PILOTS IN ONE BATTLE: a battle room-mate pops as THEIR wanzer.
+    import types as _types2
+    _now = time.time()
+    _pa = dict(unit_type=0, name1="A", name2="B", pos=(1.0, 2.0, 3.0),
+               model_flags=None, model_sub=None, type4_model=1, client_kind=3,
+               nation=1, parts=[(0, 0x10, 5)], side=0)
+    _v = _types2.SimpleNamespace(key=b"%xbattle", pop_args=dict(_pa),
+                                 pos=(1.0, 2.0, 3.0))
+    _o = _types2.SimpleNamespace(key=b"%xbattle", pos=(9.0, 2.0, 9.0),
+                                 pop_args=dict(_pa, nation=2, side=1),
+                                 last_fire=_now - 2)
+    _f = _types2.SimpleNamespace(key=b"%xbattle", pos=(5.0, 2.0, 5.0),
+                                 pop_args=dict(_pa), last_fire=_now - 1)
+    _lob = _types2.SimpleNamespace(key=b"%xlobby", pos=(0, 0, 0),
+                                   pop_args=dict(_pa, unit_type=4))
+    _ra = battle_room_pop_args(_v, _o, "Rem", "Ote")
+    _br_ok = (_ra is not None and _ra["client_kind"] == 0 and _ra["nation"] == 2
+              and _ra["parts"] == [(0, 0x10, 5)] and _ra["pos"][:3] == (9.0, 2.0, 9.0)
+              and _ra["name1"] == "Rem" and "model_flags" not in _ra
+              and battle_room_pop_args(_lob, _o, "x", "y") is None
+              and battle_room_pop_args(_v, _types2.SimpleNamespace(
+                  key=b"%xbattle", pos=(0, 0, 0), pop_args=dict(_pa, unit_type=4)),
+                  "x", "y") is None
+              and battle_room_hostile(_v, _o) and not battle_room_hostile(_v, _f)
+              and battle_room_killer(_v, _now, mates=[_o, _f]) is _o
+              and battle_room_killer(_v, _now + 60, mates=[_o, _f]) is None
+              and battle_room_killer(_v, _now, mates=[_f]) is None)
+    # FMO_BATTLE_DUMMY_AI: the POP that makes the client run the enemy
+    _ai = fmoworld.record_pop(0x2222, unit_type=0, client_kind=1, nation=2,
+                              extra={POP_AI_OWNER: struct.pack("<I", 1),
+                                     POP_AI_BRAIN: struct.pack("<I", 101)})
+    _aib = _ai[fmoworld.REC_HDR:]
+    _ai_ok = (struct.unpack_from("<I", _aib, 0)[0] == 1
+              and struct.unpack_from("<I", _aib, POP_AI_OWNER)[0] == 1
+              and struct.unpack_from("<I", _aib, POP_AI_BRAIN)[0] == 101
+              and POP_AI_BRAIN >= fmoworld.POP_PARTS + fmoworld.POP_PART_COUNT
+              * fmoworld.POP_PART_STRIDE
+              and POP_AI_OWNER >= fmoworld.POP_POS + 16)
+    print(f"  enemy AI pop: client_kind 1, owner at +0x{POP_AI_OWNER:X}, brain "
+          f"at +0x{POP_AI_BRAIN:X}, clear of the position and part array: "
+          f"{'OK' if _ai_ok else 'FAIL'}")
+    ok &= _ai_ok
+    # THE ENEMY SQUAD: parsing, the ring, the cmd-24 filter, one owner per
+    # room, a kill credited once to the last shooter, destroy:all, fire relay.
+    _sqf = []
+
+    def _sc(n, v):
+        if not v:
+            _sqf.append(n)
+        return bool(v)
+
+    _sq_ok = _sc(1, parse_battle_enemies("3:40") == (3, 40.0)
+                 and parse_battle_enemies("") == (1, 30.0)
+                 and parse_battle_enemies("99") == (8, 30.0))
+    _ring = squad_positions((10.0, 5.0, 20.0, 0.0), 4, 10.0, 40.0)
+    _sq_ok &= _sc(2, len(_ring) == 4 and all(len(p) == 4 and p[1] == 5.0
+                                             and abs(p[0] - 20.0) < 1e-6 for p in _ring)
+                  and [round(p[2]) for p in _ring] == [-40, 0, 40, 80]
+                  and squad_gap("3:80:25") == 25.0 and squad_gap("3:80") == 40.0)
+    # state: flags 0x03 = pos (6) + facing (2) -> 16 bytes
+    _stt = bytes([0, 0x03]) + bytes(14)
+    _b24 = (struct.pack("<H", 3) + struct.pack("<I", 1) + _stt
+            + struct.pack("<I", 0x2222) + _stt + struct.pack("<I", 0x2223) + _stt)
+    _f = squad_batch_filter(_b24, {0x2222, 0x2223})
+    _sq_ok &= _sc(3, move_state_len(_stt) == 16 and _f is not None
+                  and struct.unpack_from("<H", _f, 0)[0] == 2
+                  and struct.unpack_from("<I", _f, 2)[0] == 0x2222
+                  and len(_f) == 2 + 2 * 20
+                  and squad_batch_filter(_b24, {0x9999}) is None
+                  and squad_batch_filter(_b24[:-3], {0x2222}) is None)
+    import types as _types3
+    _gs = globals()
+    _sv = {k: _gs[k] for k in ("BATTLE_DUMMY", "BATTLE_ENEMIES")}
+    try:
+        _gs.update(BATTLE_DUMMY=(0x2222, 0, None), BATTLE_ENEMIES=(2, 30.0))
+        BATTLE_SQUADS.clear()
+        for _h in ("sqA", "sqB"):
+            BATTLE_STATE.pop(_h, None)
+            battle_state(_h, reset=True)
+        WORLD_MAPS["sqA"] = WORLD_MAPS["sqB"] = 418
+        _cA = _types3.SimpleNamespace(addr=("sqA", 1), key=b"%xbattle",
+                                      last_fire=None)
+        _cB = _types3.SimpleNamespace(addr=("sqB", 1), key=b"%xbattle",
+                                      last_fire=None)
+        _s1, _o1 = battle_squad_for(_cA, (0, 0, 0, 0), 2, [], mates=[])
+        _s2, _o2 = battle_squad_for(_cB, (0, 0, 0, 0), 2, [], mates=[_cA])
+        _sq_ok &= _sc(4, _s1 is _s2 and _s1["owner"] == "sqA" and _o2 is _cA
+                      and _s1["ids"] == [0x2222, 0x2223])
+        # the owner gone from the room -> the next pilot starts its own squad
+        _s3, _o3 = battle_squad_for(_cB, (0, 0, 0, 0), 2, [], mates=[])
+        _sq_ok &= _sc(5, _s3 is not _s1 and _s3["owner"] == "sqB" and _o3 is None)
+        # a new sortie by the owner -> a fresh squad
+        battle_state("sqB", reset=True)["granted_at"] += 5
+        _s4, _ = battle_squad_for(_cB, (0, 0, 0, 0), 2, [], mates=[])
+        _sq_ok &= _sc(6, _s4 is not _s3)
+        # the kill: once, to whoever fired last (B), not the reporting owner
+        _now = time.time()
+        _cA.last_fire, _cB.last_fire = _now - 5, _now - 1
+        _k1 = squad_credit_kill(_s1, 0x2222, _cA, now=_now, chans=[_cB])
+        _k2 = squad_credit_kill(_s1, 0x2222, _cA, now=_now, chans=[_cB])
+        _cA.last_fire = _cB.last_fire = None
+        _k3 = squad_credit_kill(_s1, 0x2223, _cA, now=_now, chans=[_cB])
+        _sq_ok &= _sc(7, _k1 == "sqB" and _k2 is None and _k3 == "sqA"
+                      and any(t == 0x2222 for t, _w in BATTLE_STATE["sqB"]["kills"])
+                      and _s1["dead"] == {0x2222, 0x2223})
+        # the hit list names the shooter: a pilot's hit is that pilot's kill,
+        # an enemy's hit is friendly fire and pays nobody
+        _s5 = {"ids": [0x3001, 0x3002], "dead": set(), "last_hit": {}}
+        BATTLE_STATE["sqS"] = {"squad": _s5}
+        _cS = _types3.SimpleNamespace(addr=("sqS", 1), key=b"%xbattle",
+                                      self_unit=lambda: 1, alias_of={},
+                                      last_fire=None)
+        _hl1 = bytes([1, 1, 0, 0]) + struct.pack("<IHBB", 0x3001, 99, 0, 1)
+        _hl2 = bytes([1, 1, 0, 0]) + struct.pack("<IHBB", 0x3002, 99, 0, 1)
+        _n1 = squad_note_hits(_cS, _hl1, 1)          # the pilot hit 0x3001
+        _n2 = squad_note_hits(_cS, _hl2, 0x3001)     # an enemy hit 0x3002
+        _kS1 = squad_credit_kill(_s5, 0x3001, _cS, now=_now, chans=[])
+        _kS2 = squad_credit_kill(_s5, 0x3002, _cS, now=_now, chans=[])
+        _sq_ok &= _sc(11, _n1 == [(0x3001, ("host", "sqS"))]
+                      and _n2 == [(0x3002, ("npc", 0x3001))]
+                      and _kS1 == "sqS" and _kS2 is None
+                      and _s5["friendly_fire"] == [(0x3002, 0x3001)]
+                      and _s5["dead"] == {0x3001, 0x3002})
+        BATTLE_STATE.pop("sqS", None)
+        # destroy:all completes once every squad unit is dead
+        _stq = {"squad": _s1, "kills": []}
+        _bn = objective_tick(_stq, _cA, _now, objective=("destroy", "all", None))
+        _sq_ok &= _sc(8, parse_objective("destroy:all") == ("destroy", "all", None)
+                      and "OBJECTIVE COMPLETE" in _bn and _stq["objective_done"])
+        _stq2 = {"squad": dict(_s1, dead={0x2222}), "kills": []}
+        objective_tick(_stq2, _cA, _now, objective=("destroy", "all", None))
+        _sq_ok &= _sc(9, not _stq2.get("objective_done"))
+        # fire relay: B's own shot reaches A on B's alias stream, +0x08 = alias
+        _rs = _types3.SimpleNamespace(popped=True, pending=[])
+        _cA2 = _types3.SimpleNamespace(addr=("sqA", 1), key=b"%xbattle",
+                                       alias_for=lambda a: 0x200,
+                                       remotes={0x200: _rs})
+        _cB2 = _types3.SimpleNamespace(addr=("sqB", 1), key=b"%xbattle",
+                                       self_unit=lambda: 1)
+        _svr = _gs["room_mates"]
+        _gs["room_mates"] = lambda c: [_cA2] if c is _cB2 else []
+        try:
+            _nf = fire_relay(_cB2, ("sqB", 1), bytes(0x18), 1)
+            _nf2 = fire_relay(_cB2, ("sqB", 1), bytes(0x18), 0x2222)
+        finally:
+            _gs["room_mates"] = _svr
+        _sq_ok &= _sc(10, _nf == 1 and _nf2 == 0 and len(_rs.pending) == 1
+                      and struct.unpack_from("<I", _rs.pending[0], 8)[0] == 0x200
+                      and struct.unpack_from("<I", _rs.pending[0], 4)[0] == CMD_BM_FIRE)
+    except Exception as _e:
+        print(f"  squad: EXC {_e!r}")
+        _sq_ok = False
+    finally:
+        _gs.update(_sv)
+        BATTLE_SQUADS.clear()
+        for _h in ("sqA", "sqB"):
+            BATTLE_STATE.pop(_h, None)
+            WORLD_MAPS.pop(_h, None)
+    print(f"  squad: n[:spread] parses, a ring of drop points, the cmd-24 filter "
+          f"keeps only squad entries, one owner per room (handover when it "
+          f"leaves, fresh per sortie), a kill counted once and credited to the "
+          f"last shooter, destroy:all, own fire relayed with +0x08 = the alias: "
+          f"{'OK' if _sq_ok else 'FAIL at ' + str(_sqf)}")
+    ok &= _sq_ok
+    # CEASEFIRE BONUS + OFFICER REVIEW (SE's rules, our numbers).
+    _rf = []
+
+    def _rc(n, v):
+        if not v:
+            _rf.append(n)
+        return bool(v)
+
+    _rv_ok = _rc(1, ceasefire_share({"ocu": 30, "usn": 36}, 1) == 1.0     # 45:55 < 6:4
+                 and abs(ceasefire_share({"ocu": 20, "usn": 46}, 2) - 46 / 66 / 0.5) < 1e-9
+                 and ceasefire_share({"ocu": 20, "usn": 46}, 1) < 1.0
+                 and ceasefire_share({"ocu": 0, "usn": 0}, 1) == 1.0)
+    _eq = {"ocu": 33, "usn": 33}
+    _b9, _b10, _b20, _b21, _b24 = (ceasefire_bonus(r, 1, _eq) for r in (9, 10, 20, 21, 24))
+    _rv_ok &= _rc(2, _b9 is None and _b24 is None
+                  and _b10 == (rank_pay(10)[0] * CEASEFIRE_DAYS,
+                               int(round((rank_threshold(10) or 0)
+                                         * CEASEFIRE_CONTRIB_PCT / 100)), 0)
+                  and _b20[2] == 0 and _b20[1] > 0
+                  and _b21[1] == 0 and _b21[2] == rank_pay(21)[1] * CEASEFIRE_MP_DAYS)
+    _cfc = {}
+    _rv_ok &= _rc(3, ceasefire_owed(_cfc, {"1": _eq}) == []
+                  and _cfc["ceasefire_paid"] == [1]
+                  and ceasefire_owed(_cfc, {"1": _eq, "2": _eq}) == [(2, _eq)])
+    _rv_ok &= _rc(4, review_verdict(20, 3, "full", promote_n=3) == "promote"
+                  and review_verdict(20, 1, "full", promote_n=3) == "keep"
+                  and review_verdict(20, 0, "full", promote_n=3) == "demote"
+                  and review_verdict(20, 0, "promote", promote_n=3) == "keep"
+                  and review_verdict(20, 5, "full", promote_n=3, slot_free=False) == "keep"
+                  and review_verdict(23, 9, "full", promote_n=3) == "keep"
+                  and review_verdict(19, 9, "full") is None
+                  and review_verdict(20, 9, "0") is None)
+    _dc = review_demoted_contribution(19)
+    _rv_ok &= _rc(5, (rank_threshold(19) or 0) < _dc < (rank_threshold(20) or 0)
+                  and rank_for_contribution(_dc) == 19)
+    _T = 1_800_000_000
+    _iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    _rch = {"missions": [
+        {"cat": 2, "status": "complete", "reported": _iso(_T - 100)},
+        {"cat": 2, "status": "complete", "reported": _iso(_T - 10 * DAY)},
+        {"cat": 3, "status": "complete", "reported": _iso(_T - 100)},
+        {"cat": 2, "status": "met", "reported": _iso(_T - 100)}]}
+    _rv_ok &= _rc(6, review_successes(_rch, 20, _T - 7 * DAY, _T) == 1
+                  and review_successes(_rch, 21, _T - 7 * DAY, _T) == 1)
+    # through a session: a Captain with 3 sector wins in the period -> Major;
+    # one with none under 'full' -> First Lieutenant at ~90% of the bar
+    _gr = globals()
+    _svr = {k: _gr[k] for k in ("REVIEW", "REVIEW_PROMOTE", "REVIEW_CAPS")}
+    try:
+        _gr.update(REVIEW="full", REVIEW_PROMOTE=3, REVIEW_CAPS={})
+        _rs = Session("selftest-review:1")
+        _rs.commit = lambda what: None
+        _up = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * DAY,
+               "missions": [{"cat": 2, "status": "complete",
+                             "reported": _iso(_T - i * DAY)} for i in (1, 2, 3)]}
+        _dn = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * DAY}
+        _new = {"rank": 20}
+        _v1 = _rs.officer_review(_up, now=_T)
+        _v2 = _rs.officer_review(_dn, now=_T)
+        _v3 = _rs.officer_review(_new, now=_T)
+        _v4 = _rs.officer_review(dict(_up, review_at=_T - DAY), now=_T)
+        _rv_ok &= _rc(7, _v1 == "promote" and _up["rank"] == 21
+                      and _up["review_at"] == _T
+                      and _v2 == "demote" and _dn["rank"] == 19
+                      and _dn["contribution"] == review_demoted_contribution(19)
+                      and _v3 is None and _new["review_at"] == _T
+                      and _v4 is None)
+    finally:
+        _gr.update(_svr)
+    # the ceasefire through a session: baseline first, then the next phase pays
+    _svc = {k: _gr[k] for k in ("CEASEFIRE", "war_state", "_war_tick")}
+    try:
+        _war = _types3.SimpleNamespace(data={"phases": {"1": _eq}})
+        _gr.update(CEASEFIRE=True, war_state=lambda: _war,
+                   _war_tick=lambda st: None)
+        _cs = Session("selftest-cease:1")
+        _cs.commit = lambda what: None
+        _cred = []
+        _cs.credit_money = lambda why, money=0, contribution=0: _cred.append(contribution)
+        _cc = {"rank": 12}
+        _p1 = _cs.pay_ceasefire(_cc)
+        _war.data["phases"]["2"] = {"ocu": 50, "usn": 16}
+        _p2 = _cs.pay_ceasefire(_cc)
+        _p3 = _cs.pay_ceasefire(_cc)
+        _rv_ok &= _rc(8, _p1 == [] and len(_p2) == 1 and _p2[0][0] == 2
+                      and _p3 == [] and _cc["ceasefire_paid"] == [1, 2]
+                      and len(_cc.get("mission_pay") or []) == 1
+                      and _cc["mission_pay"][0]["kind"] == PAY_CITY
+                      and _cred and _cred[0] == _p2[0][1][1])
+    finally:
+        _gr.update(_svc)
+    # steps 2, 5 and 8 price the bonus and the demotion off the rank ladder,
+    # which only exists once fmodata/ is built from the user's own client
+    _rv_skip = _fmodata_skip("fmo-ranks.tsv")
+    _rv_hard = [n for n in _rf if not (_rv_skip and n in (2, 5, 8))]
+    print(f"  ceasefire + review: the 6:4 split, the bonus by rank band (none "
+          f"below First Sergeant), no back-pay on the first check, SE's "
+          f"keep/promote/demote with a slot cap, a demotion leaves the bar at "
+          f"~90%, both through a session: "
+          + ("OK" if _rv_ok else "FAIL at " + str(_rv_hard) if _rv_hard
+             else f"OK, steps 2/5/8 {_rv_skip}"))
+    ok &= not _rv_hard
+    # cmd 43 HIT LIST: decoded, echoed to the shooter verbatim, and to a room-
+    # mate with ids rewritten; the mission block carries the battle side.
+    _hf = []
+
+    def _hc(n, v):
+        if not v:
+            _hf.append(n)
+        return bool(v)
+
+    # a captured shape: 1, n=2, slot 0, type 0; (0x2223, 99, 0xc2, 1), (1, 99, 0x3e, 0)
+    _hl = (bytes([1, 2, 0, 0]) + struct.pack("<IHBB", 0x2223, 99, 0xC2, 1)
+           + struct.pack("<IHBB", 1, 99, 0x3E, 0))
+    _p = parse_hitlist(_hl)
+    _h_ok = _hc(1, _p == {"slot": 0, "type": 0,
+                         "hits": [(0x2223, 99, 0xC2, 1), (1, 99, 0x3E, 0)]}
+                and parse_hitlist(b"\x02\x01\x00\x00") is None
+                and parse_hitlist(bytes([1, 3, 0, 0]) + bytes(8)) is None)
+    import types as _types4
+    _A = _types4.SimpleNamespace(addr=("hA", 1), key=b"%xbattle", pending=[],
+                                 alias_of={("hB", 1): 0x200},
+                                 self_unit=lambda: 1)
+    _A.alias_for = lambda a: _A.alias_of[a]
+    _B = _types4.SimpleNamespace(addr=("hB", 1), key=b"%xbattle", pending=[],
+                                 alias_of={("hA", 1): 0x201},
+                                 self_unit=lambda: 1)
+    _B.alias_for = lambda a: _B.alias_of[a]
+    _h_ok &= _hc(2, id_for_viewer(1, _A, _B) == 0x201          # A's own unit
+                 and id_for_viewer(0x200, _A, _B) == 1         # A's alias for B = B itself
+                 and id_for_viewer(0x2223, _A, _B) == 0x2223)  # squad id unchanged
+    _gh = globals()
+    _svh = _gh["room_mates"]
+    _gh["room_mates"] = lambda c: [_B] if c is _A else []
+    try:
+        _ne = hitlist_echo(_A, ("hA", 1), _hl, 1)
+    finally:
+        _gh["room_mates"] = _svh
+    _selfrec, _materec = (_A.pending[0] if _A.pending else b""), (_B.pending[0] if _B.pending else b"")
+    _mb = _materec[fmoworld.REC_HDR:]
+    _h_ok &= _hc(3, _ne == 1 and len(_A.pending) == 1 and len(_B.pending) == 1
+                 and struct.unpack_from("<I", _selfrec, 4)[0] == CMD_BM_HITLIST
+                 and struct.unpack_from("<I", _selfrec, 8)[0] == 1
+                 and _selfrec[fmoworld.REC_HDR:] == _hl
+                 and struct.unpack_from("<I", _materec, 8)[0] == 0x201
+                 and parse_hitlist(_mb)["hits"] == [(0x2223, 99, 0xC2, 1),
+                                                    (0x201, 99, 0x3E, 0)])
+    _mf = {l: (o, r) for l, o, r, _s in mission_fields(side=2)}
+    _h_ok &= _hc(4, _mf.get("BattleSide") == (MB_BATTLE_SIDE, b"\x02")
+                 and "BattleSide" not in {l for l, *_ in mission_fields(side=0)})
+    _b13a = reply_013a(mapno="38", ep_enable=False, side=1)
+    _h_ok &= _hc(5, _b13a is not None and _b13a[R13A_BLOCK + MB_BATTLE_SIDE] == 1)
+    _t0 = int(time.time())
+    _b13t = reply_013a(mapno="38", ep_enable=False)
+    _st13 = struct.unpack_from("<I", _b13t, R13A_BLOCK + MB_START_GAMETIME)[0] if _b13t else 0
+    _b13z = reply_013a(mapno="38", ep_enable=False, start_time=0)
+    _lu = Session("selftest-01a5:1").on_packet(parse(build(MSG_LOG_UPLOAD, b"hello log", seq=0x55, conn_id=1)))
+    _h_ok &= _hc(6, _t0 - 5 <= _st13 <= _t0 + 5
+                 and struct.unpack_from("<I", _b13z, R13A_BLOCK + MB_START_GAMETIME)[0] == 0
+                 and len(_lu) == 1 and parse(_lu[0])["msg"] == 1)
+    BATTLE_SEEN["cast-test"] = time.time()
+    _h_ok &= _hc(7, lobby_cast_paused("cast-test")
+                 and not lobby_cast_paused("cast-test", now=time.time() + 60)
+                 and not lobby_cast_paused("never-battled"))
+    BATTLE_SEEN.pop("cast-test", None)
+    print(f"  cmd 43 hit list: decoded; echoed verbatim to the shooter and to a "
+          f"room-mate with the shooter/target ids rewritten into its numbering; "
+          f"the battle side byte at block+0x{MB_BATTLE_SIDE:X}: "
+          f"{'OK' if _h_ok else 'FAIL at ' + str(_hf)}")
+    ok &= _h_ok
+    print(f"  battle room: a battle room-mate pops with THEIR pop (alive, their "
+          f"nation and parts), a lobby channel keeps the human, a different "
+          f"nation is hostile, and a death is credited to the hostile mate who "
+          f"fired in the last {BATTLE_KILL_WINDOW:.0f}s: "
+          f"{'OK' if _br_ok else 'FAIL'}")
+    ok &= _br_ok
     # 0x0159 = the script's server call: {event @+0x000, params[16] @+0x458},
     # the shape 0x610F9CB0 / 0x610F9E80 build and the live captures show.
     _rec = bytearray(S159_BODY_LEN)
