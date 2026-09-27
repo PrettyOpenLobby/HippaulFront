@@ -233,6 +233,14 @@ RELEASE_DEFAULTS = {
     "FMO_BATTLE_START": "2", "FMO_BATTLE_END": "escape,limit",
     "FMO_BATTLE_END_EXP": "3:40", "FMO_UDP_GROUP_LEADER": "auto",
     "FMO_RESULT_PUSH": "1", "FMO_RESULT_MONEY": "2500", "FMO_RESULT_CONTRIB": "11",
+    # battle pay on top of the flat result: per enemy destroyed, and per win
+    "FMO_KILL_CONTRIB": "50", "FMO_KILL_BONUS_HS": "500",
+    "FMO_WIN_MONEY": "1500", "FMO_WIN_CONTRIB": "30",
+    # the client runs the enemy (brain 101): a squad of 3, 120 units out, 40 apart
+    "FMO_BATTLE_DUMMY_AI": "101", "FMO_BATTLE_ENEMIES": "3:120:40",
+    # the player trade service, the phase-end ceasefire bonus, and the officer
+    # review above Captain (keep or promote, never demote)
+    "FMO_TRADE": "1", "FMO_CEASEFIRE": "1", "FMO_REVIEW": "promote",
     # missions, the war map, pay
     "FMO_MISSION_AREA": "map", "FMO_MISSION_TIME": "1800",
     "FMO_MSN": "1",
