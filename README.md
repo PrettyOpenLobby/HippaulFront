@@ -97,6 +97,19 @@ server runs with are the private deployment's, listed in `services/fmo.py`
 ones. To change a knob, set it in `.env` and add it to the `fmo` service's
 environment (compose enumerates what reaches the container).
 
+These battle and economy knobs are on by default (set one to 0 in `.env` to
+turn it off):
+
+- `FMO_KILL_CONTRIB=50`: contribution per enemy destroyed.
+- `FMO_KILL_BONUS_HS=500`: H$ per kill, owed as a "Kill bonus" line at the Personnel Officer.
+- `FMO_WIN_MONEY=1500`: H$ added to a won battle.
+- `FMO_WIN_CONTRIB=30`: contribution added to a won battle.
+- `FMO_BATTLE_DUMMY_AI=101`: the client runs the battle enemy with AI brain 101.
+- `FMO_BATTLE_ENEMIES=3:120:40`: the enemy squad's size, distance from the drop point and spacing.
+- `FMO_TRADE=1`: the player trade service.
+- `FMO_CEASEFIRE=1`: the phase-end ceasefire bonus for First Sergeant and above.
+- `FMO_REVIEW=promote`: the officer review above Captain keeps or promotes a pilot (`full` can also demote).
+
 ## The lobby NPC editor (optional)
 
 A web page that places the lobby cast over the map's floor plan and writes
@@ -113,7 +126,8 @@ docker compose --profile board up -d
 
 serves the war (the nineteen cities, who holds each, the phase score and
 clock) as a web page on port 8792, read-only over the war state, and can post
-it to a Discord webhook (`.env`). The page's backdrop is the game's own
+it to Discord through a webhook or as a bot (`.env`; a bot needs no webhook
+and posts wherever `/fmoboard` is run). The page's backdrop is the game's own
 satellite image, baked from your client with `tools/fmo_boardart_bake.py`;
 without it the board draws on a plain ground.
 
