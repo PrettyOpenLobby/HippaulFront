@@ -9194,7 +9194,10 @@ MSG_CHANGE_NATIONS = 0x01AB
 # terminal, so the screen cannot hang the way 0x01AB did. The real service (the
 # 0x017D push to the OTHER machine, item relay, two-sided confirm) is NOT built
 # and FMO_TRADE=1 only changes the log line saying so.
+MSG_TRADE_START = 0x0142              # the real OFFER
+MSG_TRADE_ACCEPT = 0x0143
 MSG_TRADE_UPDATE = 0x0144
+MSG_TRADE_OK = 0x0145
 MSG_TRADE_OFFER = 0x0146
 MSG_TRADE_POLL = 0x0147
 MSG_TRADE_STATE = 0x0148
@@ -9298,9 +9301,10 @@ CLIENT_REQUESTS = {
 }
 #: The requests that fall to "no handler" ON PURPOSE. 0x000A and 0x0140 are
 #: fire-and-forget senders (0x61173E50 / 0x61173D70 send and `ret`, no poll);
-#: 0x0142/0x0143/0x0145 are the trade machine, refused by design through the
-#: 0x0148 state record (see TRADE). Anything else here is a regression.
-UNSERVED_BY_DESIGN = frozenset({0x000A, 0x0140, 0x0142, 0x0143, 0x0145})
+#: 0x0142/0x0143/0x0145 were here until 2026-09-26: they are the trade
+#: screen's FIRST requests and the tick waits for them with no timeout, so
+#: they are answered now (on_trade). Anything else here is a regression.
+UNSERVED_BY_DESIGN = frozenset({0x000A, 0x0140})
 
 #: 0x012D -- THE NON-POL GAME HELLO. The character-select machine 0x61179DA0
 #: state 1 sends EITHER 0x015B (our normal game hello, payload = our 0x0322
@@ -9969,14 +9973,22 @@ def trade_state_record(state, first="", last="", mine=None, partner=None,
     return bytes(b)
 
 
-def trade_push_record(mode, first="", last=""):
+def trade_push_record(mode, first="", last="", give=None, receive=None):
     """A 0x017D TRADE PUSH record, 452 bytes: +0x1A0 mode (0 offered,
-    1 cancelled, 2 completed), names at +0x1A5 / +0x1B2. WARNING: Built, never sent:
-    there is no cross-session push in this server yet."""
+    1 cancelled, 2 completed), the PARTNER's names at +0x1A5 / +0x1B2.
+    Mode 2 is per recipient: +0x000 = the block this
+    client GIVES (removed by serial, its +0xC8 money debited), +0x0D0 = the
+    block it RECEIVES (appended, +0xC8 = rec+0x198 credited)."""
     if mode not in (0, 1, 2):
         raise ValueError("0x017D mode %r is not one of 0x6117F07B's arms "
                          "(0 offered, 1 cancelled, 2 completed)" % (mode,))
     b = bytearray(TRADE_STATE_LEN)
+    if give:
+        b[TRADE_MY_BLOCK:TRADE_MY_BLOCK + TRADE_BLOCK_LEN] = \
+            bytes(give[:TRADE_BLOCK_LEN]).ljust(TRADE_BLOCK_LEN, b"\0")
+    if receive:
+        b[TRADE_PARTNER_BLOCK:TRADE_PARTNER_BLOCK + TRADE_BLOCK_LEN] = \
+            bytes(receive[:TRADE_BLOCK_LEN]).ljust(TRADE_BLOCK_LEN, b"\0")
     b[TRADE_STATE_OFF] = mode
     for off, text in ((TRADE_PUSH_FIRST, first), (TRADE_LAST, last)):
         s = text.encode("cp932", "replace")[:TRADE_LAST - TRADE_PUSH_FIRST - 1
@@ -9984,6 +9996,185 @@ def trade_push_record(mode, first="", last=""):
                                              else TRADE_NAME_LEN - 1]
         b[off:off + len(s)] = s
     return bytes(b)
+
+
+# --------------------------------------------------------------------------- #
+# THE TRADE SERVICE (FMO_TRADE=1). Built from a static decode of the client;
+# not yet tested with two real clients.
+#   A 0x0142 {B's alias}  -> A: 0x0148 state 1; B: 0x017D mode 0 (on its next
+#                            keepalive -- the only cross-session delivery path)
+#   B 0x0143              -> B: state 3; A's next 0x0147 poll: state 3
+#   0x0144 {my block}     -> validated against the STORE, kept, both OKs clear
+#   0x0145 {mine, theirs} -> OK only if both halves equal the server's pair
+#   both OK               -> re-validate from the store, apply to both pilots,
+#                            each gets its own 0x017D mode 2; state 5
+#   0x0146 (payload junk) -> cancel: state 6 here, 6 on the partner's poll,
+#                            0x017D mode 1 if the partner never joined
+# KEY: THE ANTI-DUPE RULE (the Tetra Master lesson): the server is the trade
+# SERVICE. A trade completes only when BOTH sides sent 0x0145 for the CURRENT
+# pair with no 0x0144 since, and everything is re-checked from the character
+# store at commit -- never from the client's blocks.
+# --------------------------------------------------------------------------- #
+TRADE_SLOT = 0x08                      # 7 inventory entries of 0x18
+TRADE_SLOTS = 7
+TRADE_OK = 0x04                        # u8 "OK pressed" (display only)
+TRADE_MONEY = 0xC8                     # u32 money offered
+TRADE_TTL = 600                        # an idle trade is dropped after this
+#: ip -> the game Session, refreshed on every 0x0198 keepalive. The trade
+#: needs the PARTNER's session (their store, their push queue).
+LIVE_SESSIONS = {}
+#: ip -> the trade dict both sides share (see trade_open).
+TRADES = {}
+
+
+def trade_block_slots(block):
+    """[(slot, serial, id, kind)] for the non-empty slots of a 208-B block."""
+    out = []
+    for i in range(TRADE_SLOTS):
+        at = TRADE_SLOT + i * INV_ENTRY_LEN
+        rec = block[at:at + INV_ENTRY_LEN]
+        if len(rec) < INV_ENTRY_LEN or not rec[ITEM_KIND]:
+            continue
+        lo, hi = struct.unpack_from("<II", rec, ITEM_SERIAL_LO)
+        out.append((i, lo | (hi << 32),
+                    struct.unpack_from("<H", rec, ITEM_ID)[0], rec[ITEM_KIND]))
+    return out
+
+
+def trade_block_money(block):
+    if len(block) < TRADE_MONEY + 4:
+        return 0
+    return struct.unpack_from("<I", block, TRADE_MONEY)[0]
+
+
+def trade_block_key(block):
+    """The block as compared for a confirm: the OK byte does not count."""
+    b = bytearray(bytes(block[:TRADE_BLOCK_LEN]).ljust(TRADE_BLOCK_LEN, b"\0"))
+    b[TRADE_OK] = 0
+    return bytes(b)
+
+
+def serial_equipped(char, serial):
+    """True when a stored wanzer setup equips this 64-bit serial."""
+    try:
+        blk = bytes.fromhex((char or {}).get("setups") or "")
+    except ValueError:
+        return False
+    for s in range(SETUP_SLOTS):
+        base = s * SETUP_ENTRY_LEN
+        if len(blk) < base + SETUP_ENTRY_LEN or not blk[base + SETUP_IN_USE]:
+            continue
+        for i in range(SETUP_ITEMS):
+            at = base + SETUP_ITEM_OFF + i * INV_ENTRY_LEN
+            lo, hi = struct.unpack_from("<II", blk, at + ITEM_SERIAL_LO)
+            if (lo | (hi << 32)) == int(serial) and blk[at + ITEM_KIND]:
+                return True
+    return False
+
+
+def trade_validate(char, block, money_have):
+    """(clean block, problems): `block` with every slot this pilot cannot
+    give cleared and the money clamped to what they hold. A slot must name an
+    item in the pilot's STORED items (id and kind matching) that no setup
+    equips, once. Pure."""
+    b = bytearray(bytes(block[:TRADE_BLOCK_LEN]).ljust(TRADE_BLOCK_LEN, b"\0"))
+    owned = {it["serial"]: it for it in stored_items(char)}
+    seen, problems = set(), []
+    for slot, serial, iid, kind in trade_block_slots(b):
+        it = owned.get(serial)
+        if it is None:
+            why = "not one of the pilot's stored items"
+        elif (it["id"], it["kind"]) != (iid, kind):
+            why = "id/kind differ from the store"
+        elif serial_equipped(char, serial):
+            why = "equipped on a setup"
+        elif serial in seen:
+            why = "offered twice"
+        else:
+            why = None
+        if why:
+            at = TRADE_SLOT + slot * INV_ENTRY_LEN
+            b[at:at + INV_ENTRY_LEN] = bytes(INV_ENTRY_LEN)
+            problems.append(f"slot {slot} serial {serial:#x} ({why})")
+        else:
+            seen.add(serial)
+    m = trade_block_money(b)
+    have = max(0, int(money_have))
+    if m > have:
+        struct.pack_into("<I", b, TRADE_MONEY, have)
+        problems.append(f"money {m} > the {have} held")
+    return bytes(b), problems
+
+
+def trade_apply(char, give, receive, reserved=()):
+    """Move one side of a completed trade on a character record, in place:
+    remove what it gives, add what it receives. A received serial this pilot
+    already holds (or one in `reserved`) is RE-MINTED; returns the receive
+    block as the client must see it (with any new serials). Money is NOT
+    touched here (credit_money does it). Raises ValueError, changing nothing,
+    when a given item is gone or the 400 cap would overflow."""
+    gives = trade_block_slots(give)
+    owned = {it["serial"] for it in stored_items(char)}
+    missing = [s for _i, s, _d, _k in gives if s not in owned]
+    if missing:
+        raise ValueError("no longer holds " + ", ".join(f"{s:#x}" for s in missing))
+    recv = trade_block_slots(receive)
+    if len(owned) - len(gives) + len(recv) > INV_MAX:
+        raise ValueError(f"would hold more than {INV_MAX} items")
+    for _i, serial, _d, _k in gives:
+        remove_stored_item(char, serial)
+    out = bytearray(bytes(receive[:TRADE_BLOCK_LEN]).ljust(TRADE_BLOCK_LEN, b"\0"))
+    held = {it["serial"] for it in stored_items(char)} | set(reserved)
+    for slot, serial, iid, kind in recv:
+        if serial in held:
+            lo, hi = mint_serial()
+            serial = lo | (hi << 32)
+            struct.pack_into("<II", out, TRADE_SLOT + slot * INV_ENTRY_LEN,
+                             lo, hi)
+        add_stored_item(char, serial, iid, kind, price=0)
+        held.add(serial)
+    return bytes(out)
+
+
+def trade_open(a_ip, b_ip, now=None):
+    """A new trade A offered to B. Both hosts point at the same dict."""
+    t = {"a": a_ip, "b": b_ip, "state": "offered",
+         "touched": now or time.time(), "why": "",
+         "blocks": {a_ip: bytes(TRADE_BLOCK_LEN), b_ip: bytes(TRADE_BLOCK_LEN)},
+         "ok": {a_ip: False, b_ip: False}}
+    TRADES[a_ip] = TRADES[b_ip] = t
+    return t
+
+
+def trade_for(ip, now=None):
+    """The trade this host is in, or None. An idle open one is cancelled."""
+    t = TRADES.get(ip)
+    if t is not None and t["state"] in ("offered", "open") \
+            and (now or time.time()) - t["touched"] > TRADE_TTL:
+        t["state"], t["why"] = "cancelled", f"idle for {TRADE_TTL}s"
+    return t
+
+
+def trade_partner(t, ip):
+    return t["b"] if ip == t["a"] else t["a"]
+
+
+def trade_release(t, ip):
+    """This host has been told the end of `t`: forget it for this host."""
+    if TRADES.get(ip) is t:
+        del TRADES[ip]
+
+
+def trade_host_of_alias(ip, alias):
+    """The host whose unit `ip`'s client knows as `alias` (the room relay's
+    alias_of, on any of this host's world channels), or None."""
+    for ch in list(WORLD_PEERS.values()):
+        if ch.addr[0] != ip:
+            continue
+        for other_addr, a in getattr(ch, "alias_of", {}).items():
+            if a == alias:
+                return other_addr[0]
+    return None
 
 
 MSG_NAMES = {MSG_VERSION: "version", MSG_CREDENTIALS: "credentials",
@@ -10010,7 +10201,10 @@ MSG_NAMES[MSG_PLAYTIME_REPLY] = "playtime-reply"
 MSG_NAMES[MSG_MEMBER_CHECK_REQ] = "member-check-req"
 MSG_NAMES[MSG_LOGOUT_REQ] = "logout-req"
 MSG_NAMES[MSG_TRADE_UPDATE] = "trade-update"
-MSG_NAMES[MSG_TRADE_OFFER] = "trade-offer"
+MSG_NAMES[MSG_TRADE_OFFER] = "trade-cancel"
+MSG_NAMES[MSG_TRADE_START] = "trade-offer"
+MSG_NAMES[MSG_TRADE_ACCEPT] = "trade-accept"
+MSG_NAMES[MSG_TRADE_OK] = "trade-ok"
 MSG_NAMES[MSG_TRADE_POLL] = "trade-poll"
 MSG_NAMES[MSG_TRADE_STATE] = "trade-state"
 MSG_NAMES[MSG_TRADE_PUSH] = "trade-push"
@@ -12906,6 +13100,10 @@ class Session:
                    f"0x{QUEUE_SEQ:08X} (FMO_TIME_SYNC=1; scene 4 only by the "
                    f"arm's gate, dropped in the lobby)"))
             outs = []
+            # the trade service finds a partner's session here, and a push
+            # for this pilot (0x017D) rides the keepalive like 0x015A does
+            LIVE_SESSIONS[self.ip] = self
+            outs += self.trade_pushes_due(p["conn"])
             if TIME_SYNC:
                 outs.append(time_sync_packet(p["conn"], when, when_us))
             if PUSH_PROBE and not getattr(self, "push_probe_done", False):
@@ -13225,7 +13423,8 @@ class Session:
                     f"-- storing nothing")
             return [build(LOBAPI[0x01AA][0], b"", self.reply_seq(), p["conn"])]
 
-        if p["msg"] in (MSG_TRADE_OFFER, MSG_TRADE_POLL, MSG_TRADE_UPDATE):
+        if p["msg"] in (MSG_TRADE_START, MSG_TRADE_ACCEPT, MSG_TRADE_UPDATE,
+                        MSG_TRADE_OK, MSG_TRADE_OFFER, MSG_TRADE_POLL):
             return self.on_trade(p)
 
         if p["msg"] == 0x01AC and ANSWER_LOBAPI and (city_rows()
@@ -14795,49 +14994,206 @@ class Session:
         return [build(MSG_RESUME_REPLY, b"", self.reply_seq(), p["conn"])]
 
     def on_trade(self, p):
-        """The trade screen's three requests. See MSG_TRADE_* for the decode.
+        """The trade screen's requests (0x0142 offer, 0x0143 accept, 0x0144
+        update, 0x0145 OK, 0x0146 cancel/leave, 0x0147 poll). See the TRADE
+        SERVICE block.
 
-        Every one of them is answered, because an unanswered one parks the
-        trade screen's tick in state 2 with no way back (the 0x01AB lesson).
-        What it is answered WITH is a 0x0148 whose state byte is terminal --
-        a refusal -- until the service exists. Each log line names the source
-        of every value it sends."""
+        Every one is answered with a 0x0148 (the tick polls by sequence and
+        has no timeout -- the 0x01AB lesson), except the dtor's fire-and-forget
+        leave on the queue sequence. With FMO_TRADE off every answer is the
+        terminal refusal it has always been."""
         msg, pl = p["msg"], p["payload"]
-        if msg == MSG_TRADE_OFFER:
+        if msg == MSG_TRADE_OFFER and p["seq"] == QUEUE_SEQ:
+            t = trade_for(self.ip)
+            log(f"{self.peer}   0x0146 on seq 0x{p['seq']:X} = the trade "
+                f"screen's LEAVE notice (dtor 0x6119B7A3). Fire-and-forget: "
+                f"not answered."
+                + (" Cancels the open trade." if t and t["state"] in
+                   ("offered", "open") else ""))
+            if TRADE and t and t["state"] in ("offered", "open"):
+                self.trade_cancel(t, "the screen was closed")
+            return []
+        if not TRADE:
+            log(f"{self.peer}   0x{msg:04X} = a trade request, {len(pl)}B. "
+                f"FMO_TRADE is off (default): refusing so the screen cannot "
+                f"hang. Nothing was offered to anybody.")
+            return [self.trade_state_packet(p, TRADE_REFUSE_STATE)]
+        LIVE_SESSIONS.setdefault(self.ip, self)
+        t = trade_for(self.ip)
+        if msg == MSG_TRADE_START:
             target = struct.unpack_from("<I", pl, 0)[0] if len(pl) >= 4 else 0
-            if target == 0 or p["seq"] == QUEUE_SEQ:
-                log(f"{self.peer}   0x0146 with target {target} on seq "
-                    f"0x{p['seq']:X} = the trade screen's LEAVE notice "
-                    f"(dtor 0x6119B7A3, periodic queue 0x7A0E). Fire-and-"
-                    f"forget: nothing polls for a reply, so NOT answered -- a "
-                    f"reply would only sit in the receive slot like a 0x0198 "
-                    f"answer would.")
-                return []
-            log(f"{self.peer}   0x0146 = TRADE OFFER for UnitID 0x{target:X} "
-                f"(payload+0x00; the scene's +0x1C, from the Trade menu's "
-                f"resolver 0x61182460 -- an entity whose +0x1C == 1, i.e. one "
-                f"POPped with client kind 0). The tick now polls seq "
-                f"0x{p['seq']:X} for 0x0148.")
-        elif msg == MSG_TRADE_POLL:
-            log(f"{self.peer}   0x0147 = TRADE POLL (0 bytes, timer at "
-                f"0x6119F331 in tick state 0). Polls seq 0x{p['seq']:X} for "
-                f"0x0148.")
-        else:
-            log(f"{self.peer}   0x0144 = TRADE UPDATE, {len(pl)}B = the "
-                f"client's own 52-dword trade block (0x6119EC30). Stored "
-                f"nowhere. Polls seq 0x{p['seq']:X} for 0x0148.")
-        body = trade_state_record(TRADE_REFUSE_STATE)
-        log(f"{self.peer}   -> 0x0148 REFUSAL, {len(body)}B: state byte "
-            f"+0x1A0 = {TRADE_REFUSE_STATE} (FMO_TRADE_REFUSE_STATE; the tick "
-            f"reads 5/6 as terminal at 0x6119F16B), every other byte zero. "
-            + ("FMO_TRADE=1 but the trade SERVICE is not built -- the 0x017D "
-               "push to the partner, item relay and two-sided confirm do not "
-               "exist yet, so this is still a refusal."
-               if TRADE else
-               "FMO_TRADE is off (default): refusing so the screen cannot "
-               "hang. Nothing was offered to anybody."))
-        return [build(MSG_TRADE_STATE, body, self.reply_seq(), p["conn"])]
+            b_ip = trade_host_of_alias(self.ip, target)
+            other = LIVE_SESSIONS.get(b_ip) if b_ip else None
+            why = ("the target is not a relayed player this server knows"
+                   if b_ip is None else
+                   "the partner has no live game session" if other is None else
+                   "the partner is already trading" if trade_for(b_ip) and
+                   trade_for(b_ip)["state"] in ("offered", "open") else
+                   "you are already trading" if t and t["state"] in
+                   ("offered", "open") else None)
+            if why:
+                log(f"{self.peer}   0x0142 = TRADE OFFER to UnitID "
+                    f"0x{target:X}: REFUSED, {why} -> state 6")
+                return [self.trade_state_packet(p, 6)]
+            t = trade_open(self.ip, b_ip)
+            n1, n2 = self.trade_names()
+            other.queue_trade_push(trade_push_record(0, n1, n2),
+                                   f"offer from {n1}.{n2}")
+            log(f"{self.peer}   0x0142 = TRADE OFFER to UnitID 0x{target:X} = "
+                f"host {b_ip}: opened; 0x017D mode 0 queued for {b_ip}'s next "
+                f"keepalive (8:7 '{n1}.{n2} has offered you a trade.'); "
+                f"-> state 1 (waiting for the partner)")
+            return [self.trade_state_packet(p, 1, t)]
+        if t is None:
+            log(f"{self.peer}   0x{msg:04X} = a trade request with NO trade "
+                f"open for this host -> state 6 (cancelled)")
+            return [self.trade_state_packet(p, 6)]
+        t["touched"] = time.time()
+        if msg == MSG_TRADE_ACCEPT:
+            if t["state"] == "offered" and self.ip == t["b"]:
+                t["state"] = "open"
+                log(f"{self.peer}   0x0143 = TRADE ACCEPT: the trade with "
+                    f"{t['a']} is OPEN -> state 3; the offerer gets 3 on its "
+                    f"next poll")
+            else:
+                log(f"{self.peer}   0x0143 = TRADE ACCEPT in state "
+                    f"{t['state']!r} (not the invited side of an offer): "
+                    f"answered with the current state")
+        elif msg == MSG_TRADE_UPDATE and t["state"] == "open":
+            char = self.playing_char() if CHAR_STORE else None
+            have = wallet_money(char)[0] if char else 0
+            clean, problems = trade_validate(char or {}, pl, have)
+            t["blocks"][self.ip] = clean
+            t["ok"] = {t["a"]: False, t["b"]: False}
+            log(f"{self.peer}   0x0144 = TRADE UPDATE: "
+                f"{len(trade_block_slots(clean))} item(s), H$ "
+                f"{trade_block_money(clean)} offered; both OKs cleared"
+                + (f". CLEARED by the store check: {'; '.join(problems)}"
+                   if problems else ""))
+        elif msg == MSG_TRADE_OK and t["state"] == "open":
+            mine = pl[:TRADE_BLOCK_LEN]
+            theirs = pl[TRADE_BLOCK_LEN:2 * TRADE_BLOCK_LEN]
+            partner = trade_partner(t, self.ip)
+            same = (trade_block_key(mine) == trade_block_key(t["blocks"][self.ip])
+                    and trade_block_key(theirs) == trade_block_key(t["blocks"][partner]))
+            if same:
+                t["ok"][self.ip] = True
+                b = bytearray(t["blocks"][self.ip])
+                b[TRADE_OK] = 1
+                t["blocks"][self.ip] = bytes(b)
+            log(f"{self.peer}   0x0145 = TRADE OK: "
+                + ("both halves match the server's pair -> this side is OK"
+                   if same else "the halves DIFFER from the server's pair "
+                   "(a stale screen) -> NOT OK; the client sees the current "
+                   "pair on this reply"))
+            if all(t["ok"].values()):
+                self.trade_commit(t)
+        elif msg == MSG_TRADE_OFFER:
+            log(f"{self.peer}   0x0146 = TRADE CANCEL (payload ignored: "
+                f"uninitialised stack)")
+            if t["state"] in ("offered", "open"):
+                self.trade_cancel(t, f"{self.ip} cancelled")
+        state = {"offered": 1, "open": 3, "done": 5, "cancelled": 6}[t["state"]]
+        if self.ip == t["b"] and t["state"] == "offered":
+            state = 1
+        if state in (5, 6):
+            trade_release(t, self.ip)
+        return [self.trade_state_packet(p, state, t)]
 
+    def trade_names(self, ip=None):
+        n1, n2, _src = pop_names_for(ip or self.ip)
+        return n1 or "", n2 or ""
+
+    def trade_state_packet(self, p, state, t=None):
+        """A 0x0148 for this side: my block, the partner's block, the
+        partner's names -- the client redraws BOTH panels from it."""
+        mine = partner = None
+        first = last = ""
+        if t is not None:
+            other = trade_partner(t, self.ip)
+            mine, partner = t["blocks"].get(self.ip), t["blocks"].get(other)
+            first, last = self.trade_names(other)
+        body = trade_state_record(state, first, last, mine=mine,
+                                  partner=partner)
+        log(f"{self.peer}   -> 0x0148 TRADE STATE {state}, {len(body)}B")
+        return build(MSG_TRADE_STATE, body, self.reply_seq(), p["conn"])
+
+    def queue_trade_push(self, body, what):
+        """A 0x017D for THIS session, delivered on its next keepalive."""
+        q = getattr(self, "trade_pushes", None)
+        if q is None:
+            q = self.trade_pushes = []
+        q.append((body, what))
+
+    def trade_pushes_due(self, conn_id):
+        out = []
+        for body, what in getattr(self, "trade_pushes", None) or ():
+            out.append(build(MSG_TRADE_PUSH, body, QUEUE_SEQ, conn_id))
+            log(f"{self.peer}   -> 0x{MSG_TRADE_PUSH:04X} TRADE PUSH "
+                f"(mode {body[TRADE_STATE_OFF]}) on queue seq "
+                f"0x{QUEUE_SEQ:08X}: {what}")
+        self.trade_pushes = []
+        return out
+
+    def trade_cancel(self, t, why):
+        """End an open or offered trade as cancelled. The partner learns it
+        on its next poll (state 6); a partner who never joined gets 0x017D
+        mode 1 so their 'offered' flag clears."""
+        joined = t["state"] == "open"
+        t["state"], t["why"] = "cancelled", why
+        other = trade_partner(t, self.ip)
+        if not joined:
+            o = LIVE_SESSIONS.get(other)
+            if o is not None:
+                n1, n2 = self.trade_names()
+                o.queue_trade_push(trade_push_record(1, n1, n2),
+                                   f"trade cancelled ({why})")
+            trade_release(t, other)
+        log(f"{self.peer}   TRADE with {other} CANCELLED: {why}")
+
+    def trade_commit(self, t):
+        """Both sides OK on the same pair: re-check everything from the
+        STORE, apply to both pilots, push each its own 0x017D mode 2. On any
+        failure the trade is cancelled and nothing moves."""
+        a, b = t["a"], t["b"]
+        sa, sb = LIVE_SESSIONS.get(a), LIVE_SESSIONS.get(b)
+        ca = sa.playing_char() if (sa and CHAR_STORE) else None
+        cb = sb.playing_char() if (sb and CHAR_STORE) else None
+        if ca is None or cb is None:
+            return self.trade_cancel(t, "a pilot has no stored character")
+        ga, gb = t["blocks"][a], t["blocks"][b]
+        for char, blk, who in ((ca, ga, a), (cb, gb, b)):
+            _c, problems = trade_validate(char, blk, wallet_money(char)[0])
+            if problems:
+                return self.trade_cancel(
+                    t, f"{who} no longer holds what it offered: "
+                    + "; ".join(problems))
+        ma, mb = trade_block_money(ga), trade_block_money(gb)
+        import copy as _copy
+        ca2, cb2 = _copy.deepcopy(ca), _copy.deepcopy(cb)
+        try:
+            ra = trade_apply(ca2, ga, gb)
+            rb = trade_apply(cb2, gb, ga)
+        except ValueError as e:
+            return self.trade_cancel(t, f"the store refused it: {e}")
+        ca.clear(); ca.update(ca2)
+        cb.clear(); cb.update(cb2)
+        sa.credit_money("trade", money=mb - ma)
+        sb.credit_money("trade", money=ma - mb)
+        sa.commit(f"TRADE with {b}: gave {len(trade_block_slots(ga))} item(s) + "
+                  f"H$ {ma}, received {len(trade_block_slots(gb))} + H$ {mb}")
+        sb.commit(f"TRADE with {a}: gave {len(trade_block_slots(gb))} item(s) + "
+                  f"H$ {mb}, received {len(trade_block_slots(ga))} + H$ {ma}")
+        na, nb = sa.trade_names(), sb.trade_names()
+        sa.queue_trade_push(trade_push_record(2, *nb, give=ga, receive=ra),
+                            "trade COMPLETED (apply)")
+        sb.queue_trade_push(trade_push_record(2, *na, give=gb, receive=rb),
+                            "trade COMPLETED (apply)")
+        t["state"], t["why"] = "done", "both sides OK"
+        log(f"{self.peer}   VERIFIED: TRADE {a} <-> {b} COMPLETED: {a} gave "
+            f"{len(trade_block_slots(ga))} item(s) + H$ {ma}, {b} gave "
+            f"{len(trade_block_slots(gb))} + H$ {mb}; banked on both pilots, "
+            f"0x017D mode 2 queued for each (per recipient: give / receive).")
 
 # --------------------------------------------------------------------------- #
 # THE COMMUNITY / MISSION SERVER ("Fshira") -- FMO's SECOND SERVER.
@@ -24400,6 +24756,115 @@ def selftest():
     print(f"  trade: FMO_TRADE defaults OFF (refusal only): "
           f"{'OK' if not TRADE or os.environ.get('FMO_TRADE') else 'FAIL'}")
     ok &= (not TRADE) or bool(os.environ.get("FMO_TRADE"))
+
+    # THE TRADE SERVICE, two pilots end to end (no store, no sockets).
+    def _trade_blk(items=(), money=0):
+        b = bytearray(TRADE_BLOCK_LEN)
+        for i, (serial, iid, kind) in enumerate(items):
+            b[TRADE_SLOT + i * INV_ENTRY_LEN:TRADE_SLOT + (i + 1) * INV_ENTRY_LEN] = \
+                item_record(serial, iid, kind)
+        struct.pack_into("<I", b, TRADE_MONEY, money)
+        return bytes(b)
+
+    def _trade_pilot(ip, char):
+        _ps = Session(ip + ":1")
+        _ps.playing_char = lambda: char
+        _ps.commit = lambda what: None
+        _ps.trade_names = lambda ip=None: (("Bea", "Bee") if ip == "tB"
+                                           else ("Al", "Ay"))
+        _ps.credit_money = (lambda why, money=0, contribution=0:
+                            char.__setitem__("money", char["money"] + money))
+        return _ps
+
+    def _tq(sess, msg, pl=b"", seq=0x100):
+        o = sess.on_packet(parse(build(msg, pl, seq=seq, conn_id=1)))
+        q = [parse(x) for x in o]
+        return q[0]["payload"][TRADE_STATE_OFF] if q else None
+
+    _gt = globals()
+    _saved_t = {k: _gt[k] for k in ("TRADE", "CHAR_STORE", "trade_host_of_alias")}
+    _tr_ok = True
+    _tfail = []
+
+    def _tc(n, v):
+        if not v:
+            _tfail.append(n)
+        return bool(v)
+    try:
+        _gt.update(TRADE=True, CHAR_STORE="selftest",
+                  trade_host_of_alias=lambda ip, alias: "tB" if alias == 0x200 else None)
+        TRADES.clear(); LIVE_SESSIONS.clear()
+        _cA = {"money": 1000, "items": [{"serial": 0x11, "id": 7, "kind": 0x12},
+                                        {"serial": 0x12, "id": 8, "kind": 0x12}]}
+        _cB = {"money": 50, "items": [{"serial": 0x12, "id": 9, "kind": 0x22}]}
+        sA, sB = _trade_pilot("tA", _cA), _trade_pilot("tB", _cB)
+        LIVE_SESSIONS.update(tA=sA, tB=sB)
+        _tr_ok &= _tc(1, _tq(sA, MSG_TRADE_START, struct.pack("<I", 0x999) + bytes(36)) == 6)
+        _tr_ok &= _tc(2, _tq(sA, MSG_TRADE_START, struct.pack("<I", 0x200) + bytes(36)) == 1)
+        _push = sB.trade_pushes_due(1)
+        _tr_ok &= _tc(3, (len(_push) == 1 and parse(_push[0])["msg"] == MSG_TRADE_PUSH
+                   and parse(_push[0])["payload"][TRADE_STATE_OFF] == 0))
+        _tr_ok &= _tc(4, _tq(sA, MSG_TRADE_POLL) == 1)
+        _tr_ok &= _tc(5, _tq(sB, MSG_TRADE_ACCEPT, bytes(4)) == 3)
+        _tr_ok &= _tc(6, _tq(sA, MSG_TRADE_POLL) == 3)
+        # A offers item 0x11 + H$ 300 and one item it does NOT own (cleared);
+        # B offers its 0x12 (a serial A KEEPS -> re-minted on A's side)
+        _ga = _trade_blk([(0x11, 7, 0x12), (0x99, 1, 0x12)], 300)
+        _gb = _trade_blk([(0x12, 9, 0x22)], 0)
+        _tq(sA, MSG_TRADE_UPDATE, _ga)
+        _tq(sB, MSG_TRADE_UPDATE, _gb)
+        _t = TRADES["tA"]
+        _tr_ok &= _tc(7, len(trade_block_slots(_t["blocks"]["tA"])) == 1)
+        # a stale OK (the client's pair differs) is NOT an OK
+        _tq(sA, MSG_TRADE_OK, _ga + _gb)
+        _tr_ok &= _tc(8, _t["ok"]["tA"] is False)
+        _ca, _cb = _t["blocks"]["tA"], _t["blocks"]["tB"]
+        _tr_ok &= _tc(9, _tq(sA, MSG_TRADE_OK, _ca + _cb) == 3 and _t["ok"]["tA"])
+        # a new update clears both OKs
+        _tq(sB, MSG_TRADE_UPDATE, _gb)
+        _tr_ok &= _tc(10, _t["ok"] == {"tA": False, "tB": False})
+        _tq(sA, MSG_TRADE_OK, _ca + _t["blocks"]["tB"])
+        _tr_ok &= _tc(11, _tq(sB, MSG_TRADE_OK, _t["blocks"]["tB"] + _t["blocks"]["tA"]) == 5)
+        _tr_ok &= _tc(12, _tq(sA, MSG_TRADE_POLL) == 5)
+        _serA = sorted(it["serial"] for it in stored_items(_cA))
+        _serB = sorted(it["serial"] for it in stored_items(_cB))
+        _tr_ok &= _tc(13, (_cA["money"] == 700 and _cB["money"] == 350
+                   and len(_serA) == 2 and 0x12 in _serA and 0x11 not in _serA
+                   and [it["id"] for it in stored_items(_cA)
+                        if it["serial"] not in (0x11, 0x12)] == [9]
+                   and _serB == [0x11]
+                   and [it["id"] for it in stored_items(_cB)] == [7]))
+        _pa = sA.trade_pushes_due(1)
+        _tr_ok &= _tc(14, (len(_pa) == 1
+                   and parse(_pa[0])["payload"][TRADE_STATE_OFF] == 2
+                   and trade_block_money(parse(_pa[0])["payload"][:TRADE_BLOCK_LEN]) == 300))
+        _tr_ok &= _tc(15, "tA" not in TRADES and "tB" not in TRADES)
+        # an offer cancelled before B joins tells B (0x017D mode 1)
+        _tq(sA, MSG_TRADE_START, struct.pack("<I", 0x200) + bytes(36))
+        sB.trade_pushes_due(1)
+        _tr_ok &= _tc(16, _tq(sA, MSG_TRADE_OFFER, bytes(4)) == 6)
+        _pb = sB.trade_pushes_due(1)
+        _tr_ok &= _tc(17, (len(_pb) == 1
+                   and parse(_pb[0])["payload"][TRADE_STATE_OFF] == 1))
+        # an equipped item cannot be offered
+        _eq = bytearray(REPLY_0166_LEN)
+        _eq[SETUP_IN_USE] = 1
+        _eq[SETUP_ITEM_OFF:SETUP_ITEM_OFF + INV_ENTRY_LEN] = item_record(0x12, 8, 0x12)
+        _cE = {"items": [{"serial": 0x12, "id": 8, "kind": 0x12}],
+               "setups": bytes(_eq).hex()}
+        _tr_ok &= _tc(18, trade_validate(_cE, _trade_blk([(0x12, 8, 0x12)]), 0)[1] != [])
+    except Exception as _e:
+        print(f"  trade service: EXC {_e!r}")
+        _tr_ok = False
+    finally:
+        _gt.update(_saved_t)
+        TRADES.clear(); LIVE_SESSIONS.clear()
+    print(f"  trade service: offer -> push mode 0 -> accept -> updates (store-"
+          f"checked) -> a stale OK refused, an update clears OKs -> both OK -> "
+          f"items + H$ move once, a duplicate serial re-minted, mode 2 pushed; "
+          f"cancel before join pushes mode 1; equipped refused: "
+          f"{'OK' if _tr_ok else 'FAIL at step(s) ' + str(_tfail)}")
+    ok &= _tr_ok
 
     # 0x019A CITY-TABLE push (the City Control screen's data block). The layout
     # is pinned: 420-byte block at payload+0x10, u32 count, 8-byte rows anchored
