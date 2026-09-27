@@ -271,6 +271,15 @@ except ImportError:                                  # pragma: no cover
     fmoworld = None
 
 try:
+    # THE PER-LOGIN CONTENT AUTH VALUE the lobby mints on 4:5 -- the first 16
+    # bytes of this title's TCP key. See contentauth.py and Session.resolve_key.
+    # Optional: absent, the key is the old 16 zero bytes and the account comes
+    # from the address exactly as before.
+    import contentauth
+except ImportError:                                  # pragma: no cover
+    contentauth = None
+
+try:
     # KEY: THE WAR-MAP SECTOR TABLE. Optional for the same reason as the rest:
     # a missing module must degrade to the flat FMO_WARMAP_MAPS list, loudly,
     # not take the responder down. See fmosectors.py's docstring.
@@ -8491,6 +8500,10 @@ def use_db():
 IDENTITY_TTL = _env_float("FMO_IDENTITY_TTL", "120")
 
 _identity_by_ip = {}
+#: {ip: (account key, monotonic)} -- set only when a game connection's key trial
+#: (Session.resolve_key) names the member. Lives MEMBER_WINDOW, not
+#: IDENTITY_TTL: the UDP world channel asks account_for() minutes after login.
+_proven_by_ip = {}
 _store_lock = threading.Lock()
 
 
@@ -8561,6 +8574,12 @@ def account_for(ip):
     with _store_lock:
         got = _identity_by_ip.get(ip)
         if got and time.monotonic() - got[1] <= IDENTITY_TTL:
+            return got[0]
+        # The member the newest game connection from this address PROVED with
+        # its key (Session.resolve_key). Outranks the freshest-POL-login guess:
+        # with two devices behind one address, that guess can name the wrong member.
+        got = _proven_by_ip.get(ip)
+        if got and time.monotonic() - got[1] <= MEMBER_WINDOW:
             return got[0]
     found = member_for_ip(ip)          # a DB read -- deliberately not under
     if found:                          # _store_lock
@@ -10294,9 +10313,38 @@ class RC4:
         return bytes(out)
 
 
-def session_key(tail4):
-    """The 20-byte key: polcore's 16 (zero, measured) then our 4."""
-    return b"\x00" * KEY_POLCORE_LEN + tail4
+def session_key(tail4, prefix=None):
+    """The 20-byte key: polcore's 16 then our 4. polcore's 16 are the value our
+    lobby put in the 4:5 reply (contentauth.py) -- zero when it minted none."""
+    return (prefix or b"\x00" * KEY_POLCORE_LEN) + tail4
+
+
+#: FMO's content id = the 4:5 zone its launch reports (measured 2026-09-27:
+#: `4:5 zone=4` five seconds before the 0x0321 login).
+CONTENT_ID = 4
+
+#: 0 = never trial a minted value; the key is the old zero prefix and the
+#: account comes from the token/address as before. The A/B lever.
+CONTENT_AUTH = os.environ.get("FMO_CONTENT_AUTH", "1") != "0"
+
+
+def trial_key(pkt, tail4, cands):
+    """Find the prefix the client keyed with by decrypting its FIRST encrypted
+    packet under each candidate, best first.
+
+    `cands` is [(prefix16, member_id or None)]. Returns (rx RC4 already past
+    this packet, prefix, member_id, plaintext packet) or None. A candidate is
+    accepted only if the plaintext passes the client's own checksum AND names a
+    message id in the protocol's range: a wrong key gives random bytes, so the
+    pair is a ~1-in-4-million false positive per candidate -- a measurement,
+    not an address guess."""
+    for prefix, member in cands:
+        rc = RC4(session_key(tail4, prefix))
+        plain = pkt[:CRYPT_OFF] + rc.crypt(pkt[CRYPT_OFF:])
+        p = parse(plain)
+        if p["chk_ok"] and p["msg"] < 0x400:
+            return rc, prefix, member, plain
+    return None
 
 
 #: Encryption covers `len - 4` bytes from packet +0x04 -- everything except the
@@ -10512,6 +10560,9 @@ class Session:
         #: Key tail to arm with once the CURRENT batch of replies has actually
         #: been WRITTEN TO THE SOCKET. See arm_cipher for why this is deferred.
         self.pending_arm = None
+        #: Set by arm_cipher when content auth defers keying: our 0x0322 tail,
+        #: waiting for resolve_key() to find the prefix on the first packet in.
+        self.key_tail = None
         #: The last (group ids, our answer) we logged for 0x01AC. The client
         #: polls that message ~141 times a session, so the squadron lines are
         #: emitted only when something CHANGES -- otherwise the one line worth
@@ -10542,10 +10593,60 @@ class Session:
         clear -- which is a bug this file shipped once: both the 0x0322 reply and
         message 1 went out encrypted to a client that had not armed yet. Built
         and sent are different moments; only sent matters here.
+
+        WITH CONTENT AUTH ON (2026-09-27) the streams are NOT built here: the
+        16-byte prefix is whatever our lobby minted on this member's 4:5, and
+        which member that is is the thing we are trying to learn. So only the
+        tail is kept, and resolve_key() builds both streams from the client's
+        first encrypted packet. Nothing is lost by waiting: after message 1 the
+        server sends nothing until the client speaks.
         """
+        self.expect_encrypted = True
+        if CONTENT_AUTH and contentauth is not None:
+            self.key_tail = tail4
+            self.tx = self.rx = None
+            return
         self.tx = RC4(session_key(tail4))
         self.rx = RC4(session_key(tail4))
-        self.expect_encrypted = True
+
+    def resolve_key(self, pkt):
+        """Key the streams from the client's FIRST encrypted packet and, when the
+        prefix is a minted one, adopt the member it was minted for. Returns the
+        decrypted packet, or None if no candidate opens it (the caller drops the
+        connection, exactly as for any undecryptable packet)."""
+        tail4, self.key_tail = self.key_tail, None
+        cands = [(v, m) for v, m, _ in
+                 contentauth.candidates(self.ip, zone=CONTENT_ID)]
+        cands.append((None, None))            # the legacy zero prefix, last
+        got = trial_key(pkt, tail4, cands)
+        if got is None:
+            log(f"{self.peer} WARNING: content auth: NONE of {len(cands)} key "
+                f"candidate(s) (minted values + the zero prefix) opens the first "
+                f"encrypted packet -- the key model is wrong for this client")
+            return None
+        rc, prefix, member, plain = got
+        self.rx = rc                          # already advanced past this packet
+        self.tx = RC4(session_key(tail4, prefix))
+        if member is None:
+            log(f"{self.peer}   content auth: the client keyed with the ZERO "
+                f"prefix -- no minted value reached it (no 4:5 zone "
+                f"{CONTENT_ID} since its POL login, or FMO_CONTENT_AUTH/"
+                f"POL_CONTENT_AUTH_ZONES off); the account stays "
+                f"{self._account or account_for(self.ip)} (token/address)")
+            return plain
+        acct = f"member:{member}"
+        was = self._account
+        self._account = acct
+        with _store_lock:
+            _proven_by_ip[self.ip] = (acct, time.monotonic())
+            _identity_by_ip[self.ip] = (acct, time.monotonic())
+        rank = next(i for i, (v, _) in enumerate(cands) if v == prefix)
+        log(f"{self.peer}   KEY: content auth: key prefix {prefix.hex()[:8]}.. "
+            f"(candidate {rank + 1} of {len(cands)}) was minted for {acct} -- "
+            f"PROVEN by the client's own checksum, not by address"
+            + ("" if was in (None, acct) else
+               f". WARNING: OVERRIDES {was} (the token/address guess was WRONG)"))
+        return plain
 
     @property
     def account(self):
@@ -15729,7 +15830,16 @@ def serve_client(conn, addr):
                 # plaintext (0x61199c15 runs before 0x61199c34), so a checksum
                 # verified on ciphertext is meaningless.
                 flag_byte = (struct.unpack_from("<H", pkt, 2)[0] >> 8) & 0xFF
-                if flag_byte & FLAG_ENCRYPTED:
+                if flag_byte & FLAG_ENCRYPTED and sess.rx is None \
+                        and sess.key_tail is not None:
+                    # Content auth: the first packet in picks the key (and so
+                    # the member). Already decrypted on success.
+                    pkt = sess.resolve_key(pkt)
+                    if pkt is None:
+                        return
+                    log(f"{peer} <- DECRYPTED {ln}B with the RX stream "
+                        f"(keyed by this packet)")
+                elif flag_byte & FLAG_ENCRYPTED:
                     if sess.rx is None:
                         log(f"{peer} WARNING: encrypted packet before we armed a cipher "
                             f"-- we cannot read it and the stream cannot resync. "
@@ -15781,9 +15891,15 @@ def serve_client(conn, addr):
                 # this here rather than in on_packet is the entire point.
                 if sess.pending_arm is not None:
                     sess.arm_cipher(sess.pending_arm)
-                    log(f"{peer}   cipher ARMED both directions AFTER sending "
-                        f"that batch in the clear: RC4, key = 16 zero bytes "
-                        f"(polcore, tapped) + {sess.pending_arm.hex()} (ours)")
+                    if sess.key_tail is not None:
+                        log(f"{peer}   cipher ARMED after sending that batch in "
+                            f"the clear: RC4, key = <16-byte 4:5 content auth "
+                            f"value, picked from the client's first packet> + "
+                            f"{sess.pending_arm.hex()} (ours)")
+                    else:
+                        log(f"{peer}   cipher ARMED both directions AFTER sending "
+                            f"that batch in the clear: RC4, key = 16 zero bytes "
+                            f"(polcore, tapped) + {sess.pending_arm.hex()} (ours)")
                     sess.pending_arm = None
     except Exception as e:
         log(f"{peer} error: {e}")
@@ -21949,6 +22065,43 @@ def selftest():
     print(f"  continuous stream (mode 1) differs from per-message reset: "
           f"{'OK' if c2 != fresh else 'FAIL'}")
     ok &= c2 != fresh
+
+    # CONTENT AUTH (2026-09-27): trial_key must pick the prefix the "client"
+    # really keyed with, name its member, and leave the RX stream positioned
+    # for the NEXT packet -- and its twins must refuse.
+    def _client_pkt(prefix, tail, n=1):
+        """n time-requests enciphered on one client stream, as the wire has them."""
+        rc = RC4(session_key(tail, prefix))
+        out = []
+        for i in range(n):
+            pb = bytearray(build(MSG_TIME_REQ, b"", 0x1003 + i))
+            pb[3] |= FLAG_ENCRYPTED
+            struct.pack_into("<H", pb, CHK_OFF, 0)
+            struct.pack_into("<H", pb, CHK_OFF, checksum(bytes(pb)))
+            out.append(bytes(pb[:CRYPT_OFF]) + rc.crypt(bytes(pb[CRYPT_OFF:])))
+        return out
+    _pa, _pb = bytes(range(1, 17)), bytes(range(101, 117))
+    _tail = struct.pack("<I", 0)
+    _w1, _w2 = _client_pkt(_pa, _tail, 2)
+    _got = trial_key(_w1, _tail, [(_pb, 11), (_pa, 3), (None, None)])
+    _ta = (_got is not None and _got[2] == 3 and _got[1] == _pa
+           and parse(_got[3])["msg"] == MSG_TIME_REQ)
+    _next = _got[0].crypt(_w2[CRYPT_OFF:]) if _got else b""
+    _ta2 = parse(_w2[:CRYPT_OFF] + _next)["chk_ok"] if _got else False
+    print(f"  content auth: picks the real prefix past a wrong one, names "
+          f"member 3: {'OK' if _ta else 'FAIL'}; RX stream ready for the next "
+          f"packet: {'OK' if _ta2 else 'FAIL'}")
+    ok &= _ta and _ta2
+    _none = trial_key(_w1, _tail, [(_pb, 11), (None, None)])
+    print(f"  content auth twin: no candidate holds the real prefix -> refused: "
+          f"{'OK' if _none is None else 'FAIL'}")
+    ok &= _none is None
+    _z = _client_pkt(None, _tail)[0]
+    _gz = trial_key(_z, _tail, [(_pa, 3), (None, None)])
+    print(f"  content auth: a legacy zero-keyed client falls through to the "
+          f"zero prefix with NO member: "
+          f"{'OK' if _gz is not None and _gz[2] is None else 'FAIL'}")
+    ok &= _gz is not None and _gz[2] is None
 
     # REGRESSION: the TITLE MENU GATE. An empty roster is NOT 'no character'
     # to FMO -- the menu selector at 0x61042CD0 takes descriptors[ eax < 0 ]
