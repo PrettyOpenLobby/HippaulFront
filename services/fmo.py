@@ -3585,7 +3585,82 @@ MAPNO_PS2 = _env_int("FMO_MAPNO_PS2", "121")
 #: cannot send it somewhere its install has no file for. Same caveat as above:
 #: this is the union of the two readings, deliberately -- refusing a map the
 #: console DOES have costs a menu row, granting one it does not costs a void.
-PS2_VALID_MAPNOS = (101, 121, 141, 142, 143, 144, 161, 162, 163, 164)
+PS2_MAPNOS_UNION = (101, 121, 141, 142, 143, 144, 161, 162, 163, 164)
+#: VERIFIED: SETTLED 2026-09-21 FROM THE CONSOLE'S OWN MODULE (midas.pex, base
+#: 0x280000) -- the three file-list derivations above are retired:
+#:   0x0038b7e0  id -> path is ARITHMETIC, the PC's 0x6113DAE0 in other letters:
+#:                 q, r = divmod(index, 100)
+#:                 /<'A'+q//1000><(q%1000)//100>/D<q%100:02d>/F<r:02d>.BIN
+#:   0x0038b950  existence = hddata.pos bands (u16 first WRAPS, count 0 ends)
+#:   0x005672e0  BASE = 56137, 53577, 55625, 96665, 98713 (PC +20/+20/+20/+3120)
+#: A resource walk over the console's install covers all three id spaces. Disk and hddata.pos agree
+#: exactly (6/6 lobby, 211/211 battle), which is the control the old readings
+#: never had:
+#:   type 2 LOBBY   101, 121, 141-144      PC-only: 102, 122-124, 151, 161
+#:   type 1 BATTLE  211 of the PC's 281    (PS2_TYPE1_050324 below)
+#:   type 3 ZONE    every real zone row (0-10, 98-109, x00-x09/x19) is present
+#: WARNING: THE COST: PCSX2 walks into a map with no file and
+#: draws a void, REAL HARDWARE CRASHES loading it. So anything outside these
+#: sets is substituted (lobby -> MAPNO_PS2) or refused (battle, 10:6).
+#:
+#:   FMO_PS2_GATE=0       de-gate: a console session is served exactly what a
+#:                        PC is (the day FMO's patch data turns up)
+#:   FMO_PS2_MAPNOS=a,b   the type-2 maps a console may be granted
+#:   FMO_PS2_TYPE1=a-b,c  the type-1 maps a console may SORTIE to; `all`
+#:                        trusts TYPE1_ON_DISK (the PC's set)
+#: The build test is Session.is_ps2 (the 0x0065 version string), NOT
+#: responders._peer_is_ps2() -- that one says PS2 for everybody.
+PS2_GATE = (os.environ.get("FMO_PS2_GATE", "").strip() or "1") != "0"
+PS2_TYPE1_050324 = (
+    "0,14-16,18,24-36,38-76,99-104,107-127,150-156,170-174,176,180-188,191,"
+    "193,200,203-204,221,231-244,265-272,281-282,300-317,320-322,343-347,"
+    "352-356,363-365,372-375,377-383,403-404,406-414,417-420,422-423,436-439,"
+    "453-454,462-464,470-473")
+
+
+def _ps2_id_set(name, default):
+    """A comma list of ids / a-b ranges from the environment. A typo must not
+    take the service down: a bad entry is dropped and named."""
+    spec = os.environ.get(name, "").strip() or default
+    out = []
+    for e in spec.replace(" ", "").split(","):
+        lo, _, hi = e.partition("-")
+        try:
+            out.extend(range(int(lo, 0), int(hi or lo, 0) + 1))
+        except ValueError:
+            if e:
+                print(f"fmo: WARNING: {name} entry {e!r} is not an id or a-b range "
+                      f"-- dropped", flush=True)
+    return tuple(out)
+
+
+PS2_VALID_MAPNOS = _ps2_id_set("FMO_PS2_MAPNOS", "101,121,141-144")
+if MAPNO_PS2 and MAPNO_PS2 not in PS2_VALID_MAPNOS:
+    print(f"fmo: WARNING: FMO_MAPNO_PS2={MAPNO_PS2} is not in FMO_PS2_MAPNOS "
+          f"{PS2_VALID_MAPNOS} -- the console has no file for it; using 121",
+          flush=True)
+    MAPNO_PS2 = 121
+#: None = no type-1 gate (`all`); a tuple = the only battle maps granted.
+PS2_TYPE1 = (None if os.environ.get("FMO_PS2_TYPE1", "").strip().lower() == "all"
+             else _ps2_id_set("FMO_PS2_TYPE1", PS2_TYPE1_050324))
+#: KEY: THE THIRD ID SPACE, gated 2026-09-21 for the same reason as the other two:
+#: MapKind is resource type 3 (96665+MapKind on the console, 93545+ on the PC),
+#: and the console ships **103 of the PC's 1000**. The set is read off
+#: hddata.pos; it is every id SE actually authored a zone for (the tutorial
+#: props 0-10, the nation scripts 98-109, and each zone band x00..x09, 500-519,
+#: 700-719), so nothing we serve today falls outside it -- this is a backstop,
+#: not a behaviour change.
+#: WARNING: Only bites when the client USES our MapKind: with FMO_0153_F18=1
+#: `script_id_for` substitutes the nation script (98/99, both present) and
+#: throws ours away -- see the FIELD_18 note. A missing type-3 is the same
+#: zero-length-resource crash as a missing map (0x611250A2).
+PS2_VALID_MAPKINDS = _ps2_id_set(
+    "FMO_PS2_MAPKINDS",
+    "0-10,98-109,200-209,300-309,400-409,500-519,600-609,700-719")
+#: What a console session falls back to when its zone has no pack. 200 is the
+#: O.C.U. occupation band -- present on the console and FMO_MAPKIND's own
+#: default -- but this should never fire: every band we grant is in the set.
+MAPKIND_PS2 = _env_int("FMO_MAPKIND_PS2", "200")
 #: Same shape as FMO_MAPKIND_SWEEP: one value per GAME connection, logged.
 MAPNO_SWEEP = [int(x, 0) for x in
                os.environ.get("FMO_MAPNO_SWEEP", "").replace(" ", "").split(",")
@@ -10718,17 +10793,59 @@ class Session:
         be one the console's install has no file for -- and that renders as an
         empty scene the player can still walk around in. `why` names where the
         PC-side value came from, so the log says what was overridden."""
-        if not self.is_ps2 or not MAPNO_PS2 or mn == MAPNO_PS2:
+        if (not self.is_ps2 or not PS2_GATE or not MAPNO_PS2
+                or mn in PS2_VALID_MAPNOS):
             return mn
+        log(f"{self.peer}   WARNING: PS2 GATE: MapNo {mn} is not in FMO_PS2_MAPNOS "
+            f"{PS2_VALID_MAPNOS} -- real hardware CRASHES loading a map it has "
+            f"no file for (PCSX2 only draws a void). FMO_PS2_GATE=0 de-gates.")
         log(f"{self.peer}   MapNo {mn} -> {MAPNO_PS2}: this is the PS2 build "
             f"({self.version}), and {why} is the PC's map set. FMO_MAPNO_PS2 "
             f"picks what the CONSOLE ships"
             + ("" if mn in VALID_MAPNOS else
                f" (WARNING: {mn} is not in VALID_MAPNOS either)")
-            + ". WARNING: The console's own map set is NOT proven -- see MAPNO_PS2. "
-              "If this scene is still an empty void, the map set is the wrong "
-              "hypothesis and the loader is next.")
+            + ". The console's set is read off midas.pex.")
         return MAPNO_PS2
+
+    def ps2_mapkind_refusal(self, mk):
+        """None when THIS build has a zone pack for MapKind `mk`, else why not.
+
+        The caller decides what to do with it: a Change Area names the zone the
+        player PICKED, so that one refuses (the client's own error arm); a world
+        entry or Move carries a zone WE chose, so build_mapkind() substitutes."""
+        if (not self.is_ps2 or not PS2_GATE or mk is None
+                or int(mk) in PS2_VALID_MAPKINDS):
+            return None
+        return (f"PS2 GATE: zone {mk} has no type-3 pack on this build "
+                f"({self.version}) -- the console ships "
+                f"{len(PS2_VALID_MAPKINDS)} of the PC's 1000 "
+                f"(FMO_PS2_MAPKINDS), and a missing resource is the same "
+                f"0x611250A2 crash a missing map is")
+
+    def build_mapkind(self, mk, why):
+        """The MapKind to actually serve THIS build, for the grants whose zone
+        comes from our own config rather than from the player's pick."""
+        no = self.ps2_mapkind_refusal(mk)
+        if no is None:
+            return mk
+        log(f"{self.peer}   WARNING: {no}. {why} -> {MAPKIND_PS2} "
+            f"(FMO_MAPKIND_PS2). WARNING: THIS SHOULD NOT FIRE: every band we grant "
+            f"is in the console's set, so a zone that lands here means the "
+            f"zone table and the gate disagree -- fix the table, not this.")
+        return MAPKIND_PS2
+
+    def ps2_type1_refusal(self, mn):
+        """None when THIS build may be sent to type-1 (battle) map `mn`, else
+        the reason. There is no substitute for a battle map -- the sector picked
+        it -- so a console is REFUSED rather than redirected (FMO_PS2_TYPE1)."""
+        if (not self.is_ps2 or not PS2_GATE or PS2_TYPE1 is None
+                or mn is None or mn in PS2_TYPE1):
+            return None
+        return (f"PS2 GATE: type-1 battle map {mn} is not one of the "
+                f"{len(PS2_TYPE1)} in FMO_PS2_TYPE1 and this is the PS2 build "
+                f"({self.version}) -- the console has no file for it "
+                f"(hddata.pos + midas.pex 0x0038b7e0) and real "
+                f"hardware crashes on a missing map. FMO_PS2_TYPE1=all de-gates")
 
     def reply_seq(self):
         """The correlation id a reply must carry: the REQUEST'S +0x10.
@@ -11220,8 +11337,10 @@ class Session:
                 if mn != _mn0:
                     log(f"{self.peer}   MapNo {_mn0} -> {mn}: {_mn_why} binds "
                         f"zone {mk} to that lobby map")
-            # KEY: LAST WORD: the console ships a different map set (MAPNO_PS2).
+            # KEY: LAST WORD: the console ships a different map set (MAPNO_PS2),
+            # and a different ZONE-PACK set (PS2_VALID_MAPKINDS).
             mn = self.build_mapno(mn, "the value we picked")
+            mk = self.build_mapkind(mk, "the zone we picked")
             if PILOTPOS_SWEEP:
                 log(f"{self.peer}   PilotPos sweep: spawning the player at "
                     f"{pp} (candidate "
@@ -11624,6 +11743,15 @@ class Session:
                     f"THE PLAYER IS ALREADY IN. The scene will re-enter the "
                     f"same base. That is a valid test of the Move MENU and no "
                     f"test at all of terrain.")
+            # WARNING: THE PS2 GATE, AGAIN AND LAST (2026-09-21). The call above runs
+            # BEFORE the hangar / place / honoured-pick arms, and every one of
+            # them reassigns `mn` -- so a console that entered on 121 was Moved
+            # to the PC's 102 / 124 / 122 / 151. That is a crash on hardware.
+            _mn_pc = mn
+            mn = self.build_mapno(mn, "the Move destination")
+            mk = self.build_mapkind(mk, "the Move's zone")
+            if mn != _mn_pc and HANGAR_RESIDENTS.get(self.peer.split(":")[0]):
+                HANGAR_RESIDENTS[self.peer.split(":")[0]]["mapno"] = mn
             # Same reason as the 0x0150 path: a 0x0153 STARTS a world channel,
             # so whatever we still hold for this host describes a dead session.
             reset_world_channel(self.peer.split(":")[0],
@@ -11942,6 +12070,16 @@ class Session:
                     f"2026-09-04. Give this zone a destination "
                     f"(FMO_AREA_CHANGE_MAPNO={zone}:<mapno>) or set "
                     f"FMO_AREA_CHANGE_STRICT=0 to grant it anyway.")
+                return [build(2, b"", p["seq"], p["conn"])]
+            # WARNING: THE PS2 ZONE-PACK GATE (2026-09-21). Unlike the two grants that
+            # carry a zone WE chose, this one names the zone the PLAYER picked,
+            # so substituting would move them somewhere they did not ask for.
+            # Refuse instead, down the same graceful path AREA_CHANGE_STRICT
+            # uses: 0x611797DE reads a non-0x0153 reply as an error code and
+            # advances the machine to state 3, leaving the player where they are.
+            _ps2_zone_no = self.ps2_mapkind_refusal(zone)
+            if _ps2_zone_no:
+                log(f"{self.peer}   WARNING: REFUSING zone {zone}: {_ps2_zone_no}")
                 return [build(2, b"", p["seq"], p["conn"])]
             _host = self.peer.split(":")[0]
             # WARNING: "current" is the map the player is STANDING IN: the last 0x0153
@@ -12807,9 +12945,13 @@ class Session:
                     and time.time() - getattr(self, "sortie_push_grant_at", 0)
                     >= SORTIE_PUSH_DELAY):
                 self.sortie_push_pending = False
-                push = sortie_push_packet(p["conn"], host=host_for(
-                    SORTIE_HOST or BATTLE_HOST, self.ip))
-                if push is None:
+                _ps2_no = self.ps2_type1_refusal(sortie_push_mapno()[0])
+                push = None if _ps2_no else sortie_push_packet(
+                    p["conn"], host=host_for(SORTIE_HOST or BATTLE_HOST, self.ip))
+                if _ps2_no:
+                    log(f"{self.peer}   WARNING: 0x{MSG_SORTIE_PUSH:04X} AUTO-SORTIE "
+                        f"push NOT sent: {_ps2_no}")
+                elif push is None:
                     _mn, _src = sortie_push_mapno()
                     log(f"{self.peer}   WARNING: 0x{MSG_SORTIE_PUSH:04X} AUTO-SORTIE "
                         f"push NOT sent: {_src}")
@@ -22175,9 +22317,51 @@ def selftest():
     print(f"  a PS2 session is served MapNo {MAPNO_PS2}, a PC session keeps "
           f"its own  {'OK' if build_ok else 'FAIL'}")
     ok &= build_ok
+    # THE GATE (2026-09-21, hardware crashes on a missing map). Every PC room
+    # map outside the console's set is substituted, a map IN the set passes
+    # untouched, and the PC is never touched by either arm.
+    _pc_only = [m for m in VALID_MAPNOS if m not in PS2_VALID_MAPNOS]
+    # a PC-only battle map when the default set is in force, else any id
+    _t1 = next((m for m in sorted(TYPE1_ON_DISK)
+                if PS2_TYPE1 is not None and m not in PS2_TYPE1),
+               next(iter(sorted(TYPE1_ON_DISK))))
+    gate_ok = (bool(_pc_only)
+               and all(s3.build_mapno(m, "test") == MAPNO_PS2 for m in _pc_only)
+               and all(s3.build_mapno(m, "test") == m for m in PS2_VALID_MAPNOS)
+               and all(pcs.build_mapno(m, "test") == m for m in VALID_MAPNOS)
+               and pcs.ps2_type1_refusal(_t1) is None
+               and (PS2_TYPE1 is None or _t1 in PS2_TYPE1
+                    or s3.ps2_type1_refusal(_t1) is not None)
+               and s3.ps2_type1_refusal(None) is None
+               # the console's set is a SUBSET of the PC's: an id only the
+               # console had would mean the BASE table was misread
+               and (PS2_TYPE1 is None or os.environ.get("FMO_PS2_TYPE1")
+                    or (set(PS2_TYPE1) <= set(TYPE1_ON_DISK)
+                        and len(PS2_TYPE1) == 211
+                        and s3.ps2_type1_refusal(PS2_TYPE1[0]) is None))
+               and (os.environ.get("FMO_PS2_MAPNOS")
+                    or set(PS2_VALID_MAPNOS) <= set(VALID_MAPNOS))
+               # the zone-pack gate: every band we actually grant must PASS,
+               # a zone the console has no pack for must be refused, and the
+               # PC must be untouched by either arm
+               and all(s3.ps2_mapkind_refusal(z) is None
+                       for z in (100, 200, 207, 300, 400, 407, 509, 600))
+               and s3.ps2_mapkind_refusal(950) is not None
+               and pcs.ps2_mapkind_refusal(950) is None
+               and s3.build_mapkind(950, "test") == MAPKIND_PS2
+               and s3.build_mapkind(200, "test") == 200
+               and pcs.build_mapkind(950, "test") == 950
+               and MAPKIND_PS2 in PS2_VALID_MAPKINDS)
+    print(f"  PS2 gate: {len(_pc_only)} PC-only lobby maps -> {MAPNO_PS2}, "
+          f"{PS2_VALID_MAPNOS} pass, type-1 {_t1} "
+          f"{'refused' if s3.ps2_type1_refusal(_t1) else 'granted'} for the "
+          f"console, {len(PS2_VALID_MAPKINDS)} zone packs pass and a zone "
+          f"without one is refused, the PC untouched  "
+          f"{'OK' if gate_ok else 'FAIL'}")
+    ok &= gate_ok
     # Both readings of the console's catalogue agree on 121 and 141; the
     # default must be one of those, not a value only one reading supports.
-    agreed_ok = MAPNO_PS2 in (121, 141)
+    agreed_ok = MAPNO_PS2 in PS2_VALID_MAPNOS
     print(f"  the default PS2 MapNo is one BOTH catalogue readings agree on "
           f"{'OK' if agreed_ok else 'FAIL'}")
     ok &= agreed_ok
