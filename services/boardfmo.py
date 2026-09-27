@@ -49,6 +49,13 @@ except ImportError:                          # pragma: no cover
 NAME = "fmo"
 TITLE = "Front Mission Online - City Control"
 
+#: what /fmoboard calls this board, and what its one feed is called
+DISCORD_TITLE = "City Control"
+DISCORD_FEED_NAMES = {"": "standings"}
+#: whose player count the bot's status shows ("Watching 12 players online").
+#: fmo.py publishes it; with nobody publishing, the status is simply blank.
+PRESENCE_GAME = "fmo"
+
 #: NOT under services/fedata/ (restarts FE) and NOT a services/fmo*.py name
 #: (pol-git-sync's fmo rule would restart the game server).
 ART_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boardart", "fmo")
@@ -504,6 +511,20 @@ def discord_message(snap, args=None):
         files.append(("fmo-city-control.png", "image/png", png))
     else:
         payload["attachments"] = []
+    return payload, files
+
+
+def discord_bot_message(snap, args=None):
+    """The same board, posted AS THE BOT (/fmoboard) instead of through a
+    webhook. The only difference is the button, and it is a LINK button --
+    style 5 carries its own url and Discord never calls us back for it, so
+    City Control needs no interaction handler to be a bot.
+    """
+    payload, files = discord_message(snap, args)
+    url = (getattr(args, "fmo_url", "") or "").strip()
+    if url:
+        payload["components"] = [{"type": 1, "components": [
+            {"type": 2, "style": 5, "label": "Open the board", "url": url}]}]
     return payload, files
 
 
