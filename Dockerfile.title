@@ -1,14 +1,17 @@
 # The Front Mission Online title plugin, layered on the OpenLobby core image.
 #
 # The game's own service builds from services/Dockerfile. This image is the
-# core plus the two modules that run INSIDE the core's login and authsess
-# processes: the plugin, and the pilot database it reads.
+# core plus the modules that run INSIDE the core's login and authsess
+# processes: the plugin, the pilot database it reads, and the database
+# plumbing and migrations that database's tables come from.
 # docker-compose.title.yml swaps it in for those two services. Build the core
 # first, or point OPENLOBBY_IMAGE at the image you use (a title image, to
 # stack titles).
 ARG OPENLOBBY_IMAGE=openlobby:latest
 FROM ${OPENLOBBY_IMAGE}
 
+COPY services/fmodb.py /app/fmodb.py
+COPY services/fmo_migrations /app/fmo_migrations
 COPY services/fmostore.py /app/fmostore.py
 COPY services/fmotitle.py /app/fmotitle.py
 

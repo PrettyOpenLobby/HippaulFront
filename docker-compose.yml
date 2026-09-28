@@ -1,39 +1,54 @@
-# Front Mission Online game service. Requires the core lobby stack (openlobby)
-# running on the same Docker host: this compose joins its data volume (the
-# shared account and session database, and this title's own player database
-# beside it) and its logs volume.
+# Front Mission Online game service. This file is an OVERRIDE of OpenLobby's
+# compose file, not a stack of its own: the service runs in OpenLobby's
+# compose project, beside the core, on its network, with its PostgreSQL and
+# Valkey and its data and logs volumes. With both repositories checked out
+# side by side, from this directory:
 #
 #   1. python tools/gen_blowfish_tables.py                        (once)
 #   2. python tools/fmodata_build.py --client <your FMO install>  (once)
 #   3. cp .env.example .env    # set POL_ADVERTISE to your server's LAN/VPN IP
-#      docker compose up -d --build
+#      docker compose --project-directory ../openlobby \
+#          --env-file ../openlobby/.env --env-file .env \
+#          -f ../openlobby/docker-compose.yml -f docker-compose.yml \
+#          up -d --build fmo
 #
-# The client discovers this service through the core lobby (content id 4 in
-# the games menu) and dials fmo01.pol.com:61300, which the core's DNS answers
-# with the advertised address.
+# (OpenLobby's .env first, so its POL_DB_PASSWORD reaches the connection
+# string below; this repository's .env second, for the FMO_* knobs.)
+#
+# Build the core image first (openlobby:latest, `docker compose build` in
+# ../openlobby) or point OPENLOBBY_IMAGE at the one you use: this image is
+# built on it. The client discovers this service through the core lobby
+# (content id 4 in the games menu) and dials fmo01.pol.com:61300, which the
+# core's DNS answers with the advertised address.
+#
+# Relative paths below resolve against ../openlobby (the project directory).
 
 # fmo owns the image build; the optional services consume it with
 # pull_policy: never so parallel builds cannot race on the tag.
-x-app: &app
+x-fmo: &fmo
   image: crystalfront:latest
   pull_policy: never
   restart: unless-stopped
-  environment: &appenv
+  environment: &fmoenv
     POL_ADVERTISE: "${POL_ADVERTISE:-}"
     POL_ACCOUNTS_DB: /data/accounts.db
     POL_LOG_DIR: /logs
     PYTHONUNBUFFERED: "1"
+    # PostgreSQL and Valkey, OpenLobby's services (its docs/database.md).
+    # The game's tables are CrystalFront's own migrations (fmo_*), applied
+    # by the service at start.
+    POL_DATABASE_URL: "postgresql://openlobby:${POL_DB_PASSWORD:-openlobby}@postgres:5432/openlobby"
+    POL_VALKEY_URL: "valkey://valkey:6379/0"
   volumes:
     - pol-data:/data
     - pol-logs:/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    valkey:
+      condition: service_healthy
 
 volumes:
-  pol-data:
-    external: true
-    name: openlobby_pol-data
-  pol-logs:
-    external: true
-    name: openlobby_pol-logs
   fmo-board-state:
 
 services:
@@ -44,17 +59,22 @@ services:
   # this list (compose enumerates what reaches the container) and set it in
   # .env.
   fmo:
-    <<: *app
-    build: ./services
+    <<: *fmo
+    build:
+      context: ../crystalfront/services
+      args:
+        OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
     pull_policy: build
     entrypoint: ["python", "fmo.py"]
     environment:
-      <<: *appenv
+      <<: *fmoenv
       # the endpoints handed to the client in the join grant
       FMO_BATTLE_HOST: "${POL_ADVERTISE:-127.0.0.1}"
       FMO_NEXT_HOST: "${POL_ADVERTISE:-127.0.0.1}"
-      # the player database, the character store and the war state
-      FMO_DB: /data/fmo.db
+      # the player database (PostgreSQL; 0 = the JSON character store), the
+      # JSON store it imports once and keeps as the backup, and the old war
+      # state file, imported once into an empty database
+      FMO_DB: "${FMO_DB:-1}"
       FMO_CHAR_STORE: /data/fmo_characters.json
       FMO_WAR_STATE: /data/fmowar.json
       FMO_NPC_LAYOUT: /data/fmo_npc_layout.json
@@ -79,14 +99,14 @@ services:
   # Optional: the City Control board, a web page of the war (the nineteen
   # cities, who holds them, the phase clock), read-only over the war state.
   # The backdrop needs art baked from your own client (README.md).
-  #   docker compose --profile board up -d
+  #   add --profile board to the command above
   board:
-    <<: *app
+    <<: *fmo
     profiles: ["board"]
     entrypoint: ["python", "polboards.py", "--bind", "0.0.0.0",
                  "--fmo-port", "8792"]
     environment:
-      <<: *appenv
+      <<: *fmoenv
       POL_DATA_DIR: /data
       POL_BOARDS_STATE_DIR: /state
       POL_BOARDS_FMO_URL: "${POL_BOARDS_FMO_URL:-}"
