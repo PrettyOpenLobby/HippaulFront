@@ -4161,7 +4161,7 @@ def describe_script_choice(mapkind, nation=None, nation_src=None):
                f"so this run cannot tell MapKind values apart"))
 
 
-def setup_block(mapno=None, pilotpos=None, csn=None):
+def setup_block(mapno=None, pilotpos=None, csn=None, self_id=None):
     """The 252 bytes at 0x0153 +0x28, laid out as lobby+0x6B3A is read.
 
     Only the named fields are written; the rest stays zero, because writing
@@ -4190,7 +4190,13 @@ def setup_block(mapno=None, pilotpos=None, csn=None):
     # the scene if its id is also here. FMO_UDP_POP defaults this list to the
     # unit it pops, so the two cannot drift apart by accident -- which is the
     # single most likely way to get a false negative out of this experiment.
-    for i, uid in enumerate(SETUP_UNIT_IDS[:8]):
+    # WIRE IDS: this pilot's own unit is the character id it selected
+    # (CHAR_WIRE_BASE), so it replaces the fixed POP id at the head of the list.
+    ids = list(SETUP_UNIT_IDS[:8])
+    if self_id:
+        ids = [self_id] + [u for u in ids if u not in (self_id,) + (
+            (POP[0],) if POP else ())]
+    for i, uid in enumerate(ids[:8]):
         struct.pack_into("<I", b, SU_UNITS + i * 4, uid & 0xFFFFFFFF)
     return bytes(b)
 
@@ -4232,7 +4238,7 @@ def advance_sweep():
 
 
 def reply_0153(fill=None, mapkind=None, mapno=None, pilotpos=None, csn=None,
-               field18=None, host=None):
+               field18=None, host=None, self_id=None):
     """The 380-byte 0x0153 payload. `fill=False` is the all-zero control.
 
     `field18` overrides the +0x18 zone kind (globals+0x1AC: 0 lobby, 1 room,
@@ -4250,7 +4256,8 @@ def reply_0153(fill=None, mapkind=None, mapno=None, pilotpos=None, csn=None,
     struct.pack_into("<II", b, R153_FIELD_18,
                      (FIELD_18 if field18 is None else field18) & 0xFFFFFFFF,
                      FIELD_1C)
-    b[R153_SETUP:R153_SETUP + SETUP_LEN] = setup_block(mapno, pilotpos, csn)
+    b[R153_SETUP:R153_SETUP + SETUP_LEN] = setup_block(mapno, pilotpos, csn,
+                                                       self_id=self_id)
     # The 88 bytes at +0x124 stay zero -- the structure is unidentified and it is
     # the same one a 0x0155 entry carries, so a guess here would be a guess twice.
     return bytes(b)
@@ -8426,6 +8433,34 @@ def list_payload(count):
 #: NON-ZERO or the client's own free-slot search rejects it.
 FREE_SLOT_ID = 1
 
+#: KEY: THE CHARACTER ID THE CLIENT SEES = the stored id + FMO_CHAR_WIRE_BASE.
+#:
+#: The client's selected character id becomes its own UnitID ([mgr+0x2C],
+#: globals+0x1BC -> the "%xlobby"/"%xbattle" key and the own unit's +0x08), and
+#: its unit tick 0x61064720 SKIPS every unit whose UnitID is below 10 before it
+#: builds or sends movement state (`cmp [ebp+8],0xA; jb` at 0x6106659C).
+#: We served ids 1, 2, ... so a pilot's OWN wanzer
+#: never sent cmd 23/24: live 2026-09-27, AI enemies (0x2222..) moved on both
+#: screens and the allied pilots never did. Retail ids were large.
+#: The store keeps its ids (1, 2, ...); only the wire is shifted, at the two
+#: boundaries -- roster_payload() out, Session.find()/apply_charsel() in -- so no
+#: stored character is renumbered. 0x1000 clears the room aliases (0x200..),
+#: the enemy squad (0x2222..) and the NPC ids (0x8208....). 0 = the old ids.
+CHAR_WIRE_BASE = _env_int("FMO_CHAR_WIRE_BASE", "0x1000")
+
+
+def to_wire(store_id):
+    """Stored character id -> the id the client is served."""
+    return (store_id + CHAR_WIRE_BASE) if CHAR_WIRE_BASE and store_id else store_id
+
+
+def from_wire(wire_id):
+    """An id the client sent -> the stored id. Idempotent on a stored id (they
+    never reach CHAR_WIRE_BASE), so a caller that already converted is safe."""
+    if CHAR_WIRE_BASE and wire_id is not None and wire_id >= CHAR_WIRE_BASE:
+        return wire_id - CHAR_WIRE_BASE
+    return wire_id
+
 
 def has_named_character(roster):
     """The client's own test, transcribed: a character exists iff some slot
@@ -8492,8 +8527,8 @@ def roster_payload(roster):
         off = 4 + i * LIST_ENTRY_LEN
         nb = character_nation(c)[0] if NATION_PER_CHARACTER else None
         body[off:off + LIST_ENTRY_LEN] = list_entry(
-            c["id"], c.get("first", ""), c.get("last", ""), c.get("nation", 0),
-            nation_byte=nb)
+            to_wire(c["id"]), c.get("first", ""), c.get("last", ""),
+            c.get("nation", 0), nation_byte=nb)
     return bytes(body)
 
 # --------------------------------------------------------------------------- #
@@ -11157,6 +11192,7 @@ class Session:
             f"{len(self._roster)} character(s) now on file")
 
     def find(self, char_id):
+        char_id = from_wire(char_id)          # the client names the WIRE id
         for c in self.roster:
             if c["id"] == char_id:
                 return c
@@ -11457,8 +11493,10 @@ class Session:
         caller turns that into a real failure reply rather than answering
         "done" for something that did not happen.
         """
+        char_id = from_wire(char_id)          # store ids from here on
         if msg == 0x013E and len(payload) >= 0x3C:
             rec = character_from_013e(payload)
+            rec["id"] = from_wire(rec["id"])
             # WARNING: COMPLETE the record the NAME step already made -- do not append.
             # Creation is TWO messages against ONE slot: 0x0177 carries the names
             # (and upserts the row), then the wanzer pick sends 0x013E with the
@@ -11973,7 +12011,8 @@ class Session:
             outs = [build(MSG_0150_REPLY,
                            reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
                                       csn=csn,
-                                      host=host_for(BATTLE_HOST, self.ip)),
+                                      host=host_for(BATTLE_HOST, self.ip),
+                                     self_id=self.wire_self_id()),
                            self.reply_seq(), p["conn"])]
             # KEY: MEASURED TWICE, 2026-09-04. This is WORLD ENTRY, a different
             # grant from the Move handler's, and it runs the same lobby reset
@@ -12379,7 +12418,8 @@ class Session:
             outs = [build(MSG_0150_REPLY,
                           reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
                                      csn=csn, field18=kind,
-                                     host=host_for(BATTLE_HOST, self.ip)),
+                                     host=host_for(BATTLE_HOST, self.ip),
+                                     self_id=self.wire_self_id()),
                           self.reply_seq(), p["conn"])]
             # KEY: CITY-TABLE ORDERING (measured 2026-08-27 03:56Z): the client's
             # 0x01AC came IN THE LOBBY, so the 0x019A push filled lobby+0x6C36
@@ -12694,7 +12734,8 @@ class Session:
                 f"through the sortie, not through this grant.")
             outs = [build(MSG_0150_REPLY,
                           reply_0153(mapkind=zone, mapno=_mn,
-                                     host=host_for(BATTLE_HOST, self.ip)),
+                                     host=host_for(BATTLE_HOST, self.ip),
+                                     self_id=self.wire_self_id()),
                           p["seq"], p["conn"])]
             # KEY: MEASURED 2026-09-05 (static, 0x611796EF): after copying the
             # block the Change Area arm DESTROYS the world manager
@@ -19008,6 +19049,26 @@ ROOM = os.environ.get("FMO_UDP_ROOM", "1") != "0"
 ROOM_PEER_KEY = os.environ.get("FMO_UDP_ROOM_PEER_KEY", "1") != "0"
 
 ROOM_ALIAS_BASE = _env_int("FMO_UDP_ROOM_ALIAS_BASE", "0x200")
+#: KEY: THE PEER LINK (2026-09-27). Retail FMO ran
+#: movement, fire, damage and voice PEER-TO-PEER; we stand in for every peer.
+#: Until now the room-mate POP left the peer's address zero, so the client never
+#: sent the alias a byte (frozen pilot, [!] over them, no voice) -- and when it
+#: did send, we filed it under the self stream, because the client stamps +0x00
+#: with its OWN UnitID and names the peer only by the +0x09 TAG byte (POP
+#: body+0x36 -> peer+0x111C). With this on: the POP carries our endpoint and a
+#: per-alias tag, alias datagrams carry that tag at +0x0A, inbound traffic is
+#: routed by tag, the client's cmd 3/16 hello gets cmd 4 (link state 2 -- the
+#: client logs "(Operator)p2p成功" once every peer is up), pings are answered,
+#: and its records for the peer are RELAYED to that player's client under the
+#: alias they know the sender by. FMO_UDP_PEER_LINK=0 restores the old POP.
+PEER_LINK = os.environ.get("FMO_UDP_PEER_LINK", "1") != "0"
+#: First tag byte. Must never equal a manager hid the client uses for its OWN
+#: stream (lobby 2, battle 0, group 1 / 5), or its self traffic would read as
+#: an alias's; 0x40.. is clear of all of them.
+PEER_TAG_BASE = _env_int("FMO_UDP_PEER_TAG_BASE", "0x40")
+#: Keep each linked alias stream alive: the [!] also shows when a peer has been
+#: silent > 1.5 s (0x611E2250), so an idle alias gets an ack-only datagram.
+PEER_KEEPALIVE = _env_float("FMO_UDP_PEER_KEEPALIVE", "1.0")
 #: The UnitType a remote player is popped as. 4 is the only type measured to
 #: render a person (the UnitType selects class and control); it is a knob
 #: because "what another player looks like" is not decoded, only "what I look
@@ -19119,6 +19180,13 @@ class RemoteStream:
     def __init__(self, alias, peer_addr):
         self.alias = alias          # the UnitID this client knows them by
         self.peer_addr = peer_addr  # the OTHER channel's (host, port)
+        #: The PEER LINK tag (see PEER_LINK): POP body+0x36, our +0x0A on this
+        #: stream, and the +0x09 the client stamps on what it sends this peer.
+        self.tag = PEER_TAG_BASE + ((alias - ROOM_ALIAS_BASE) % 0x40)
+        self.rx = 0                 # how far we consumed THEIR records (our ack)
+        self.last_tx = 0.0          # when we last sent on this stream
+        self.linked = False         # the client's cmd 3/16 got our cmd 4
+        self.relayed = 0            # records passed on to the other client
         self.tx_base = 0
         self.pending = []
         self.adopted = False
@@ -19288,6 +19356,11 @@ class WorldChannel:
         authority; the latched character id is the cross-check and the fallback,
         because it is the same number by construction (globals+0x1BC feeds both
         the key and `manager+0x2C`)."""
+        # With wire ids (CHAR_WIRE_BASE) the client's own id is the character
+        # id it selected, which the key latched -- the fixed FMO_UDP_POP id (1)
+        # would be a unit the client does not own, and it is < 10 besides.
+        if CHAR_WIRE_BASE and self.char_id and self.char_id >= CHAR_WIRE_BASE:
+            return self.char_id
         if POP:
             return POP[0]
         return self.char_id
@@ -19401,6 +19474,10 @@ class WorldChannel:
         _h = host_for(BATTLE_HOST, self.addr[0] if self.addr else None)
         ep = (endpoint_net if EP_0153_NET else endpoint)(_h, BATTLE_PORT)
         ids = UDP_KEY_IDS or list(range(1, max(LIST_COUNT, 1) + 1)) + [0]
+        if CHAR_WIRE_BASE and not UDP_KEY_IDS:
+            # The client keys with the id it SELECTED, i.e. the wire id
+            # (to_wire). Tried first; the store ids stay as the fallback.
+            ids = [to_wire(i) for i in range(1, LIST_SLOTS + 1)] + ids
         # Scene 4's battle UDP manager keys "%xbattle" from the SAME endpoint
         # struct (served again in the 0x014E push, FMO_SORTIE_HOST/PORT
         # reused), so the battle twin of every lobby key is a candidate too.
@@ -20216,6 +20293,13 @@ def fire_relay(chan, addr, body, arg8):
     for o in room_mates(chan):
         if not _is_battle_chan(o):
             continue
+        # PEER LINK: once the shooter's link to this mate is up, its client
+        # sends the shot on that link and peer_link_serve relays it -- relaying
+        # it here too would fire every shot twice.
+        _mine = getattr(chan, "remotes", {}).get(
+            getattr(chan, "alias_of", {}).get(o.addr))
+        if PEER_LINK and _mine is not None and getattr(_mine, "linked", False):
+            continue
         alias = o.alias_for(chan.addr)
         rs = o.remotes.get(alias)
         if rs is None or not rs.popped:
@@ -20368,7 +20452,8 @@ def room_queue(chan):
                        "FRIENDLY (same nation)"))
             try:
                 chan.pending.append(fmoworld.record_pop(
-                    alias, look=_rlook_now, **rs.pop_args,
+                    alias, look=_rlook_now, **(owned_by(rs.pop_args, alias)
+                                               if _is_battle_chan(chan) else rs.pop_args),
                     # KEY: THE PEER STREAM'S OWN BLOWFISH KEY. Every peer the
                     # client creates gets its own cipher, scheduled from this
                     # field (fmoworld.POP_CLIENT_BLOB). We send the key THIS
@@ -20379,7 +20464,8 @@ def room_queue(chan):
                     # client's MD5 fails, and every movement record on the
                     # alias stream is discarded before the window is consulted:
                     # measured live as "they appear but never move".
-                    client_key=(chan.key if ROOM_PEER_KEY else None)))
+                    client_key=(chan.key if ROOM_PEER_KEY else None),
+                    **peer_link_pop_args(chan, rs)))
             except ValueError as e:
                 log(f"[udp {chan.addr[0]}:{chan.addr[1]}] WARNING: ROOM POP "
                     f"REFUSED BY OUR OWN GUARD, nothing sent: {e}")
@@ -20399,8 +20485,10 @@ def room_queue(chan):
             # dressed. On the SELF stream, like the create POP.
             try:
                 chan.pending.append(fmoworld.record_pop(
-                    alias, look=other.type4_look, **rs.pop_args,
-                    client_key=(chan.key if ROOM_PEER_KEY else None)))
+                    alias, look=other.type4_look, **(owned_by(rs.pop_args, alias)
+                                                     if _is_battle_chan(chan) else rs.pop_args),
+                    client_key=(chan.key if ROOM_PEER_KEY else None),
+                    **peer_link_pop_args(chan, rs)))
             except ValueError as e:
                 log(f"[udp {chan.addr[0]}:{chan.addr[1]}] WARNING: ROOM DEFERRED "
                     f"LOOK for {alias:#x} refused, the bare unit stands: {e}")
@@ -20427,6 +20515,30 @@ def room_queue(chan):
             rs.sent_pos, rs.sent_at = other.pos, now
 
 
+def owned_by(pop_args, owner):
+    """`pop_args` with body+0x2C (the OWNER) set to `owner`. A room-mate's unit
+    is owned by its alias -- the peer whose link state 2 lets the freeze check
+    0x61051BB0 run it; a battle mate's args are copied from THEIR self POP,
+    whose owner is their own id, which must not leak into this client."""
+    extra = dict(pop_args.get("extra") or {})
+    extra[POP_AI_OWNER] = struct.pack("<I", owner & 0xFFFFFFFF)
+    return dict(pop_args, extra=extra)
+
+
+def peer_link_pop_args(chan, rs):
+    """The POP fields that make the client's peer for this alias SEND: our
+    endpoint as THIS client reaches it (the one 0x0153 / 0x013A hand it) and the
+    alias's tag. {} with FMO_UDP_PEER_LINK=0."""
+    if not PEER_LINK:
+        return {}
+    host = host_for(BATTLE_HOST, chan.addr[0])
+    try:
+        host = socket.gethostbyname(host)
+    except OSError:
+        return {"client_tag": rs.tag}
+    return {"client_addr": (host, BATTLE_PORT), "client_tag": rs.tag}
+
+
 def room_flush(sock, chan, got):
     """Send one datagram per alias stream that has records waiting.
 
@@ -20436,17 +20548,25 @@ def room_flush(sock, chan, got):
     if not ROOM or not chan.tables:
         return 0
     sent = 0
+    _now = time.time()
     for alias, rs in list(chan.remotes.items()) + list(getattr(chan, "npc_remotes", {}).items()):
-        if not rs.pending:
+        _live = (PEER_LINK and getattr(rs, "linked", False) and not rs.gone
+                 and _now - getattr(rs, "last_tx", 0.0) >= PEER_KEEPALIVE)
+        if not rs.pending and not _live:
             continue
         # WARNING: Same window contract as the self stream, on its own counters: FROM
         # is the first record this peer has not acknowledged, the datagram
         # carries the whole unacknowledged tail, and flag 0 asks to be adopted
         # exactly once (0x61070902 only adopts while the peer's +0x106E is 0).
-        _n = fit_records(rs.pending)          # the same 1,400-B wall
+        _n = fit_records(rs.pending) if rs.pending else 0   # the 1,400-B wall
         dgm = fmoworld.build(*chan.tables, peer=alias,
                              hid=scene_reply_hid(chan),
-                             kind=got["kind"], ack=0,
+                             # PEER LINK: +0x0A is the alias's TAG -- the client
+                             # copies it to peer+0x111C and stamps it back at
+                             # +0x09 on everything it sends this peer.
+                             kind=(rs.tag if PEER_LINK and hasattr(rs, "tag")
+                                   else got["kind"]),
+                             ack=getattr(rs, "rx", 0) if PEER_LINK else 0,
                              flag=0 if not rs.adopted else 2,
                              frm=rs.tx_base,
                              to=(rs.tx_base + _n) & 0xFFFF,
@@ -20470,9 +20590,150 @@ def room_flush(sock, chan, got):
                    "map, or the window test), NOT failing to receive them"
                    if rs.tx_base == 0 and rs.sent_n > 3 else ""))
         rs.adopted = True
+        rs.last_tx = _now
         sock.sendto(dgm, chan.addr)
         sent += 1
     return sent
+
+
+def peer_stream_for(chan, got):
+    """The RemoteStream a client datagram belongs to, or None for the self
+    stream. PEER LINK: by the +0x09 tag the client stamps for that peer -- its
+    +0x00 is always its OWN UnitID, so the old +0x00 lookup could never match
+    (and the traffic was misread as the self stream restarting). The +0x00
+    lookup stays as the fallback for FMO_UDP_PEER_LINK=0."""
+    if not got:
+        return None
+    if PEER_LINK and got["hid"] >= PEER_TAG_BASE:
+        for rs in chan.remotes.values():
+            if getattr(rs, "tag", None) == got["hid"]:
+                return rs
+    return (chan.remotes.get(got["peer"])
+            or getattr(chan, "npc_remotes", {}).get(got["peer"]))
+
+
+#: Voice chat on the battle group's peer links (sender 0x611E5150).
+GROUP_VOICE_CMD = 123
+#: cmd 191: update an existing group member's blob from +0x4C (0x611E5420).
+GROUP_BLOB_UPDATE_CMD = 191
+#: talkers (default) = relay voice only to members that have themselves sent
+#: voice (their voice system is up); all = to every member.
+GROUP_VOICE_TO = os.environ.get("FMO_GROUP_VOICE_TO", "talkers").strip() or "talkers"
+#: Records a peer link carries that are link housekeeping, not game state.
+PEER_HELLO = (3, 16)        # the peer's hello / retry -> answer cmd 4
+PEER_ACKED = 4              # the peer answering OUR hello
+PEER_PING, PEER_PONG = 300, 301
+
+
+def peer_link_serve(chan, rs, got, addr):
+    """Consume one datagram the client sent to alias `rs`: link housekeeping
+    here, everything else RELAYED to the player that alias stands for, under
+    the alias THAT client knows the sender by."""
+    rs.rx = got["to"]
+    other = WORLD_PEERS.get(rs.peer_addr)
+    for off, size, cmd, body in got["records"]:
+        if cmd in PEER_HELLO:
+            rs.pending.append(fmoworld.record(
+                PEER_ACKED, (rs.alias & 0xFFFFFFFF).to_bytes(4, "little"),
+                arg8=rs.alias))
+            if not rs.linked:
+                rs.linked = True
+                log(f"[udp {addr[0]}:{addr[1]}] VERIFIED: PEER LINK: the client "
+                    f"greeted alias {rs.alias:#x} (cmd {cmd}, tag {rs.tag:#x}) "
+                    f"-> cmd 4, its peer state goes to 2. Watch its log for "
+                    f"'(Operator)p2p成功' and the [!] clearing.")
+            continue
+        if cmd == PEER_ACKED:
+            if not rs.linked:
+                rs.linked = True
+                log(f"[udp {addr[0]}:{addr[1]}] VERIFIED: PEER LINK: alias "
+                    f"{rs.alias:#x} acked our hello (cmd 4)")
+            continue
+        if cmd == PEER_PING:
+            tick = body[:4] if len(body) >= 4 else b"\0\0\0\0"
+            rs.pending.append(fmoworld.record(
+                PEER_PONG, tick + struct.pack("<II",
+                                              int(time.time() * 1000) & 0xFFFFFFFF,
+                                              0), arg8=rs.alias))
+            continue
+        if other is None or not other.tables:
+            continue
+        # THE RELAY. The record is about the sender's own unit (their UnitID,
+        # at rec+0x08 and inside a cmd 24 batch); the other client knows that
+        # unit by the alias IT minted for the sender.
+        plain = got["plain"]
+        src = struct.unpack_from("<I", plain, off + 8)[0]
+        flt = struct.unpack_from("<I", plain, off + 12)[0]
+        if chan.key == GROUP_KEY:
+            # VOICE (cmd 123). Delivered VERBATIM
+            # on the other member's group SELF stream: the receive arm
+            # 0x611E5ADD takes it on any stream with no id check, and a body we
+            # altered would fail the codec -- which deletes the client's voice
+            # system until restart. Nothing else on a group link is relayed.
+            if cmd == GROUP_VOICE_CMD:
+                # WARNING: ONLY TO A CLIENT WHOSE VOICE SYSTEM IS UP. Live
+                # 2026-09-27: a PC's voice reached a Steam Deck whose voice
+                # system had failed to start (the red icon: no capture
+                # device under Proton), and the Deck hung. The server cannot read that state, but a client
+                # only SENDS cmd 123 when its voice system works -- so a
+                # member that has never sent voice gets none.
+                # FMO_GROUP_VOICE_TO=all relays to every member regardless.
+                chan.voice_seen = True
+                if GROUP_VOICE_TO != "all" and not getattr(other, "voice_seen", False):
+                    if not getattr(other, "voice_withheld_said", False):
+                        other.voice_withheld_said = True
+                        log(f"[udp {addr[0]}:{addr[1]}] GROUP VOICE withheld "
+                            f"from {other.addr[0]}:{other.addr[1]}: that client "
+                            f"has never sent voice, so its voice system may not "
+                            f"be up -- a client whose voice failed hung on "
+                            f"receiving it. FMO_GROUP_VOICE_TO=all "
+                            f"overrides.")
+                    continue
+                try:
+                    other.pending.append(fmoworld.record(
+                        cmd, body, arg8=src, flt=flt & 0xFFFF0000))
+                except ValueError:
+                    continue
+                rs.relayed += 1
+                if rs.relayed <= 3 or rs.relayed % 200 == 0:
+                    log(f"[udp {addr[0]}:{addr[1]}] GROUP VOICE #{rs.relayed}: "
+                        f"cmd {cmd} {len(body)}B -> {other.addr[0]}:{other.addr[1]} "
+                        f"(their group self stream, verbatim)")
+            continue
+        mine = chan.self_unit()
+        # Only the sender's OWN unit: a squad owner's records about the AI
+        # enemies already reach the room through the squad relay, and a second
+        # copy would move / fire / hit them twice.
+        if src != mine and cmd != 24:     # a batch is filtered per entry below
+            continue
+        b_alias = other.alias_for(getattr(chan, "peer_key", chan.addr))
+        _rsb = other.remotes.get(b_alias)
+        if _rsb is None or not _rsb.popped:
+            continue                # not introduced there yet: nothing to move
+        new_src = b_alias if src == mine else src
+        nb = bytearray(body)
+        if cmd == 24:
+            # u16 n, then n x (u32 id, motion state). A squad owner's batch also
+            # carries the AI units, which the squad relay already delivers --
+            # keep ONLY the sender's own entry (squad_batch_filter walks the
+            # real entry lengths) and rename it to the alias.
+            _own = squad_batch_filter(bytes(nb), {mine})
+            if _own is None:
+                continue
+            nb = bytearray(_own)
+            struct.pack_into("<I", nb, 2, b_alias)
+        try:
+            rec = fmoworld.record(cmd, bytes(nb), arg8=new_src,
+                                  flt=flt & 0xFFFF0000)
+        except ValueError:
+            continue
+        _rsb.pending.append(rec)
+        rs.relayed += 1
+        if rs.relayed <= 5 or rs.relayed % 500 == 0:
+            log(f"[udp {addr[0]}:{addr[1]}] PEER LINK relay #{rs.relayed}: "
+                f"cmd {cmd} {len(body)}B for unit {src:#x} -> "
+                f"{other.addr[0]}:{other.addr[1]} as {new_src:#x} (their alias "
+                f"stream {b_alias:#x})")
 
 
 #: THE BATTLE STATE, per client HOST -- the bridge between the UDP battle
@@ -20865,8 +21126,7 @@ def _serve_datagram(sock, peers, dg, addr):
     # which is byte-identical to the restart the detector below exists to
     # catch). **Two streams sharing one set of counters is the bug
     # WorldChannel's own docstring is about, one level up.**
-    alias_rs = ((chan.remotes.get(got["peer"])
-                 or getattr(chan, "npc_remotes", {}).get(got["peer"])) if got else None)
+    alias_rs = peer_stream_for(chan, got)
     # WARNING: THE BACKSTOP. If the reset above ever fails to fire, this is the shape
     # it leaves behind: we believe we have sent records the peer has never
     # acknowledged and is not asking for. Saying so costs one line and saves a
@@ -20945,6 +21205,23 @@ def _serve_datagram(sock, peers, dg, addr):
         # arrives the log line is the measurement.
         before = len(alias_rs.pending)
         alias_rs.retire(got["ack"])
+        if PEER_LINK and hasattr(alias_rs, "tag"):
+            # THE PEER LINK: hello -> cmd 4, ping -> pong, the rest relayed to
+            # the player this alias stands for. Then answer on the alias
+            # stream with our ack and whatever is queued for it.
+            peer_link_serve(chan, alias_rs, got, addr)
+            _n = fit_records(alias_rs.pending) if alias_rs.pending else 0
+            sock.sendto(fmoworld.build(*chan.tables, peer=alias_rs.alias,
+                                       hid=scene_reply_hid(chan),
+                                       kind=alias_rs.tag, ack=alias_rs.rx,
+                                       flag=0 if not alias_rs.adopted else 2,
+                                       frm=alias_rs.tx_base,
+                                       to=(alias_rs.tx_base + _n) & 0xFFFF,
+                                       body=b"".join(alias_rs.pending[:_n])),
+                        addr)
+            alias_rs.adopted = True
+            alias_rs.last_tx = time.time()
+            return
         if got["records"]:
             log(f"[udp {addr[0]}:{addr[1]}] room stream {got['peer']:#x} "
                 f"carried {len(got['records'])} record(s) -- unexpected, and "
@@ -21220,6 +21497,11 @@ def _serve_datagram(sock, peers, dg, addr):
         if _battle_pop:
             uid, utype = POP_BATTLE
             _which = None
+        # WIRE IDS: the self unit is the id the client selected (the latched
+        # char id), not the fixed POP id -- see CHAR_WIRE_BASE.
+        uid = chan.self_unit() if CHAR_WIRE_BASE and chan.char_id and \
+            chan.char_id >= CHAR_WIRE_BASE else uid
+        if _battle_pop:
             log(f"[udp {addr[0]}:{addr[1]}] BATTLE POP OVERRIDE "
                 f"(FMO_UDP_POP_BATTLE): this battle channel pops "
                 f"UnitID={uid:#010x} UnitType={utype} instead of FMO_UDP_POP's "
@@ -21407,6 +21689,16 @@ def _serve_datagram(sock, peers, dg, addr):
                 unit_type=utype, name1=_n1, name2=_n2, pos=_pos,
                 model_flags=_mf, model_sub=_ms, type4_model=_sx, client_kind=_ck,
                 nation=_nat, parts=(_pt or None), side=_side)
+            # KEY: THE OWNER (body+0x2C -> unit+0x30). The freeze check 0x61051BB0
+            # runs every unit tick: a UnitID >= 10 whose owner is not a
+            # connected peer (state 2) is FROZEN -- no driving, no spawn init,
+            # no cmd 23/24. Ids < 10 skip the check but are never networked
+            # (0x6106659C), which is why UnitID 1 drove and never moved on
+            # anyone else's screen, and why 0x1001 with owner 0 could not
+            # drive (live 09-27). A pilot's own unit is owned by itself.
+            if uid >= 10 and _is_battle_chan(chan):     # battle units only
+                chan.pop_args["extra"] = {
+                    POP_AI_OWNER: struct.pack("<I", uid & 0xFFFFFFFF)}
             chan.pending.append(fmoworld.record_pop(
                 uid, look=_lk_now, **chan.pop_args))
         except ValueError as e:
@@ -21586,7 +21878,7 @@ def _serve_datagram(sock, peers, dg, addr):
     if (BATTLE_GATE_POP and chan.popped and not chan.gate_popped
             and chan.key and chan.key.endswith(b"battle") and chan.pop_args):
         chan.gate_popped = True         # once, whatever happens below
-        _guid = (POP_BATTLE or POP or (None,))[0]
+        _guid = chan.self_unit() if POP else (POP_BATTLE or (None,))[0]
         _gargs = dict(chan.pop_args, client_kind=BATTLE_GATE_KIND)
         if chan.pop_args.get("client_kind") == BATTLE_GATE_KIND:
             log(f"[udp {addr[0]}:{addr[1]}] GATE POP SKIPPED: the self-POP "
@@ -21809,7 +22101,7 @@ def _serve_datagram(sock, peers, dg, addr):
     if (POP and chan.popped and chan.pop_args and chan.type4_look
             and not chan.look_sent and chan.look_due
             and time.time() >= chan.look_due):
-        uid = POP[0]
+        uid = chan.self_unit()
         try:
             chan.pending.append(fmoworld.record_pop(
                 uid, look=chan.type4_look, **chan.pop_args))
@@ -21841,7 +22133,7 @@ def _serve_datagram(sock, peers, dg, addr):
         if chan.undestroy_due is None:
             chan.undestroy_due = time.time() + UNDESTROY_AFTER
         elif time.time() >= chan.undestroy_due:
-            uid = POP[0]
+            uid = chan.self_unit()
             _alive_args = dict(chan.pop_args, client_kind=UNDESTROY_KIND)
             try:
                 # ORDER MATTERS: depop first (sets char+0x20), then the re-POP
@@ -23748,10 +24040,44 @@ def selftest():
     # slot; do not add a second one.
     half = [{'id': 3, 'first': '', 'last': '', 'nation': 0}]
     n, cid, name0 = _slot0(half)
-    half_ok = n == 1 and cid == 3 and name0 == 0
+    half_ok = n == 1 and cid == to_wire(3) and name0 == 0   # the WIRE id
     print(f'  half-created pilot is itself the free slot (count={n} id={cid}) '
           f'{"OK" if half_ok else "FAIL"}')
     ok &= half_ok
+
+    # WIRE IDS (live 2026-09-27: the unit tick skips UnitID < 10, so a pilot
+    # selected as character 1 never sent its own movement). The client sees
+    # store id + CHAR_WIRE_BASE everywhere; the store keeps its ids.
+    if CHAR_WIRE_BASE:
+        _w = to_wire(1)
+        _, _wcid, _ = _slot0([{"id": 1, "first": "Fox", "last": "Noted"}])
+        _ss = Session("selftest-wire")
+        _ss._roster = [{"id": 1, "first": "Fox", "last": "Noted"},
+                       {"id": 2, "first": "Deck", "last": "Guy"}]
+        _f_ok = (_ss.find(_w) is _ss._roster[0] and _ss.find(1) is _ss._roster[0]
+                 and _ss.find(to_wire(2)) is _ss._roster[1])
+        _store_was = CHAR_STORE
+        globals()["CHAR_STORE"] = ""
+        try:
+            _ss.apply_charsel(0x013F, struct.pack("<I", _w), _w)
+        finally:
+            globals()["CHAR_STORE"] = _store_was
+        _del_ok = [c["id"] for c in _ss._roster] == [2]
+        _sb = setup_block(self_id=_w)
+        _sb_ids = struct.unpack_from("<8I", _sb, SU_UNITS)
+        _sb_ok = _sb_ids[0] == _w and (not POP or POP[0] not in _sb_ids)
+        _wc = WorldChannel(("198.51.100.9", 19155))
+        _cand = [cid for cid, _k in _wc.candidates()]
+        _wc.char_id = _w
+        _su_ok = _w in _cand and _cand.index(_w) < _cand.index(1) \
+            and _wc.self_unit() == _w
+        _wire_ok = (_wcid == _w >= 10 and _f_ok and _del_ok and _sb_ok
+                    and _su_ok and from_wire(_w) == 1 and from_wire(1) == 1)
+        print(f"  wire ids: the list serves {_w:#x} for store id 1, find() takes "
+              f"either, a delete by wire id removes store id 1, the 0x0153 setup "
+              f"block leads with it, the UDP key tries it first and self_unit() "
+              f"becomes it: {'OK' if _wire_ok else 'FAIL ' + repr((_wcid, _f_ok, _del_ok, _sb_ok, _su_ok))}")
+        ok &= _wire_ok
 
     # REGRESSION: creation is TWO messages against ONE slot (0x0177 names it,
     # 0x013E completes it). 0x013E used to append unconditionally, and
@@ -25091,6 +25417,70 @@ def selftest():
             print(f"  room: an ACK on the alias stream retires only ITS "
                   f"records: {'OK' if retired else 'FAIL'}")
             ok &= retired
+
+            # KEY: THE PEER LINK. The POP must carry
+            # our endpoint (net order) and the alias's tag; the client's hello
+            # on that tag must come back as cmd 4 on the alias stream stamped
+            # with the tag; and its own-unit record for the peer must reach the
+            # OTHER client under the alias that client knows the sender by.
+            _pr = fmoworld.record_pop(0x200, unit_type=4, client_key=b"k",
+                                      client_addr=("203.0.113.125", 61300),
+                                      client_tag=0x41)
+            _pb = _pr[fmoworld.REC_HDR:]
+            _pop_ok = (_pb[0x30:0x34] == bytes([203, 0, 113, 125])
+                       and _pb[0x34:0x36] == (61300).to_bytes(2, "big")
+                       and _pb[0x36] == 0x41)
+            print(f"  peer link: the room POP carries our endpoint (net order) "
+                  f"and the alias tag at body+0x30/+0x34/+0x36: "
+                  f"{'OK' if _pop_ok else 'FAIL'}")
+            ok &= _pop_ok
+            # THE OWNER (body+0x2C): a battle mate's args are copied from THEIR
+            # self POP (owner = their own id 0x1001); the relayed unit must be
+            # owned by the ALIAS, or the freeze check 0x61051BB0 keeps it still.
+            _their = {"unit_type": 0, "extra": {POP_AI_OWNER: struct.pack("<I", 0x1001)}}
+            _ob = fmoworld.record_pop(0x200, **owned_by(_their, 0x200))[fmoworld.REC_HDR:]
+            _own_ok = (struct.unpack_from("<I", _ob, POP_AI_OWNER)[0] == 0x200
+                       and struct.unpack_from("<I", _their["extra"][POP_AI_OWNER])[0] == 0x1001)
+            print(f"  peer link: a relayed mate is owned by its ALIAS (body+0x2C "
+                  f"= 0x200), not the sender's own id: {'OK' if _own_ok else 'FAIL'}")
+            ok &= _own_ok
+            if PEER_LINK:
+                _ca, _rsa = WORLD_PEERS[A], WORLD_PEERS[A].remotes[alias]
+                _mine = _ca.self_unit()
+                _before = (_ca.tx_base, len(_ca.pending))
+
+                def _link_dg(frm, to, body, hid):
+                    return fmoworld.build(*tables, peer=_mine, hid=hid, kind=2,
+                                          ack=0, flag=0 if frm == 0 else 2,
+                                          frm=frm, to=to, body=body)
+                del sent[:]
+                _serve_datagram(sock, WORLD_PEERS, _link_dg(
+                    0, 1, fmoworld.record(3, bytes(4), arg8=_mine), _rsa.tag), A)
+                _rep = [fmoworld.parse(*tables, d) for _t, d in sent]
+                _hello = (_rsa.linked and _rep and _rep[0]
+                          and _rep[0]["peer"] == alias
+                          and _rep[0]["kind"] == _rsa.tag
+                          and any(c == 4 for _o, _s, c, _b in _rep[0]["records"])
+                          and (_ca.tx_base, len(_ca.pending)) == _before)
+                print(f"  peer link: a hello on tag {_rsa.tag:#x} is the ALIAS "
+                      f"stream (not a self-stream restart), answered with cmd 4 "
+                      f"stamped with the tag: {'OK' if _hello else 'FAIL'}")
+                ok &= bool(_hello)
+                _rsb = WORLD_PEERS[B].remotes[back]
+                _n0 = len(_rsb.pending)
+                _serve_datagram(sock, WORLD_PEERS, _link_dg(
+                    1, 2, fmoworld.record(23, bytes(16), arg8=_mine), _rsa.tag), A)
+                _got = [struct.unpack_from("<II", r, 4) for r in _rsb.pending[_n0:]]
+                _relay = (23, back) in _got
+                print(f"  peer link: A's own cmd 23 reaches B as unit {back:#x} "
+                      f"(B's alias for A): "
+                      f"{'OK' if _relay else 'FAIL ' + repr(_got)}")
+                ok &= _relay
+                # Twin: an untagged datagram is still A's own stream.
+                _self = peer_stream_for(_ca, {"hid": UDP_HID, "peer": _mine})
+                print(f"  peer link twin: an untagged datagram is the SELF "
+                      f"stream: {'OK' if _self is None else 'FAIL'}")
+                ok &= _self is None
 
             # Different zones are different rooms.
             WORLD_MAPS[B[0]] = 121

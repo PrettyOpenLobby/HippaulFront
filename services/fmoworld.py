@@ -103,6 +103,7 @@ same constants it serves, and the selftest pins that relation.
 import argparse
 import hashlib
 import os
+import socket
 import struct
 import sys
 
@@ -1123,12 +1124,14 @@ POP_CLIENT_KIND = 0x00  # u32. 0/2/3 build the peer; 1 builds none
 #: The three fields the client object is constructed FROM (`0x611EAF6A`):
 #: `0x611E7400(manager, UnitID, mode, &body[0x08], body[0x30], body[0x34] &
 #: 0xFFFF, body[0x36])`. `body+0x36` lands at `peer+0x111C`, the datagram
-#: `kind` byte the peer echoes. WARNING: The other two are NOT decoded -- they are
-#: address-shaped and this is where a peer-to-peer design would put a remote
-#: endpoint, but nothing traces them to a sockaddr, and the remote-peer arm of
-#: `0x611E2E10` creates NO socket (only the self peer does), so a relay through
-#: our own socket should not need them. Left zero; named so a sweep can move
-#: them without hunting the offsets again.
+#: `kind` byte the peer echoes.
+#: WARNING: RETRACTED 2026-09-27: "a relay through our own socket should not
+#: need" +0x30/+0x34 was WRONG. They ARE the peer's sendto
+#: target (IPv4 / port, raw network order -> peer+0x10EC / +0x10EA; the peer
+#: sends through the manager's one socket), and the flush 0x611E22C0 sends
+#: nothing while the port is 0. Left zero, the client never sent the other pilot
+#: a byte: frozen, [!], no voice, no damage between pilots -- SE's own list of
+#: P2P-failure symptoms. `record_pop(client_addr=, client_tag=)` fills them.
 #: KEY: AND IT IS THE PEER STREAM'S BLOWFISH KEY -- decoded 2026-08-26, and the
 #: reason a relayed player appears but never moves. 0x611E3720 passes `&body[0x08]`
 #: and the length 16 into 0x610702F0, which STRLENs it and hands it straight to the
@@ -1223,7 +1226,7 @@ def record_pop(unit_id, unit_type=0, kind=0, name1="", name2="",
                pos=(0.0, 0.0, 0.0, 0.0), extra=None,
                model_flags=None, model_sub=None, client_kind=0,
                type4_model=None, client_key=None, look=None, nation=None,
-               parts=None, side=None):
+               parts=None, side=None, client_addr=None, client_tag=None):
     """One cmd-7 record: create unit `unit_id` in the client's entity map.
 
     WARNING: EVERY FIELD NOT LISTED IN THE POP_* CONSTANTS IS SENT AS ZERO, and that is
@@ -1326,6 +1329,21 @@ def record_pop(unit_id, unit_type=0, kind=0, name1="", name2="",
         if b"\0" in client_key:
             raise ValueError("client_key contains a NUL; strlen would cut it")
         body[POP_CLIENT_BLOB:POP_CLIENT_BLOB + len(client_key)] = client_key
+    if client_addr:
+        # KEY: THE PEER'S ADDRESS (2026-09-27). The
+        # peer ctor stores body+0x30 (IPv4) / +0x34 (port), both RAW network
+        # order, as the sendto target, and the flush 0x611E22C0 sends NOTHING
+        # while the port is 0 (0x611E2310) -- so with these zero the client
+        # queued its movement, fire and voice for the other pilot and never sent
+        # a byte: the frozen [!] pilot. We are the peer, so it is OUR endpoint.
+        _ip, _port = client_addr
+        body[POP_CLIENT_A:POP_CLIENT_A + 4] = socket.inet_aton(_ip)
+        body[POP_CLIENT_B:POP_CLIENT_B + 2] = int(_port).to_bytes(2, "big")
+    if client_tag is not None:
+        # peer+0x111C: the byte the client stamps at +0x09 on everything it
+        # sends THIS peer -- how we tell its alias traffic from its own stream
+        # (its +0x00 is always its OWN UnitID).
+        body[POP_CLIENT_KINDBYTE] = client_tag & 0xFF
     if parts:
         # WARNING: Both guards refuse rather than drop. A type-4 POP that quietly
         # carried 132 unread bytes, or a model_flags that quietly became a part
