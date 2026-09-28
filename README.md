@@ -24,15 +24,22 @@ can:
 - form and manage a squadron (a PlayOnline group), see its insignia and info;
 - read the mission board, accept a mission, report it and be paid; draw a
   daily salary; hold a city on the war map (City Control);
-- sortie: pick a battle map, enter the arena in the dressed wanzer, see the
-  battle begin and end, and return to the lobby through the result screen.
+- sortie: pick a battle map, enter the arena in the dressed wanzer, fight the
+  enemy squad the client runs, see the battle begin and end, and return to
+  the lobby through the result screen;
+- fight beside or against another pilot: the server stands in as each
+  client's peer, so pilots see each other move and shoot, kills and wins are
+  credited to the pilot who earned them, and a destroyed pilot's own battle
+  ends as a loss while the others fight on;
+- form a battle group: the Player List, the Sortie Setting, a group sortie
+  the other members are offered to follow, and voice chat relayed between
+  members whose voice system is up.
 
-What it does not do: combat itself. The practice target cannot be destroyed
-(hits are applied client-side to units the shooter owns, and no exchange
-between two clients has been seen on a screen), so a sortie is a walk
-around the arena and back out. The campaign cutscenes are set up but have
-not been watched through.
-Play between two humans in one lobby works; two in one battle is untested.
+What it does not do: the campaign cutscenes are set up but have not been
+watched through, and voice has been relayed but not yet heard on a client
+with a working capture device. Two clients behind one router each keep
+their own session: a world channel is bound to the player who entered it,
+not to the address.
 The PlayStation 2 client reaches the lobby but renders its lobby map as an
 empty void. It ships a different map set from the PC client, and which map
 numbers it has is still unknown.
@@ -109,6 +116,23 @@ turn it off):
 - `FMO_TRADE=1`: the player trade service.
 - `FMO_CEASEFIRE=1`: the phase-end ceasefire bonus for First Sergeant and above.
 - `FMO_REVIEW=promote`: the officer review above Captain keeps or promotes a pilot (`full` can also demote).
+
+Play between pilots is on by default too:
+
+- `FMO_UDP_PEER_LINK=1`: the peer link. Another pilot's unit is popped with
+  this server's endpoint and a per-peer tag, so the client sends it its
+  movement, fire and voice, which the server relays. 0 restores the old POP,
+  under which other pilots stand frozen.
+- `FMO_CHAR_WIRE_BASE=0x1000`: character ids as the client sees them (the
+  stored id plus this base). The client never networks a unit whose id is
+  below 10; 0 serves the stored ids.
+- `FMO_BATTLE_DEATH_END=5`: seconds after a pilot's own wanzer is destroyed
+  until that pilot's battle ends as a loss (0 = never).
+- `FMO_GROUP_VOICE_TO=talkers`: group voice goes only to members that have
+  sent voice themselves (a client whose voice system failed hangs on
+  receiving it); `all` sends it to every member.
+- `FMO_NATION_CHANGE_TOGGLE=1`: Change Nations switches the pilot to the
+  other nation (the client's submit names none); 0 leaves the nation alone.
 
 ## The lobby NPC editor (optional)
 

@@ -241,6 +241,11 @@ RELEASE_DEFAULTS = {
     # the player trade service, the phase-end ceasefire bonus, and the officer
     # review above Captain (keep or promote, never demote)
     "FMO_TRADE": "1", "FMO_CEASEFIRE": "1", "FMO_REVIEW": "promote",
+    # play between pilots: the peer link, the character ids the client sees,
+    # the defeat delay, group voice routing and Change Nations
+    "FMO_UDP_PEER_LINK": "1", "FMO_CHAR_WIRE_BASE": "0x1000",
+    "FMO_BATTLE_DEATH_END": "5", "FMO_GROUP_VOICE_TO": "talkers",
+    "FMO_NATION_CHANGE_TOGGLE": "1",
     # missions, the war map, pay
     "FMO_MISSION_AREA": "map", "FMO_MISSION_TIME": "1800",
     "FMO_MSN": "1",
