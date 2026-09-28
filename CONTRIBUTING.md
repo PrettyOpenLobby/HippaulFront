@@ -16,7 +16,10 @@ services/
   fmomsn.py       the codec of the second (community) server
   fmowar.py       the war state: sector control and the phase clock
   fmosectors.py   the war-map sector table
-  fmostore.py     the player database (fmo.db)
+  fmostore.py     the player database (fmo_character and fmo_squadron_insignia
+                  in PostgreSQL, or JSON when FMO_DB is 0)
+  fmodb.py        reaches the core's polcore; migrate, status and import
+  fmo_migrations/ CrystalFront's migrations, numbered from 2001
   fmolayout.py    the lobby NPC layout file and the floor-plan geometry
   fmodevtool.py   the lobby NPC editor page, served by fedevtool.py
   fmotitle.py     the title plugin the core loads for the Viewer's profile
@@ -122,13 +125,53 @@ python tools/gen_blowfish_tables.py # once: the cipher tables, computed from pi
 python tools/fmo_run_all.py         # every self-test; -k <substring> picks a few
 ```
 
-Every suite is expected to pass on a clean checkout. `fmo_title` needs the
-OpenLobby core checked out beside this repository (or `OPENLOBBY_DIR`
-pointing at it) for `titles.py`. GitHub Actions runs the scanner and the
-suites on every push and pull request.
+Every suite is expected to pass on a clean checkout. The suites import the
+core's `polcore` (and `fmo_title` its `titles.py`), so they need the
+OpenLobby core checked out beside this repository, or `OPENLOBBY_DIR`
+pointing at it (`OPENLOBBY_SERVICES` at its `services/`), and the drivers
+(`pip install "psycopg[binary]" psycopg-pool valkey`). The ones that touch
+the database each get a new, empty one from the core's `tools/pgtest.py`,
+which uses Docker or the server `POL_TEST_DATABASE_URL` names. Without a
+server they report SKIP, and `POL_TEST_REQUIRE_DB=1` makes that a failure.
+`tools/fmo_import_test.py` rebuilds the old files from git at a pinned
+commit, so a shallow clone needs `git fetch --unshallow` first. GitHub
+Actions runs the scanner and the suites on every push and pull request.
 
 A new self-test is registered by hand in `tools/fmo_run_all.py`. The list is
 explicit on purpose: a suite that is not registered does not run.
+
+## Where state lives
+
+Anything that must survive a restart is a table in the core's PostgreSQL:
+the pilots (`fmo_character`), the squadron insignia, the war
+(`fmo_war`), the sector wins (`fmo_sector_win`) and the City Control
+board's Discord bookkeeping (`fmo_board_state`). Who is playing from which
+address, and a member's POL groups, come from the core's account tables
+through `accounts`; `FMO_MEMBER_LOOKUP=0` turns that lookup off. Nothing
+durable goes in Valkey, and files are only for what the operator edits,
+such as the lobby NPC layout.
+
+A schema change is a new file in `services/fmo_migrations/` with the next
+number. A shipped migration is never edited. The core's `schema_migrations`
+table is keyed by the number alone and shared with the core and the other
+titles, so CrystalFront keeps to 2001-2999 and a table name that starts
+with `fmo_`; a reused number is silently skipped.
+
+Moving a file into the database comes with an importer in `fmodb.py`
+(`python fmodb.py import fmo_db|board_state ...`). It only reads its
+source, runs in one transaction, refuses a table that already holds rows
+unless given `--merge`, writes nothing with `--dry-run`, and changes nothing
+on a second run. Its command is added to `TITLES` in OpenLobby's
+`tools/db_import.py` and to its `docs/database.md`. `fmo.db` has to be
+imported before `fmo` first starts, or the service fills `fmo_character`
+from the older `fmo_characters.json` and the import is refused.
+
+`live_sessions.py` is the core's. The server publishes its session count
+with `live_sessions.start_heartbeat`; a copy of the module must not be added
+here. `services/.dockerignore` keeps one out of the image and the build
+refuses an image whose `live_sessions` is not the core's. A deploy script
+asks a running container, for example
+`docker compose exec -T fmo python live_sessions.py count fmo`.
 
 ## What a pull request needs
 

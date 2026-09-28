@@ -50,8 +50,8 @@ The core does the login, the DNS and the member profile; this repository is
 one service, `fmo.py` (the `fmoserver` package behind it), holding the TCP
 session the client keeps for its whole lobby stay and the UDP world channel
 beside it (both on 61300). It runs in the core's compose project: it reads
-the shared account and session database on the core's data volume (which
-tells it who is playing from which address), and keeps its pilots, squadron
+the core's account and session tables in PostgreSQL (which tell it who is
+playing from which address), and keeps its pilots, squadron
 insignia, war state and sector wins in the core's PostgreSQL database, in
 tables of its own (`fmo_*`). Their schema is this repository's migrations
 (`services/fmo_migrations/`, numbered 2001 and up), applied by the service
