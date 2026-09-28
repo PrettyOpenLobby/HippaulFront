@@ -41,6 +41,8 @@ SUITES = [
     ("fmolayout",  [PY, "fmolayout.py", "--selftest"],  SERVICES),
     # the City Control board and its place in the boards host
     ("fmo_board",  [PY, "fmo_board_test.py"],           HERE),
+    # the title plugin: the Viewer's profile out of the pilot database
+    ("fmo_title",  [PY, "fmo_title_test.py"],           HERE),
 ]
 
 

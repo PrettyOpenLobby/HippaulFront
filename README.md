@@ -55,6 +55,23 @@ beside it. The client is sent here by the core's games menu (content id 4)
 and dials `fmo01.pol.com`, which the core's DNS answers with the advertised
 address.
 
+## The title plugin (the Viewer's profile)
+
+The core builds the profile the Viewer shows for a Front Mission Online Content ID from
+data only this title holds, so a small plugin runs inside the core's `login`
+and `authsess` processes (OpenLobby's `services/titles.py`, `POL_TITLES`).
+`Dockerfile.title` layers it on the core image and `docker-compose.title.yml`
+swaps that image into those two services. From this directory, with the core
+checked out beside it:
+
+```
+docker compose --project-directory ../openlobby     -f ../openlobby/docker-compose.yml -f docker-compose.title.yml     up -d --build login authsess
+```
+
+Without it the game plays the same; only the Viewer's profile screen for a Front Mission Content ID stays empty. The plugin reads the pilot database (`FMO_DB`, on the shared data volume). To run several titles, build each title image on the previous
+one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
+`.env`, for example `POL_TITLES=tmtitle,fmotitle`.
+
 ## Prerequisites
 
 - The core lobby stack (OpenLobby) running on the same Docker host
