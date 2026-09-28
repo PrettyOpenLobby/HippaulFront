@@ -31,7 +31,6 @@ x-fmo: &fmo
   restart: unless-stopped
   environment: &fmoenv
     POL_ADVERTISE: "${POL_ADVERTISE:-}"
-    POL_ACCOUNTS_DB: /data/accounts.db
     POL_LOG_DIR: /logs
     PYTHONUNBUFFERED: "1"
     # PostgreSQL and Valkey, OpenLobby's services (its docs/database.md).
