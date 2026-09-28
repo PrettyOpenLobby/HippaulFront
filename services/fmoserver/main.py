@@ -44,22 +44,33 @@ def run():
             f"serves {charlist.LIST_COUNT} synthetic entr(y/ies)")
     # THE DATABASE: apply CrystalFront's migrations (the fmo_* tables) before
     # the first login, then let the character store make its first use (the
-    # one-shot JSON import, and the log line saying where the pilots are) and
-    # load the sector-win ledger a restart must not lose.
+    # one-shot JSON import, and the log line saying where the pilots are),
+    # load the sector-win ledger a restart must not lose, and load the war
+    # state (its one-shot fmowar.json import), which the City Control board
+    # reads from the table.
     if fmodb is None:
         log("WARNING: DATABASE OFF: polcore (OpenLobby) is not importable -- the "
             "pilots stay in the JSON character store and the sector-win ledger "
             "is memory only")
     else:
+        db_ok = True
         try:
             fmodb.ready()
             log("database: CrystalFront's migrations applied (the fmo_* tables)")
         except fmodb.ERRORS as e:
+            db_ok = False
             log(f"WARNING: database unusable at start ({e!r}) -- every store "
                 f"call retries it; until it answers, pilots read as empty and "
                 f"writes are refused (logged)")
         charstore.use_db()
         sectorwins._sw_ensure_loaded()
+        if db_ok:
+            warstate.load_at_start()
+        else:
+            # a War made now would start empty and later write that over
+            # the stored state
+            log("WARNING: war state not loaded at start (the database is "
+                "unusable); it loads on first use")
     log(f"listening on {wirelog.PORT} -- FMO world door [build {room.BUILD}] "
         + (f"TCP + UDP world channel (hid={udpconfig.UDP_HID}, "
            f"endpoint {addressing.BATTLE_HOST}:{addressing.BATTLE_PORT}, key {room._udp_key_hint()})"
@@ -277,6 +288,6 @@ def run():
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
     addressing, charlist, charstore, devtool, identity, lobapi, move, popself, popsweep, resume,
-    room, sectorwins, sortie, sortiepush, status, tcpserver, udpconfig, worldchannel,
-    zonecontrol, zoneentry,
+    room, sectorwins, sortie, sortiepush, status, tcpserver, udpconfig, warstate,
+    worldchannel, zonecontrol, zoneentry,
 )

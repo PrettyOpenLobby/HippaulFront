@@ -35,9 +35,11 @@ tests can use the rules without a database, like fmoworld.py and fmomsn.py.
 
 WHERE THE STATE LIVES. One JSON document in the stack's PostgreSQL database
 (the fmo_war table, see fmodb.py), read whole and written whole as the file
-fmowar.json was until 2026-09. The first writer to find the table empty
-imports that file once (FMO_WAR_STATE, else /data/fmowar.json) and leaves it
-as it was.
+fmowar.json was until 2026-09. The fmo service loads the state when it
+starts (fmoserver/warstate.py, load_at_start), and the first writer to find
+the table empty imports that file once (FMO_WAR_STATE, else
+/data/fmowar.json), logs the sector count or why it could not, and leaves the
+file as it was. `python fmodb.py import war FILE` imports it by hand.
 """
 import argparse
 import datetime
@@ -218,34 +220,55 @@ def write_state(data, now=None):
         return False
 
 
-def import_legacy(path=None):
+def read_legacy(path):
+    """The war state an old fmowar.json holds, as a dict. Raises OSError
+    when the file cannot be read and ValueError when it is not a war state
+    (not JSON, or not a JSON object)."""
+    with open(path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    if not isinstance(d, dict):
+        raise ValueError("%s holds a %s, not a war state object"
+                         % (path, type(d).__name__))
+    return d
+
+
+def import_legacy(path=None, log=None):
     """Fill an EMPTY fmo_war from the old fmowar.json, once. Returns True when
-    it imported. The file is left as it was."""
+    it imported. The file is left as it was. `log`, when given, is told what
+    happened: the sector count imported, or why nothing was (no file, a table
+    that already holds the state, a file or a database that failed)."""
+    say = log or (lambda _msg: None)
     path = path or LEGACY_PATH
     if not path or not os.path.exists(path):
+        say("no old war state file at %s; nothing to import" % path)
         return False
     fdb = _fmodb()
     if fdb is None:
+        say("WARNING: %s not imported: the database module (fmodb) is not "
+            "importable" % path)
         return False
     try:
-        with open(path, encoding="utf-8") as fh:
-            d = json.load(fh)
-    except (OSError, ValueError):
-        return False
-    if not isinstance(d, dict):
+        d = read_legacy(path)
+    except (OSError, ValueError) as exc:
+        say("WARNING: %s not imported: %s" % (path, exc))
         return False
     try:
         fdb.ready()
         with fdb.db.transaction(lock="fmo_war") as conn:
             if fdb.db.query_one("SELECT 1 AS x FROM fmo_war WHERE id = 1", conn=conn):
+                say("fmo_war already holds the war state; %s is not read "
+                    "(fmodb.py import war compares the two)" % path)
                 return False
             fdb.db.execute("INSERT INTO fmo_war (id, data, updated_at)"
                            " VALUES (1, %s, %s)",
                            (json.dumps(d, sort_keys=True, indent=1),
                             os.path.getmtime(path)), conn=conn)
-        return True
-    except fdb.ERRORS + (OSError,):
+    except fdb.ERRORS + (OSError,) as exc:
+        say("WARNING: %s not imported: the database failed (%s)" % (path, exc))
         return False
+    say("imported %s: %d sector(s), %d judged phase(s)"
+        % (path, len(d.get("sectors") or {}), len(d.get("phases") or {})))
+    return True
 
 
 class War:

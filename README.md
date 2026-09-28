@@ -63,7 +63,9 @@ The stores this server kept as files before it moved onto the database are
 imported the first time the database is empty and left where they were:
 `fmo_characters.json` (the character store, which `FMO_DB=0` still switches
 back to), `fmowar.json` and `fmo_sector_wins.json`. Nothing needs running for
-those three. `fmo.db`, the SQLite player database of earlier versions, and
+those three. The war state is loaded when `fmo` starts, and the log says how
+many sectors came in from `fmowar.json` or why none did;
+`fmodb.py import war /data/fmowar.json` imports it by hand with a report. `fmo.db`, the SQLite player database of earlier versions, and
 the City Control board's Discord state are imported by hand, after
 OpenLobby's own import (its docs/database.md, "Moving an existing /data") and
 before `fmo` first starts. Otherwise the service fills `fmo_character` from
