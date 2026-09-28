@@ -62,9 +62,28 @@ advertised address.
 The stores this server kept as files before it moved onto the database are
 imported the first time the database is empty and left where they were:
 `fmo_characters.json` (the character store, which `FMO_DB=0` still switches
-back to), `fmowar.json` and `fmo_sector_wins.json`. `fmo.db`, the SQLite
-player database of earlier versions, is not read by the server; an install
-that has one keeps it until its pilots are imported.
+back to), `fmowar.json` and `fmo_sector_wins.json`. Nothing needs running for
+those three. `fmo.db`, the SQLite player database of earlier versions, and
+the City Control board's Discord state are imported by hand, after
+OpenLobby's own import (its docs/database.md, "Moving an existing /data") and
+before `fmo` first starts. Otherwise the service fills `fmo_character` from
+the older `fmo_characters.json` and the import of `fmo.db` is refused. From
+this directory:
+
+```
+DC="docker compose --project-directory ../openlobby --env-file ../openlobby/.env --env-file .env -f ../openlobby/docker-compose.yml -f docker-compose.yml"
+$DC run --rm --no-deps --entrypoint python fmo fmodb.py import fmo_db /data/fmo.db
+$DC run --rm --no-deps -v crystalfront_fmo-board-state:/state:ro --entrypoint python fmo fmodb.py import board_state /state
+```
+
+The second reads the board's old state volume (`crystalfront_fmo-board-state`
+from when this was a compose project of its own; `docker volume ls` shows
+the name) and needs running only where the board posted to Discord. Each
+command only reads its source, runs in one transaction, prints what it
+imported and each row it could not map, and refuses a table that already
+holds rows unless given `--merge`, which adds only the keys the table lacks.
+`--dry-run` prints the same report and writes nothing, and a second run
+changes nothing.
 
 ## The title plugin (the Viewer's profile)
 
@@ -193,7 +212,9 @@ war state in the database, and can post
 it to Discord through a webhook or as a bot (`.env`; a bot needs no webhook
 and posts wherever `/fmoboard` is run). The page's backdrop is the game's own
 satellite image, baked from your client with `tools/fmo_boardart_bake.py`;
-without it the board draws on a plain ground.
+without it the board draws on a plain ground. Which message it posted, and
+where each feed posts, is kept in the `fmo_board_state` table, so a restart
+edits the same message instead of posting a second one.
 
 ## Selftests
 
@@ -203,7 +224,8 @@ python tools/fmo_run_all.py
 
 runs the offline suite: every request the client sends driven through the
 real dispatcher, the world channel's cipher and framing, the community server
-codec, the war model, the player database and the board. Checks that need
+codec, the war model, the player database, the board and the import of the
+old files. Checks that need
 the generated game tables skip themselves until step 2 has been run.
 
 The suites import OpenLobby's `polcore` from the checkout beside this one
