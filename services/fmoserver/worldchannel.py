@@ -98,6 +98,7 @@ class WorldChannel:
         self.popped = False        # the cmd-7 POP probe is once-per-channel
         self.npcs_popped = False   # the NPC source records (FMO_UDP_POP_NPC)
         self.dummy_popped = False  # the battle dress probe (FMO_BATTLE_DUMMY)
+        self.squad_popped = False  # the enemy squad (FMO_BATTLE_ENEMIES)
         self.dummy_id = None       # its UnitID, for FMO_BATTLE_DUMMY_KILL
         self.dummy_pos = None      # its world pos, for FMO_BATTLE_REFEREE
         self.dummy_kill_due = None # when to send the destroy DEPOP
@@ -248,6 +249,9 @@ class WorldChannel:
         self.popped = False
         self.npcs_popped = False   # re-arm the NPC source POPs for the new scene
         self.dummy_popped = False  # and the battle dress probe
+        #: and the enemy squad. Left set, only the FIRST sortie on a channel
+        #: got enemies and every later one landed on an empty battlefield.
+        self.squad_popped = False
         self.dummy_id = None
         self.dummy_pos = None
         self.dummy_kill_due = None

@@ -8427,7 +8427,14 @@ def _selftest_run(test_db):
             _sqf.append(n)
         return bool(v)
 
-    _sq_ok = _sc(1, squad.parse_battle_enemies("3:40") == (3, 40.0)
+    # a second sortie on the same channel pops the squad again: restart()
+    # must clear squad_popped, or sorties 2+ have no enemies
+    _wc = worldchannel.WorldChannel(("sqR", 1))
+    _wc.squad_popped = True
+    _wc.restart()
+    _sq_ok = _sc(12, _wc.squad_popped is False)
+
+    _sq_ok &= _sc(1, squad.parse_battle_enemies("3:40") == (3, 40.0)
                  and squad.parse_battle_enemies("") == (1, 30.0)
                  and squad.parse_battle_enemies("99") == (8, 30.0))
     _ring = squad.squad_positions((10.0, 5.0, 20.0, 0.0), 4, 10.0, 40.0)
