@@ -158,7 +158,7 @@ titles, so CrystalFront keeps to 2001-2999 and a table name that starts
 with `fmo_`; a reused number is silently skipped.
 
 Moving a file into the database comes with an importer in `fmodb.py`
-(`python fmodb.py import fmo_db|board_state ...`). It only reads its
+(`python fmodb.py import fmo_db|board_state|war ...`). It only reads its
 source, runs in one transaction, refuses a table that already holds rows
 unless given `--merge`, writes nothing with `--dry-run`, and changes nothing
 on a second run. Its command is added to `TITLES` in OpenLobby's

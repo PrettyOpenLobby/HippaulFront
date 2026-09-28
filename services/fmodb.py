@@ -16,21 +16,30 @@ OPENLOBBY_DIR/services, or an `openlobby` checkout beside this repository.
     python fmodb.py status       list this repository's migrations
     python fmodb.py import fmo_db FILE [--merge] [--dry-run]
     python fmodb.py import board_state FILE|DIR [--merge] [--dry-run]
+    python fmodb.py import war FILE [--merge] [--dry-run]
 
 `import` moves what an earlier release kept in files into the tables:
 `fmo_db` reads fmo.db, the SQLite pilot database, into fmo_character and
 fmo_squadron_insignia; `board_state` reads the City Control board's
-<name>_discord.json and discord_channels.json (a file, or every such file in
-a directory) into fmo_board_state. The source is only read (SQLite in
-read-only mode). The import runs in one transaction and refuses a table that
-already holds rows (exit 2) unless --merge is given, which adds only the keys
-the table lacks. A second run finds nothing to add. --dry-run prints the same
-report and writes nothing. Rows it cannot map are listed and skipped.
+fmo_*_discord.json and discord_channels.json (a file, or every such file in
+a directory; the other boards' files in a shared state directory are
+skipped) into fmo_board_state; `war` reads fmowar.json, the war state, into
+fmo_war. The source is only read (SQLite in read-only mode). The import runs
+in one transaction and refuses a table that already holds rows (exit 2)
+unless --merge is given, which adds only the keys the table lacks. A second
+run finds nothing to add. --dry-run prints the same report and writes nothing,
+not even the migrations. Rows it cannot map are listed and skipped. A source
+that cannot be read exits 1.
+
+The war state is one row, so for `war` the keys are its sectors, its judged
+phases and its other top-level entries: --merge adds the ones the table
+lacks and lists the ones that differ.
 
 fmo_characters.json, fmowar.json and fmo_sector_wins.json need no command:
-the fmo service imports each the first time it finds its table empty. Import
-fmo.db before the service first starts, or the older fmo_characters.json
-fills fmo_character first and fmo.db is refused.
+the fmo service imports each the first time it finds its table empty (the
+war state when the service starts). Import fmo.db before the service first
+starts, or the older fmo_characters.json fills fmo_character first and
+fmo.db is refused.
 """
 import contextlib
 import datetime
@@ -400,9 +409,129 @@ def read_old_board_state(path, table):
                  jsonb=("data",), compare_skip=("updated_at",))], skipped
 
 
+#: The parts of the war state --merge adds to, entry by entry.
+WAR_MERGED = ("sectors", "phases")
+
+
+def _war_merge(have, new):
+    """(merged, added, differs) for --merge of the war state: `have` (the
+    table's) with each sector, phase and top-level key of `new` it lacks.
+    An entry in both with other contents keeps the table's and is listed.
+    The log list is the table's."""
+    merged = json.loads(json.dumps(have))
+    added, differs = [], []
+    for k, v in new.items():
+        if k in WAR_MERGED and isinstance(v, dict) and isinstance(merged.get(k), dict):
+            for sub, sv in v.items():
+                if sub not in merged[k]:
+                    merged[k][sub] = sv
+                    added.append(f"{k}/{sub}")
+                elif merged[k][sub] != sv:
+                    differs.append(f"{k}/{sub}")
+        elif k not in merged:
+            merged[k] = v
+            added.append(k)
+        elif merged[k] != v:
+            differs.append(k)
+    return merged, added, differs
+
+
+def import_war(path, merge=False, dry_run=False, out=print):
+    """Import the old fmowar.json into fmo_war (one row, the whole document).
+    The same contract as import_source: an empty table takes the file; a
+    table that holds the same state is left alone (exit 0); one that holds
+    another state is refused (exit 2) unless --merge, which adds the
+    sectors, phases and top-level keys the table lacks and lists the ones
+    that differ; --dry-run writes nothing; exit 1 when the file cannot be
+    read as a war state."""
+    import fmowar
+    if not os.path.isfile(path):
+        out(f"error: {path} does not exist")
+        return 1
+    try:
+        new = fmowar.read_legacy(path)
+        mtime = os.path.getmtime(path)
+    except (OSError, ValueError) as exc:
+        out(f"error: cannot read {path}: {exc}")
+        return 1
+    out(f"import war: {path}")
+    out(f"  the file: {len(new.get('sectors') or {})} sector(s), "
+        f"{len(new.get('phases') or {})} judged phase(s)")
+    if not dry_run:
+        ready()
+    status, added, differs = None, [], []
+    try:
+        with db.transaction(lock="crystalfront.import") as conn:
+            exists = conn.execute("SELECT to_regclass('fmo_war') IS NOT NULL AS ok"
+                                  ).fetchone()["ok"]
+            if not exists and not dry_run:
+                raise RuntimeError("fmo_war does not exist after the migrations")
+            row = conn.execute("SELECT data FROM fmo_war WHERE id = 1"
+                               ).fetchone() if exists else None
+            write = None                        # (data, updated_at) to store
+            if row is None:
+                out("  fmo_war: empty%s, the file goes in whole"
+                    % ("" if exists else " (not created yet)"))
+                status, write = "done", (new, mtime)
+            else:
+                try:
+                    have = json.loads(row["data"])
+                except ValueError:
+                    have = None
+                if have == new:
+                    status = "nothing"
+                elif not isinstance(have, dict):
+                    raise RuntimeError("fmo_war holds something that is not a "
+                                       "war state object; fix the row by hand")
+                else:
+                    merged, added, differs = _war_merge(have, new)
+                    out(f"  fmo_war: holds another state; {len(added)} "
+                        f"entr(y/ies) the table lacks, {len(differs)} in both "
+                        f"with other contents")
+                    for k in differs:
+                        out(f"    kept the table's, the file's differs: {k}")
+                    if not merge:
+                        status = "refused"
+                    elif added:
+                        status, write = "done", (merged, datetime.datetime.now(
+                            datetime.timezone.utc).timestamp())
+                    else:
+                        status = "nothing"
+            if status == "done" and dry_run:
+                status = "dry-run"
+            if status != "done":
+                raise _Rollback()
+            conn.execute("INSERT INTO fmo_war (id, data, updated_at)"
+                         " VALUES (1, %s, %s) ON CONFLICT (id) DO UPDATE"
+                         " SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+                         (json.dumps(write[0], sort_keys=True, indent=1), write[1]))
+    except _Rollback:
+        pass
+    except ERRORS as exc:
+        out(f"FAILED, rolled back: {exc}")
+        return 1
+    if status == "refused":
+        out("REFUSED: fmo_war already holds another war state. Nothing was "
+            "written. Run again with --merge to add only what it lacks.")
+        return 2
+    if status == "dry-run":
+        out("Dry run: nothing was written.")
+    elif status == "nothing":
+        out("Nothing to import: the table already holds %s. Nothing was changed."
+            % ("this state" if not differs else "every entry the file adds"))
+    elif added:
+        out(f"  fmo_war: added {', '.join(added)}")
+        out(f"Done: {len(added)} entr(y/ies) merged into the war state.")
+    else:
+        out(f"Done: the war state written ({len(new.get('sectors') or {})} "
+            f"sector(s)).")
+    return 0
+
+
 IMPORTS = {
     "fmo_db": read_old_fmo_db,
     "board_state": lambda path: read_old_board_state(path, "fmo_board_state"),
+    "war": None,                        # import_war: one row, not a Plan
 }
 
 
@@ -410,6 +539,8 @@ def import_source(store, path, merge=False, dry_run=False, out=print):
     """Import one old source. Returns the exit status: 0 done, nothing to do
     or dry run; 1 the source or the database failed; 2 refused, a table
     already holds rows and the source has rows it lacks (without --merge)."""
+    if store == "war":
+        return import_war(path, merge=merge, dry_run=dry_run, out=out)
     try:
         plans, skipped = IMPORTS[store](path)
     except SourceError as exc:

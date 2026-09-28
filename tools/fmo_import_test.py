@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""fmo_import_test.py -- `python fmodb.py import fmo_db FILE` and
-`import board_state FILE|DIR`: what an earlier release kept in files, into
-PostgreSQL.
+"""fmo_import_test.py -- `python fmodb.py import fmo_db FILE`,
+`import board_state FILE|DIR` and `import war FILE`: what an earlier release
+kept in files, into PostgreSQL, and the war state the fmo service loads (and
+imports) when it starts.
 
     python tools/fmo_import_test.py
 
@@ -16,9 +17,11 @@ version could map is added by hand, as a hand edit could leave one.
 
 Checked on a throwaway database: the counts, every pilot read back through
 the new fmostore.load_roster() equal to what the old one read, the insignia,
-the board rows, a second run that changes nothing, --dry-run, the refusal on
-a table that already holds rows, --merge, and a source that is byte for byte
-what it was.
+the board rows (only the City Control board's own files from a state
+directory every board shared), the war state, a second run that changes
+nothing, --dry-run, the refusal on a table that already holds rows, --merge,
+unreadable sources, the war state's import at start (and the log line saying
+what it did), and a source that is byte for byte what it was.
 
 SKIPs without a test database (Docker or POL_TEST_DATABASE_URL);
 POL_TEST_REQUIRE_DB=1 makes that a failure.
@@ -145,6 +148,20 @@ def old_sources(base):
 OTHER_BOARDS = ("jan_discord.json", "jan_live_bot_99_discord.json",
                 "tm_auction_discord.json", "ffxi_conquest_discord.json")
 
+#: An old fmowar.json: two sectors and a judged phase, the shape fmowar.War
+#: wrote.
+WAR = {"sectors": {
+    "85102": {"nation": 1, "control": 40, "counter": {"1": 1, "2": 0},
+              "wins": {"1": 3, "2": 0}, "supply": {"1": 0, "2": 0}, "bg_max": 0,
+              "bg_min": 0, "npc": 0, "terrain": 0, "deadlock": False,
+              "updated": 1760000000},
+    "70117": {"nation": 2, "control": 20, "counter": {"1": 0, "2": 2},
+              "wins": {"1": 0, "2": 5}, "supply": {"1": 0, "2": 0}, "bg_max": 0,
+              "bg_min": 0, "npc": 0, "terrain": 0, "deadlock": False,
+              "updated": 1760000100}},
+    "phases": {"1": {"ocu": 12, "usn": 9, "winner": 1}},
+    "log": [["settle", 85102]]}
+
 
 def digest(root):
     out = {}
@@ -182,7 +199,8 @@ def main():
 
 def fingerprint(db):
     out = {}
-    for t in ("fmo_character", "fmo_squadron_insignia", "fmo_board_state"):
+    for t in ("fmo_character", "fmo_squadron_insignia", "fmo_board_state",
+              "fmo_war"):
         out[t] = sorted(repr(sorted((k, str(v)) for k, v in r.items()))
                         for r in db.query("SELECT * FROM %s" % t))
     return out
@@ -258,9 +276,29 @@ def _main(fmodb, url, base):
     finally:
         os.environ.pop("POL_DATABASE_URL", None)
 
+    print("import war")
+    war = os.path.join(base, "data", "fmowar.json")
+    with open(war, "w", encoding="utf-8") as fh:
+        json.dump(WAR, fh, indent=1)
+    os.utime(war, (1760000200, 1760000200))
+    code, out = run(url, "war", war, "--dry-run")
+    check("--dry-run: exit 0, nothing written",
+          code == 0 and "Dry run: nothing was written." in out
+          and count("fmo_war") == 0, out)
+    code, out = run(url, "war", war)
+    check("exit 0, done", code == 0 and "Done" in out and "2 sector(s)" in out, out)
+    row = db.query_one("SELECT data, updated_at FROM fmo_war WHERE id = 1")
+    check("the table holds the file's state",
+          row is not None and json.loads(row["data"]) == WAR, row)
+    check("updated_at is the file's mtime", row and row["updated_at"] == 1760000200, row)
+    import fmowar
+    w = fmowar.War(autosave=False)
+    check("fmowar reads it", w.present and w.sector(85102)["control"] == 40
+          and w.sector(70117)["nation"] == 2)
+
     print("a second run changes nothing")
     fp = fingerprint(db)
-    for args in (("fmo_db", dbpath), ("board_state", state)):
+    for args in (("fmo_db", dbpath), ("board_state", state), ("war", war)):
         code, out = run(url, *args)
         check("%s: exit 0, nothing to import" % args[0],
               code == 0 and "Nothing to import" in out, out)
@@ -292,6 +330,49 @@ def _main(fmodb, url, base):
     check("and the report names it",
           "kept the table's row, the source's differs: ('member:3', 1)" in out, out)
 
+    print("war: another state in the table: refused, then --merge")
+    war2 = os.path.join(base, "fmowar2.json")
+    w2 = json.loads(json.dumps(WAR))
+    w2["sectors"]["85102"]["control"] = 80          # differs: the table's is kept
+    w2["sectors"]["94101"] = dict(WAR["sectors"]["70117"], nation=1)   # new
+    w2["phases"]["2"] = {"ocu": 1, "usn": 2, "winner": 2}               # new
+    with open(war2, "w", encoding="utf-8") as fh:
+        json.dump(w2, fh)
+    fp = fingerprint(db)
+    code, out = run(url, "war", war2)
+    check("refused: exit 2", code == 2 and "REFUSED: fmo_war" in out
+          and "--merge" in out, out)
+    check("and lists what differs", "the file's differs: sectors/85102" in out, out)
+    check("nothing written", fingerprint(db) == fp)
+    code, out = run(url, "war", war2, "--merge", "--dry-run")
+    check("--merge --dry-run writes nothing", code == 0 and fingerprint(db) == fp, out)
+    code, out = run(url, "war", war2, "--merge")
+    got = json.loads(db.query_one("SELECT data FROM fmo_war")["data"])
+    check("--merge: exit 0, the two new entries",
+          code == 0 and "added sectors/94101, phases/2" in out, out)
+    check("--merge: new sector and phase in, the differing sector is the table's",
+          got["sectors"]["94101"]["nation"] == 1 and got["phases"]["2"]["winner"] == 2
+          and got["sectors"]["85102"]["control"] == 40 and got["log"] == WAR["log"], got)
+    code, out = run(url, "war", war2, "--merge")
+    check("--merge again: nothing to import",
+          code == 0 and "Nothing to import" in out, out)
+
+    print("war: unreadable sources")
+    code, out = run(url, "war", os.path.join(base, "missing.json"))
+    check("a missing file: exit 1", code == 1 and "does not exist" in out, out)
+    for name, body in (("notjson.json", "{not json"), ("list.json", "[1, 2]")):
+        fn = os.path.join(base, name)
+        with open(fn, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        code, out = run(url, "war", fn)
+        check("%s: exit 1" % name, code == 1 and "cannot read" in out, out)
+        os.remove(fn)
+    os.remove(war2)
+
+    print("the war state at fmo's start")
+    at_start(db, base)
+    shutil.rmtree(os.path.join(base, "start"))
+
     print("bad sources")
     code, out = run(url, "fmo_db", os.path.join(base, "missing.db"))
     check("a missing file: exit 1", code == 1 and "does not exist" in out, out)
@@ -301,8 +382,57 @@ def _main(fmodb, url, base):
     check("a SQLite file that is not fmo.db: exit 1", code == 1 and "is it fmo.db" in out, out)
     os.remove(other)
     os.remove(db2)
+    os.remove(war)
     check("the sources are byte for byte what they were, and no journal was made",
           digest(base) == before, sorted(set(digest(base)) ^ set(before)))
+
+
+def at_start(db, base):
+    """fmoserver.warstate.load_at_start(), which main.run() calls: an empty
+    table takes the old file at start (not at the first battle), and the log
+    says how many sectors came in, or why none did."""
+    import inspect
+    import fmowar
+    from fmoserver import main as fmain, warstate
+    check("main.run() loads the war state at start",
+          "warstate.load_at_start()" in inspect.getsource(fmain.run))
+    legacy = os.path.join(base, "start", "fmowar.json")
+    os.makedirs(os.path.dirname(legacy))
+    lines = []
+    was = (fmowar.LEGACY_PATH, warstate.log, warstate._WAR_STATE)
+    fmowar.LEGACY_PATH, warstate.log = legacy, lines.append
+    try:
+        db.execute("DELETE FROM fmo_war")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write("{broken")
+        warstate._WAR_STATE = None
+        fmowar.import_legacy(log=lines.append)
+        check("a file that cannot be read: logged, not swallowed",
+              any("WARNING" in m and "not imported" in m for m in lines), lines)
+        check("and nothing written", db.query_one(
+            "SELECT count(*) AS n FROM fmo_war")["n"] == 0)
+        with open(legacy, "w", encoding="utf-8") as fh:
+            json.dump(WAR, fh)
+        lines.clear()
+        st = warstate.load_at_start()
+        check("the table is filled at start", db.query_one(
+            "SELECT count(*) AS n FROM fmo_war")["n"] == 1)
+        check("the log gives the sector count imported",
+              any("war state: imported" in m and "2 sector(s)" in m for m in lines),
+              lines)
+        check("and the state it loaded", any("war state: loaded" in m for m in lines),
+              lines)
+        check("the imported sectors are the file's",
+              st is not None and st.sector(85102)["control"] == 40)
+        check("the board reads it (no 'no war state')",
+              fmowar.War(autosave=False).present)
+        warstate._WAR_STATE = None
+        lines.clear()
+        warstate.load_at_start()
+        check("a restart leaves the table alone and says so",
+              any("already holds the war state" in m for m in lines), lines)
+    finally:
+        fmowar.LEGACY_PATH, warstate.log, warstate._WAR_STATE = was
 
 
 if __name__ == "__main__":

@@ -46,6 +46,24 @@ def war_state():
     return _WAR_STATE
 
 
+def load_at_start():
+    """Load the war state when the service starts, so the table is filled
+    (the one-shot import of the old fmowar.json) and the City Control board
+    has a state to read before the first battle. Logs what was imported, or
+    why it was not, and the state's sector count. Returns the War, or None."""
+    if fmowar is None:
+        log("WARNING: war state OFF: fmowar.py did not import")
+        return None
+    fmowar.import_legacy(log=lambda msg: log("war state: " + msg))
+    st = war_state()
+    if st.present:
+        log(f"war state: loaded, {st.summary()}")
+    else:
+        log(f"WARNING: war state: nothing stored and nothing written (is the "
+            f"database reachable?); {st.summary()}")
+    return st
+
+
 def _war_tick(st):
     """Judge any phase whose time has come; log each one."""
     try:
