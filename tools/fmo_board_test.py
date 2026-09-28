@@ -279,6 +279,30 @@ def _main(db):
     check("the first tick POSTs and keeps the id",
           d.tick("s1", build, now=1000.0) == "posted" and d.msg_id == "777")
     check("...across a restart", polboards.Discord("fmo", hook, state, opener=net).msg_id == "777")
+
+    print("Discord bookkeeping in the database (fmo_board_state), as the compose stack runs")
+    os.environ["POL_DATABASE_URL"] = db.database_url()
+    os.environ.pop("POL_BOARDS_STATE_DIR", None)
+    try:
+        path = polboards.state_path(args, "fmo")
+        check("with a database the state is the fmo_discord row", path == "db:fmo_discord", path)
+        net2 = FakeNet()
+        net2.script = [(200, {"id": "888"})]
+        d2 = polboards.Discord("fmo", hook, path, every=60, ttl=600, refresh=1800, opener=net2)
+        check("the first tick POSTs and keeps the id in the table",
+              d2.tick("s1", build, now=1000.0) == "posted"
+              and db.query_one("SELECT data FROM fmo_board_state WHERE name = 'fmo_discord'")
+              ["data"]["message_id"] == "888")
+        check("...across a restart", polboards.Discord("fmo", hook, path, opener=net2).msg_id == "888")
+        polboards._note_channel("chosen", "fmo", "4242", guild="99")
+        check("where a feed posts is the discord_channels row",
+              polboards.bot_channels()["chosen"] == {"fmo": {"99": "4242"}}
+              and db.query_one("SELECT data FROM fmo_board_state WHERE name = 'discord_channels'")
+              ["data"]["chosen"] == {"fmo": {"99": "4242"}})
+        check("and no file was written for either",
+              not os.path.exists(os.path.join(tmp, "state", "discord_channels.json")))
+    finally:
+        os.environ.pop("POL_DATABASE_URL", None)
     check("a changed board is EDITED in place",
           d.tick("s2", build, now=1100.0) == "edited" and net.calls[-1][0] == "PATCH"
           and net.calls[-1][1].endswith("/messages/777"))
