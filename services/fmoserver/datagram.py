@@ -711,7 +711,7 @@ def _serve_datagram(sock, peers, dg, addr):
             and chan.key and chan.key.endswith(b"battle")):
         chan.dummy_popped = True        # once, whatever happens below
         _duid, _dutype, _dpos = battlepop.BATTLE_DUMMY
-        _selfuid = (battlepop.POP_BATTLE or popsweep.POP or (None,))[0]
+        _selfuid = chan.self_unit()
         if _duid == _selfuid:
             log(f"[udp {addr[0]}:{addr[1]}] WARNING: BATTLE DUMMY REFUSED: id "
                 f"{_duid:#010x} is the SELF unit's id, so 0x611ED660's "
@@ -778,7 +778,7 @@ def _serve_datagram(sock, peers, dg, addr):
         chan.squad_popped = True
         if squad._BATTLE_ENEMIES_ERR:
             log(f"[udp {addr[0]}:{addr[1]}] WARNING: {squad._BATTLE_ENEMIES_ERR} -- one enemy")
-        _selfuid = (battlepop.POP_BATTLE or popsweep.POP or (None,))[0] or 0
+        _selfuid = chan.self_unit() or 0
         _base = (battlepop.BATTLE_DUMMY[2] or (chan.pop_args or {}).get("pos")
                  or popsweep.next_pop_pos(rooms.WORLD_MAPS.get(addr[0]))[0])
         _snat = battlepop.BATTLE_DUMMY_NATION or {1: 2, 2: 1}.get(
@@ -786,7 +786,7 @@ def _serve_datagram(sock, peers, dg, addr):
         _sparts = popparts.pop_parts_for(addr[0])[0]
         _sq, _och = squad.battle_squad_for(chan, _base, _snat, _sparts)
         _mine = _sq["owner"] == referee.bkey(addr[0])
-        _owner = _selfuid if _mine else (chan.alias_for(_och.addr) if _och else 0)
+        _owner = squad.squad_owner_uid(chan, _mine, _och)
         _bst = referee.battle_state(referee.bkey(addr[0]))
         _bst["squad"] = _sq
         _bst.setdefault("enemies", set())

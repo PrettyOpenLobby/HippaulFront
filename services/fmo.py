@@ -1658,6 +1658,7 @@ _OWNERS = {
     'squad_credit_kill': 'squad',
     'squad_gap': 'squad',
     'squad_note_hits': 'squad',
+    'squad_owner_uid': 'squad',
     'squad_positions': 'squad',
     'squad_relay': 'squad',
     'squadron_activate_body': 'squadron',
