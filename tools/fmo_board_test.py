@@ -111,6 +111,8 @@ def _main(db):
     data = os.path.join(tmp, "data")
     os.makedirs(data)
     os.environ["POL_DATA_DIR"] = data
+    # the live-session marker stays in this process's own store
+    os.environ.pop("POL_VALKEY_URL", None)
     os.environ.pop("FMO_WAR_STATE", None)
     os.environ.pop("FMO_SECTOR_WINS", None)
     import fmowar
@@ -219,13 +221,11 @@ def _main(db):
           == [("FZ-06", 12, 1), ("O.C.U. Occupied Zone 01", 1, 2), ("FZ-06", 12, 1)], rb)
     check("a frontline city carries its name, other sectors none",
           rb[0]["city"] == "Maltaf" and rb[1]["city"] == "")
-    marker = os.path.join(data, boardfmo.LIVE_MARKER)
-    with open(marker, "w") as fh:
-        json.dump({"count": 3, "stamp": now}, fh)
-    check("a fresh marker = its connection count", boardfmo.connections(now) == 3)
-    with open(marker, "w") as fh:
-        json.dump({"count": 3, "stamp": now - boardfmo.LIVE_GRACE_S - 5}, fh)
-    check("...a stale one = 0", boardfmo.connections(now) == 0)
+    import live_sessions
+    live_sessions.write_marker(boardfmo.LIVE_MARKER, 3)
+    check("a fresh marker = its connection count", boardfmo.connections() == 3)
+    check("...a stale one = 0",
+          boardfmo.connections(time.time() + boardfmo.LIVE_GRACE_S + 5) == 0)
 
     print("the page and the image")
     cols = boardfmo.LAYOUT["cols"]
@@ -357,8 +357,7 @@ def _main(db):
     finally:
         srv.shutdown()
     check("after everything, the game data is still identical",
-          {k: v for k, v in tree_hash(data).items() if k != boardfmo.LIVE_MARKER}
-          == {k: v for k, v in before.items()}
+          tree_hash(data) == before
           and fmowar.read_state() == war_before)
     print("[fmo_board_test] OK -- %d checks" % len(CHECKS))
 
