@@ -4,7 +4,8 @@
     python tools/fmo_title_test.py
 
 Needs the OpenLobby core checked out beside this repository (or OPENLOBBY_DIR
-pointing at it) for `titles.py`. Offline; uses a database in a temp directory.
+pointing at it) for `titles.py` and polcore. Runs on a throwaway database
+(OpenLobby's tools/pgtest.py) and SKIPs without one.
 
 Each check is a regression that has already happened once: a store read as
 JSON after the data moved into sqlite, the gender byte read as the nation
@@ -12,17 +13,14 @@ JSON after the data moved into sqlite, the gender byte read as the nation
 """
 import os
 import sys
-import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OPENLOBBY = os.environ.get("OPENLOBBY_DIR", os.path.join(ROOT, os.pardir, "openlobby"))
 sys.path.insert(0, os.path.join(OPENLOBBY, "services"))
 sys.path.insert(0, os.path.join(ROOT, "services"))
 
-TMP = tempfile.mkdtemp(prefix="fmo-title-")
-os.environ["FMO_DB"] = os.path.join(TMP, "fmo.db")
-
 import titles          # noqa: E402
+import fmodb           # noqa: E402
 import fmostore        # noqa: E402
 import fmotitle        # noqa: E402
 
@@ -79,5 +77,13 @@ def main():
     return 0
 
 
+def run():
+    with fmodb.test_database() as url:
+        if url is None:
+            print("SKIP -- no test database (Docker, or POL_TEST_DATABASE_URL)")
+            return 0
+        return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

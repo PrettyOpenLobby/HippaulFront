@@ -1,6 +1,7 @@
-"""The sector-win ledger: wins per nation per war-map tile, kept on disk."""
+"""The sector-win ledger: wins per nation per war-map tile, kept in the database."""
 import json
 import os
+from .deps import fmodb
 from .wirelog import log
 
 
@@ -13,70 +14,126 @@ from .wirelog import log
 #: the accept snapshots the row's zone rather than the pilot's.
 MSN_ZONES = os.environ.get("FMO_MSN_ZONES", "").strip()
 SECTOR_WINS = {}               #: (zone, tile, nation) -> [unix win times]
-#: FMO_SECTOR_WINS -- where the ledger is kept so prod's daily 23:50 restart
-#: does not wipe a sector mission in progress. '' = memory only. Default:
-#: fmo_sector_wins.json beside the character DB (/data on prod). Wins older
-#: than SECTOR_WINS_KEEP seconds (default two days) are dropped on save.
-SECTOR_WINS_PATH = (os.environ.get("FMO_SECTOR_WINS", "").strip()
-                    if "FMO_SECTOR_WINS" in os.environ else
-                    os.path.join(os.environ.get("FMO_DATA_DIR", "/data"),
-                                 "fmo_sector_wins.json"))
+#: FMO_SECTOR_WINS -- whether the ledger is kept in the database
+#: (fmo_sector_win) so prod's daily 23:50 restart does not wipe a sector
+#: mission in progress. '' or 0 = memory only; unset or anything else = the
+#: database. Wins older than SECTOR_WINS_KEEP seconds (default two days) are
+#: dropped on save.
+SECTOR_WINS_STORE = (os.environ.get("FMO_SECTOR_WINS", "").strip() not in ("", "0")
+                     if "FMO_SECTOR_WINS" in os.environ else True)
+#: The JSON file the ledger was kept in before it moved into the database. It
+#: is read once, into an empty table, and never written: an old FMO_SECTOR_WINS
+#: path, else fmo_sector_wins.json in FMO_DATA_DIR (/data on prod).
+_SW_ENV = os.environ.get("FMO_SECTOR_WINS", "").strip()
+SECTOR_WINS_LEGACY = (_SW_ENV if _SW_ENV.endswith(".json") else
+                      os.path.join(os.environ.get("FMO_DATA_DIR", "/data"),
+                                   "fmo_sector_wins.json"))
 SECTOR_WINS_KEEP = int(os.environ.get("FMO_SECTOR_WINS_KEEP", "").strip()
                        or "172800", 0)
+_SW_LOADED = [None]            #: how many keys the first load found; None = not yet
 
 
-def sector_wins_load(path=None, ledger=None):
-    """Fill the ledger from its file. Returns how many keys were loaded; a
-    missing or unreadable file is an empty ledger, never an error."""
-    led = SECTOR_WINS if ledger is None else ledger
-    path = SECTOR_WINS_PATH if path is None else path
+def _sw_legacy(path):
+    """{(zone, tile, nation): [times]} out of the old JSON file; bad keys are
+    skipped, a missing or unreadable file is empty."""
+    out = {}
     if not path or not os.path.exists(path):
-        return 0
+        return out
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
     except (OSError, ValueError):
-        return 0
-    n = 0
-    for k, times in (raw or {}).items():
+        return out
+    for k, times in (raw or {}).items() if isinstance(raw, dict) else ():
         try:
             z, t, nat = (int(x) for x in k.split(":"))
-            led[(z, t, nat)] = sorted(int(x) for x in times)
-            n += 1
-        except (ValueError, TypeError):
+            out[(z, t, nat)] = sorted(int(x) for x in times)
+        except (ValueError, TypeError, AttributeError):
             continue
-    return n
+    return out
 
 
-def sector_wins_save(path=None, ledger=None, now=None):
-    """Write the ledger (pruned to SECTOR_WINS_KEEP) atomically; False when
-    there is no path or the write failed."""
+def sector_wins_load(store=None, ledger=None):
+    """Fill the ledger from the database. Returns how many keys were loaded;
+    no database or an unreadable one is an empty ledger, never an error.
+    An empty table is first filled from the old JSON file, once."""
     led = SECTOR_WINS if ledger is None else ledger
-    path = SECTOR_WINS_PATH if path is None else path
-    if not path:
-        return False
+    store = SECTOR_WINS_STORE if store is None else store
+    if not store:
+        return 0
+    if fmodb is None:
+        log("[fmo] WARNING: sector wins are memory only: polcore (OpenLobby) "
+            "is not importable")
+        return 0
+    try:
+        fmodb.ready()
+        db = fmodb.db
+        with db.transaction(lock="fmo_sector_win") as conn:
+            rows = db.query("SELECT zone, tile, nation, won_at FROM fmo_sector_win"
+                            " ORDER BY won_at", conn=conn)
+            if not rows:
+                old = _sw_legacy(SECTOR_WINS_LEGACY)
+                if old:
+                    _sw_write(db, conn, old)
+                    log(f"[fmo] sector wins: imported {len(old)} key(s) from "
+                        f"{SECTOR_WINS_LEGACY} (the file is left as it was)")
+                    rows = db.query("SELECT zone, tile, nation, won_at"
+                                    " FROM fmo_sector_win ORDER BY won_at", conn=conn)
+    except fmodb.ERRORS as e:
+        log(f"[fmo] WARNING: sector wins not loaded ({e!r})")
+        return 0
+    got = {}
+    for r in rows:
+        got.setdefault((int(r["zone"]), int(r["tile"]), int(r["nation"])),
+                       []).append(int(r["won_at"]))
+    led.update(got)
+    return len(got)
+
+
+def _sw_write(db, conn, ledger):
+    """Replace the table with `ledger` (inside the caller's transaction)."""
+    db.execute("DELETE FROM fmo_sector_win", conn=conn)
+    rows = [(z, t, n, w) for (z, t, n), times in ledger.items() for w in times]
+    if rows:
+        db.execute_many("INSERT INTO fmo_sector_win (zone, tile, nation, won_at)"
+                        " VALUES (%s, %s, %s, %s)", rows, conn=conn)
+
+
+def sector_wins_save(store=None, ledger=None, now=None):
+    """Write the ledger (pruned to SECTOR_WINS_KEEP) in one transaction; False
+    when the ledger is memory only or the write failed."""
+    led = SECTOR_WINS if ledger is None else ledger
+    store = SECTOR_WINS_STORE if store is None else store
     cut = int(servicerecord._now_unix(now)) - SECTOR_WINS_KEEP
     out = {}
     for key, times in list(led.items()):
         keep = [t for t in times if t >= cut]
         led[key] = keep
         if keep:
-            out["%d:%d:%d" % key] = keep
+            out[key] = keep
+    if not store or fmodb is None:
+        return False
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path + ".tmp", "w", encoding="utf-8") as fh:
-            json.dump(out, fh, sort_keys=True)
-        os.replace(path + ".tmp", path)
+        fmodb.ready()
+        db = fmodb.db
+        with db.transaction(lock="fmo_sector_win") as conn:
+            _sw_write(db, conn, out)
         return True
-    except OSError:
+    except fmodb.ERRORS as e:
+        log(f"[fmo] WARNING: sector wins not saved ({e!r})")
         return False
 
 
-#: Load what the last process recorded, so a restart keeps sector missions.
-try:
-    _SW_LOADED = sector_wins_load()
-except Exception:                                  # pragma: no cover
-    _SW_LOADED = 0
+def _sw_ensure_loaded():
+    """Load what the last process recorded, on first use, so a restart keeps
+    sector missions (it was a file read at import; a database read waits
+    until something needs the ledger)."""
+    if _SW_LOADED[0] is None:
+        _SW_LOADED[0] = 0               # once, whatever happens
+        try:
+            _SW_LOADED[0] = sector_wins_load()
+        except Exception:                          # pragma: no cover
+            pass
 
 
 def _row_int_map(spec, what):
@@ -97,6 +154,8 @@ def _row_int_map(spec, what):
 
 def sector_win_record(zone, tile, nation, now=None, ledger=None):
     """One WIN by `nation` on (zone, tile), stamped `now`. Returns the key."""
+    if ledger is None:
+        _sw_ensure_loaded()
     led = SECTOR_WINS if ledger is None else ledger
     key = (int(zone or 0), int(tile or 0), int(nation or 0))
     led.setdefault(key, []).append(int(servicerecord._now_unix(now)))
@@ -109,6 +168,8 @@ def sector_wins_between(zone, tile, nation, since, until, ledger=None):
     """How many wins by `nation` on (zone, tile) fell in [since, until] --
     inclusive at both ends: stamps are whole seconds, and a win in the
     accept's own second is after the accept."""
+    if ledger is None:
+        _sw_ensure_loaded()
     led = SECTOR_WINS if ledger is None else ledger
     key = (int(zone or 0), int(tile or 0), int(nation or 0))
     return sum(1 for t in led.get(key, ()) if int(since) <= t <= int(until))

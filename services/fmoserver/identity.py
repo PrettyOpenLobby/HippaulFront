@@ -191,9 +191,8 @@ def member_for_ip(ip):
 
 def store_accounts():
     """Every account key in the store that has at least one character."""
-    db = charstore.use_db()
-    if db:
-        return fmostore.store_accounts(db)
+    if charstore.use_db():
+        return fmostore.store_accounts()
     if not charstore.CHAR_STORE:
         return []
     with _store_lock:

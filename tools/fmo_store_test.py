@@ -19,16 +19,24 @@ import struct
 import sys
 import tempfile
 os.environ["POL_LOG_DIR"] = tempfile.gettempdir()
-# KEY: ITS OWN DIRECTORY, and services/ ON THE PATH. Both matter as of 2026-09-08:
-# fmo.py now keeps player state in `fmo.db` BESIDE the character store, and it
-# reaches it through a GUARDED `import fmostore`. Run from ../tools with only
-# tools/ on sys.path that import fails, fmo.py degrades to the JSON store, and
-# this test would have passed while testing nothing of the database -- which is
-# exactly what it did on the first run. A per-run directory also stops a stale
-# database from a previous run being read as this run's state.
+# KEY: ITS OWN DIRECTORY, its own DATABASE, and services/ ON THE PATH. All
+# three matter: fmo.py keeps player state in the database and reaches it
+# through a GUARDED `import fmostore`. Run from ../tools with only tools/ on
+# sys.path that import fails, fmo.py degrades to the JSON store, and this test
+# would have passed while testing nothing of the database -- which is exactly
+# what it did on the first run. A fresh database per run (OpenLobby's
+# tools/pgtest.py, never POL_DATABASE_URL) also stops a previous run's state
+# being read as this run's.
 _HOME = tempfile.mkdtemp(prefix="fmo_store_test")
 sys.path.insert(0, os.path.abspath("."))
 os.environ["FMO_CHAR_STORE"] = os.path.join(_HOME, "fmo_test_chars.json")
+os.environ.pop("FMO_DB", None)
+import fmodb  # noqa: E402
+_TEST_DB = fmodb.test_database()
+if _TEST_DB.__enter__() is None:
+    print("SKIP -- no test database (Docker, or POL_TEST_DATABASE_URL)")
+    _TEST_DB.__exit__(None, None, None)
+    sys.exit(0)
 s = importlib.util.spec_from_file_location("fmo", "fmo.py")
 m = importlib.util.module_from_spec(s); sys.modules["fmo"] = m; s.loader.exec_module(m)
 
@@ -199,4 +207,5 @@ print("0x018E row 0: id",
       struct.unpack_from("<I", body, rec + m.ML_KEY)[0],
       "name", body[rec + m.ML_NAME:rec + m.ML_NAME + 11].decode())
 
+_TEST_DB.__exit__(None, None, None)
 print("ALL OK")
