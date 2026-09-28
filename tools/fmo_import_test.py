@@ -133,9 +133,17 @@ def old_sources(base):
     c.close()
     with open(os.path.join(state, "notes.txt"), "w") as fh:
         fh.write("not state")
-    with open(os.path.join(state, "old_discord.json"), "w") as fh:
+    with open(os.path.join(state, "fmo_old_discord.json"), "w") as fh:
         fh.write("[1, 2]")
+    # the other boards' files: the old state directory was one for every board
+    for other in OTHER_BOARDS:
+        with open(os.path.join(state, other), "w") as fh:
+            json.dump({"message_id": "1"}, fh)
     return dbpath, state, rosters
+
+
+OTHER_BOARDS = ("jan_discord.json", "jan_live_bot_99_discord.json",
+                "tm_auction_discord.json", "ffxi_conquest_discord.json")
 
 
 def digest(root):
@@ -235,7 +243,10 @@ def _main(fmodb, url, base):
     check("the chosen channel, per guild",
           rows.get("discord_channels", {}).get("chosen") == {"fmo": {"99": "4242"}}, rows)
     check("a file that is not board state, and one that is not an object, are skipped",
-          "skipped notes.txt" in out and "skipped old_discord.json" in out, out)
+          "skipped notes.txt" in out and "skipped fmo_old_discord.json" in out, out)
+    check("the other boards' files are skipped as theirs",
+          all("skipped %s: another board's state" % n in out for n in OTHER_BOARDS),
+          out)
     import polboards
     os.environ["POL_DATABASE_URL"] = url
     try:
