@@ -13,6 +13,10 @@
 # Without it the game plays the same; only the Viewer's profile screen for a
 # Front Mission Content ID stays empty.
 #
+# The plugin reads the pilots from the core's own PostgreSQL database
+# (POL_DATABASE_URL, which login and authsess already have), so nothing here
+# names a database.
+#
 # Stacking titles: every title image is the core image plus one plugin, so
 # to run several, build each on the previous one (OPENLOBBY_IMAGE) and list
 # them all in POL_TITLES, e.g. POL_TITLES=tmtitle,fmotitle in .env.
@@ -28,12 +32,9 @@ services:
     pull_policy: build
     environment:
       POL_TITLES: "${POL_TITLES:-fmotitle}"
-      # the pilot database the game writes, on the shared data volume
-      FMO_DB: "${FMO_DB:-/data/fmo.db}"
 
   authsess:
     image: crystalfront-title:latest
     pull_policy: never
     environment:
       POL_TITLES: "${POL_TITLES:-fmotitle}"
-      FMO_DB: "${FMO_DB:-/data/fmo.db}"

@@ -1,9 +1,11 @@
 # One image for the Front Mission Online service and its optional board;
 # the entrypoint is chosen per service in docker-compose.yml.
-# Digest pinned 2026-09-15; bump deliberately, not by surprise.
-FROM python:3.12-slim@sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79
-
-RUN pip install --no-cache-dir pillow
+#
+# Built on the OpenLobby core image, which carries polcore (the PostgreSQL
+# and Valkey layer every service shares) and its drivers. Build the core
+# first, or point OPENLOBBY_IMAGE at the image you use.
+ARG OPENLOBBY_IMAGE=openlobby:latest
+FROM ${OPENLOBBY_IMAGE}
 
 WORKDIR /app
 COPY . /app/
@@ -17,6 +19,8 @@ import os, sys
 missing = [p for p in ("fmo_blowfish_P.bin", "fmo_blowfish_S.bin") if not os.path.exists(p)]
 if missing:
     sys.exit("missing generated tables: %s - run tools/gen_blowfish_tables.py first" % ", ".join(missing))
+if not os.path.isdir("polcore"):
+    sys.exit("the base image has no polcore/ - build it FROM the OpenLobby image")
 if not os.path.exists("fmodata/fmo-ranks.tsv"):
     print("NOTE: fmodata/ holds only the authored events table; run "
           "tools/fmodata_build.py against your client install for the rank "
