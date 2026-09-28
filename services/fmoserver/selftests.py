@@ -8433,6 +8433,12 @@ def _selftest_run(test_db):
     _wc.squad_popped = True
     _wc.restart()
     _sq_ok = _sc(12, _wc.squad_popped is False)
+    # the owner stamp is the id the self-POP used: with wire ids that is the
+    # character id (0x1001), not FMO_UDP_POP_BATTLE's 1
+    if charlist.CHAR_WIRE_BASE:
+        _wc.char_id = charlist.CHAR_WIRE_BASE + 1
+        _sq_ok &= _sc(13, squad.squad_owner_uid(_wc, True, None) == charlist.CHAR_WIRE_BASE + 1
+                      and squad.squad_owner_uid(_wc, False, None) == 0)
 
     _sq_ok &= _sc(1, squad.parse_battle_enemies("3:40") == (3, 40.0)
                  and squad.parse_battle_enemies("") == (1, 30.0)

@@ -129,6 +129,20 @@ def battle_squad_for(chan, base, nation, parts, now=None, mates=None):
     return sq, owner_chan
 
 
+def squad_owner_uid(chan, mine, owner_chan):
+    """The POP body+0x2C owner for a squad unit on `chan`: the id the self-POP
+    used when this client runs the brains, else the owner's alias here.
+
+    With wire ids the self-POP uses chan.self_unit() (the character id,
+    0x1001 and up). Stamping FMO_UDP_POP_BATTLE's fixed id 1 here left the
+    client owning no enemy: every one arrived as a network copy with no
+    brain, which never moved or fired, and the pilot's hits on it were
+    skipped."""
+    if mine:
+        return chan.self_unit() or 0
+    return chan.alias_for(owner_chan.addr) if owner_chan else 0
+
+
 def move_state_len(state, at=0):
     """Byte length of one motion-state record starting at `at` (decoder
     0x6104C2F0), or None if it runs short."""
