@@ -682,7 +682,7 @@ def _serve_datagram(sock, peers, dg, addr):
             chan.pending.append(fmoworld.record_pop(
                 uid, look=_lk_now, **chan.pop_args))
         except ValueError as e:
-            log(f"[udp {addr[0]}:{addr[1]}] \WARNING: POP REFUSED BY OUR OWN "
+            log(f"[udp {addr[0]}:{addr[1]}] WARNING: POP REFUSED BY OUR OWN "
                 f"GUARD, nothing sent: {e}")
             chan.popped = True
         else:

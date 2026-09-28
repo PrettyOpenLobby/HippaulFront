@@ -304,5 +304,5 @@ try:
     POP_BATTLE = popsweep._parse_pop(POP_BATTLE_SPEC)
 except ValueError:
     POP_BATTLE = None
-    print(f"[fmo] \WARNING: FMO_UDP_POP_BATTLE={POP_BATTLE_SPEC!r} is not "
+    print(f"[fmo] WARNING: FMO_UDP_POP_BATTLE={POP_BATTLE_SPEC!r} is not "
           f"'<unitid>[:<unittype>]' -- THE BATTLE POP OVERRIDE IS OFF")
