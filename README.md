@@ -1,4 +1,4 @@
-# CrystalFront
+# HippaulFront
 
 A server for Front Mission Online, Square Enix's 2005 PC (and PlayStation 2)
 team-based mech game whose lobby, missions and sorties ran through PlayOnline.
@@ -106,6 +106,9 @@ one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
 
 ## Prerequisites
 
+- This repository checked out as `hippaulfront`, which is where the compose files
+  look for it (`git clone https://github.com/PrettyOpenLobby/HippaulFront.git hippaulfront`).
+  A checkout from before the rename, still named `crystalfront`, needs renaming.
 - The core lobby stack (OpenLobby) checked out beside this repository, with
   its image built (`openlobby:latest`), because this service's image is built
   on top of it
@@ -137,7 +140,7 @@ its `POL_DB_PASSWORD` reaches the connection string; this repository's
 `.env` carries the `FMO_*` knobs.
 
 Without building: the image is published to
-`ghcr.io/prettyopenlobby/crystalfront` on every push (it carries the cipher
+`ghcr.io/prettyopenlobby/hippaulfront` on every push (it carries the cipher
 tables, so step 1 is not needed); step 2 still runs on the host, and the
 override mounts your `services/fmodata/` (and the baked board art) into the
 containers:
