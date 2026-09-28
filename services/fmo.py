@@ -8754,6 +8754,12 @@ def account_for(ip):
     pinned = ACCOUNT_PIN.get(ip)
     if pinned:
         return pinned
+    # Serving a world datagram: THAT channel's player, not the address's newest.
+    _a = getattr(_udp_ctx, "addr", None)
+    if _a is not None and _a[0] == ip:
+        _c = WORLD_PEERS.get(_a)
+        if _c is not None and _c.account:
+            return _c.account
     with _store_lock:
         got = _identity_by_ip.get(ip)
         if got and time.monotonic() - got[1] <= IDENTITY_TTL:
@@ -11116,6 +11122,29 @@ class Session:
             self._account = account_for(self.ip)
         return self._account
 
+    def wire_self_id(self):
+        """The UnitID this client will believe is its own: the WIRE character
+        id it selected in 0x0130 (CHAR_WIRE_BASE), else None to keep the fixed
+        FMO_UDP_POP id in the 0x0153 setup block."""
+        sel = getattr(self, "playing", 0)
+        if CHAR_WIRE_BASE and sel and sel >= CHAR_WIRE_BASE:
+            return sel
+        return None
+
+    def battle_key(self):
+        """The BATTLE_STATE key for this pilot -- the SAME key its world
+        channels use (chan_bkey): the account when a world channel is bound to
+        it, else the address, exactly as before binding existed."""
+        ip = getattr(self, "ip", None)
+        try:
+            acct = self.account
+        except Exception:                    # a bare test session: no account
+            return ip
+        if acct and any(getattr(c, "account", None) == acct
+                        for c in list(WORLD_PEERS.values())):
+            return acct
+        return ip
+
     @property
     def roster(self):
         if self._roster is None:
@@ -11914,7 +11943,8 @@ class Session:
             # reset_world_channel.
             reset_world_channel(self.peer.split(":")[0], "0x0153 served",
                                 mapno=mn, mapkind=mk,
-                                place=entry_place(mk) if PLACES else None)
+                                place=entry_place(mk) if PLACES else None,
+                                account=self.account)
             self.remember_zone(mk, mn, "world entry")
             if FILL_0153:
                 log(f"{self.peer}   -> 0x0153 (NOT N+1), {REPLY_0153_LEN}B: "
@@ -12319,7 +12349,7 @@ class Session:
             # so whatever we still hold for this host describes a dead session.
             reset_world_channel(self.peer.split(":")[0],
                                 "0x0153 served (0x016D)", mapno=mn, mapkind=mk,
-                                place=_place)
+                                place=_place, account=self.account)
             self.remember_zone(mk, mn, "move")
             log(f"{self.peer}   -> 0x0153, {REPLY_0153_LEN}B: "
                 f"ClientScriptNo={csn} PilotPos={pp} "
@@ -12690,7 +12720,8 @@ class Session:
                 # grant early, exactly as the Move path already does.
                 reset_world_channel(_host, "0x0153 served (0x0151 area change)",
                                     mapno=_mn, mapkind=zone,
-                                    place=entry_place(zone) if PLACES else None)
+                                    place=entry_place(zone) if PLACES else None,
+                                    account=self.account)
                 self.remember_zone(zone, _mn, "Change Area")
             if ZONE_CONTROL:
                 zpush = zone_control_push(p["conn"])
@@ -13418,7 +13449,7 @@ class Session:
             elif _PUSH_PROBE_ERR and not getattr(self, "push_probe_done", False):
                 self.push_probe_done = True
                 log(f"{self.peer}   WARNING: FMO_PUSH_PROBE ignored: {_PUSH_PROBE_ERR}")
-            _bst = BATTLE_STATE.get(self.ip)
+            _bst = BATTLE_STATE.get(self.battle_key())
             if _bst is not None:
                 _bst["clock"] = (when, when_us, time.time())
             if _BATTLE_END_ERR and not getattr(self, "_be_err_said", False):
@@ -14386,7 +14417,7 @@ class Session:
         self.battle_end_done = False
         self.battle_settlement = None          # one settlement per sortie
         # the battle map this sortie went to: the war map's census key
-        _bsr0 = battle_state(self.ip, reset=True)
+        _bsr0 = battle_state(self.battle_key(), reset=True)
         _bsr0["mapno"] = next(
             struct.unpack_from("<I", r)[0] for l, _o, r, _s in fields
             if l == "MapNo")
@@ -14978,7 +15009,7 @@ class Session:
             log(f"{self.peer}   WARNING: FMO_RESULT_CONTRIB={RESULT_CONTRIB} and "
                 f"FMO_BATTLE_END_CONTRIB={BATTLE_END_CONTRIB} disagree -- they "
                 f"name ONE delta; using {contrib}. Set one of them.")
-        kills = battle_kills(BATTLE_STATE.get(getattr(self, "ip", None)))
+        kills = battle_kills(BATTLE_STATE.get(self.battle_key()))
         try:
             pay = battle_pay(len(kills), _won, money=RESULT_MONEY,
                              contrib=contrib, exp_rows=rows)
@@ -15291,7 +15322,7 @@ class Session:
         # SE: a win over other PILOTS moves the front more than one over NPCs
         # (fmowar weight 2). Set when a hostile room-mate popped in this
         # battle (room_queue -> battle_room_hostile).
-        pvp = bool((BATTLE_STATE.get(getattr(self, "ip", None)) or {}).get("pvp"))
+        pvp = bool((BATTLE_STATE.get(self.battle_key()) or {}).get("pvp"))
         s, what = st.settle(tile, n, won=bool(won), pvp=pvp)
         log(f"{self.peer}   WAR STATE: tile {tile} (selector {MAPKIND} sector "
             f"{self.sector[1]}, map {self.sector[2]}), nation {n} ({src}) "
@@ -17188,7 +17219,8 @@ def online_players():
     for a, ch in list(WORLD_PEERS.items()):
         if ch.key is None or now - ch.seen_at > ROOM_TTL:
             continue
-        n1, n2, _src = pop_names_for(a[0])
+        with _as_world_channel(a):           # each channel's OWN player
+            n1, n2, _src = pop_names_for(a[0])
         out[(n1.strip().lower(), n2.strip().lower())] = a[0]
     return out
 
@@ -19139,6 +19171,16 @@ class WorldChannel:
 
     def __init__(self, addr):
         self.addr = addr
+        #: The account this channel's player entered the world as, bound once at
+        #: creation by claim_world_account() -- or None, when account_for() falls
+        #: back to the per-address answer it always gave.
+        self.account = None
+        #: {"map", "zone", "place"} this channel's player was granted -- see
+        #: chan_where(). None = use the per-address WORLD_* values.
+        self.loc = None
+        #: monotonic time this channel last consumed its OWN re-entry -- see
+        #: rebind_on_restart(), which keeps the binding across a Move.
+        self.settled_at = None
         self.key = None
         self.tables = None
         #: the first of OUR records the peer has not acknowledged. It moves
@@ -19387,6 +19429,132 @@ class WorldChannel:
         return None
 
 
+#: KEY: WHICH ACCOUNT IS BEHIND WHICH WORLD CHANNEL (2026-09-27). The world helpers
+#: all ask account_for(host_ip), which is one answer per ADDRESS -- so with one
+#: player's PC (Fox) and Steam Deck (Kai) in the world from one router, both
+#: self-POPs named 'Kai'/'Test' even after the TCP side named each member
+#: correctly by key. The UDP key cannot tell them apart ("%xlobby" over our own
+#: endpoint + character id, and both characters are id 1), so the link is the
+#: ENTRY: each game connection's 0x0153 queues its account here, and the next
+#: NEW channel from that address claims the oldest one (a client opens its
+#: channel seconds after its 0x0153). A re-entry by a player who already has a
+#: bound channel (a Move, a Change Area) is consumed by that channel's own next
+#: datagram (settle_world_entry), so it is never left for the OTHER device's
+#: new channel to claim; a relaunch from a new NAT port still finds its entry.
+WORLD_ENTRY_TTL = _env_float("FMO_WORLD_ENTRY_TTL", "60")
+_world_entries = {}                  # {host: [(account, monotonic), ...]}
+_world_entries_lock = threading.Lock()
+#: The datagram being served right now, so account_for() can answer for THIS
+#: channel. Thread-local: serve_udp is one thread; the TCP threads never see it.
+_udp_ctx = threading.local()
+
+
+class _as_world_channel:
+    """`with _as_world_channel(addr):` -- account_for() answers for THAT
+    channel for the duration, then the served channel again. Use it whenever
+    code serving one channel computes something about ANOTHER (a room-mate's
+    pop): the address alone cannot say which of two same-router players."""
+
+    def __init__(self, addr):
+        self.addr = addr
+
+    def __enter__(self):
+        self.saved = getattr(_udp_ctx, "addr", None)
+        _udp_ctx.addr = self.addr
+        return self
+
+    def __exit__(self, *exc):
+        _udp_ctx.addr = self.saved
+        return False
+
+
+def queue_world_entry(host, account, loc=None):
+    """A game connection from `host` entered the world as `account`, at `loc`
+    ({"map", "zone", "place"}, only the fields the 0x0153 set)."""
+    if not account:
+        return
+    now = time.monotonic()
+    with _world_entries_lock:
+        q = [e for e in _world_entries.get(host, [])
+             if now - e[1] <= WORLD_ENTRY_TTL and e[0] != account]
+        q.append((account, now, dict(loc or {})))
+        _world_entries[host] = q
+
+
+def _bind_world_entry(chan, entry):
+    chan.account = entry[0]
+    chan.loc = dict(chan.loc or {}, **entry[2])
+
+
+def claim_world_account(host, chan=None):
+    """The account for a NEW world channel from `host`, or None. With `chan`,
+    binds it (account AND the location that entry was granted)."""
+    now = time.monotonic()
+    with _world_entries_lock:
+        q = [e for e in _world_entries.get(host, [])
+             if now - e[1] <= WORLD_ENTRY_TTL]
+        got = q.pop(0) if q else None
+        _world_entries[host] = q
+    if got is None:
+        return None
+    if chan is not None:
+        _bind_world_entry(chan, got)
+    return got[0]
+
+
+def settle_world_entry(chan):
+    """A bound channel is still talking: any entry queued for ITS account was
+    its own re-entry (a Move, a Change Area), not a new device's. Take its
+    location and drop it."""
+    if not chan.account:
+        return
+    host = chan.addr[0]
+    with _world_entries_lock:
+        q = _world_entries.get(host)
+        mine = [e for e in (q or []) if e[0] == chan.account]
+        if mine:
+            _world_entries[host] = [e for e in q if e[0] != chan.account]
+    for e in mine:
+        _bind_world_entry(chan, e)
+    if mine:
+        chan.settled_at = time.monotonic()
+
+
+def rebind_on_restart(chan):
+    """The client behind `chan` restarted its indices (a new scene -- or a NEW
+    CLIENT on the same address:port). Returns the new account if the binding
+    changed, else None.
+
+    WARNING: LIVE 2026-09-27: the Steam Deck relaunched FMO as Kai from the SAME
+    source port (19155) a channel bound to Fox still held, so the channel
+    object -- and its binding -- was reused, and Kai wore Fox's name while
+    Kai's own entry sat unclaimed. A restart is where the client is replaced,
+    so it is where the binding is re-decided:
+      * an entry for THIS account is pending -> same player, new location;
+      * this account settled one recently -> a Move/Change Area, keep it;
+      * otherwise an entry from ANOTHER account is waiting -> a different
+        client took over the port: claim it."""
+    settle_world_entry(chan)
+    recent = getattr(chan, "settled_at", None)
+    if recent is not None and time.monotonic() - recent <= WORLD_ENTRY_TTL:
+        return None
+    was = chan.account
+    got = claim_world_account(chan.addr[0], chan)
+    return got if got and got != was else None
+
+
+def chan_where(chan):
+    """(MapNo, zone, place) of THIS channel's player. A bound channel carries
+    its own (2026-09-27: an O.C.U. PC and a U.S.N. Deck on one router were
+    relayed into each other's lobby because WORLD_ZONES is per ADDRESS and the
+    later entry overwrote the earlier). Unbound: the per-address values."""
+    loc = getattr(chan, "loc", None) or {}
+    host = chan.addr[0]
+    return (loc.get("map", WORLD_MAPS.get(host)),
+            loc.get("zone", WORLD_ZONES.get(host)),
+            loc.get("place", WORLD_PLACES.get(host)))
+
+
 def serve_udp(sock):
     peers = WORLD_PEERS
     while True:
@@ -19395,6 +19563,7 @@ def serve_udp(sock):
         except OSError as exc:
             log(f"[udp] recv failed: {exc}")
             return
+        _udp_ctx.addr = addr
         try:
             _serve_datagram(sock, peers, dg, addr)
         except Exception as exc:                 # noqa: BLE001
@@ -19404,6 +19573,8 @@ def serve_udp(sock):
             # channel "not being served", which is the state we just left.
             log(f"[udp {addr[0]}:{addr[1]}] handler raised {exc!r} on a "
                 f"{len(dg)}B datagram -- continuing")
+        finally:
+            _udp_ctx.addr = None
 
 
 #: WARNING: THE WORLD CHANNELS, MODULE-LEVEL SO THE TCP HALF CAN INVALIDATE THEM.
@@ -19507,8 +19678,12 @@ def zone_of(host):
     return (z, z // 100) if z is not None else (None, None)
 
 
-def reset_world_channel(host, why, mapno=None, mapkind=None, place=None):
+def reset_world_channel(host, why, mapno=None, mapkind=None, place=None,
+                        account=None):
     """ARM a restart on every world channel for `host`, without dropping it.
+
+    `account` is the entering game connection's; it is queued for the NEW
+    channel this entry is about to open (queue_world_entry).
 
     THIS USED TO DROP THE CHANNEL OUTRIGHT, AND IT COST A LIVE RUN
     (2026-08-22). Serving a 0x0153 is not the moment the client restarts its
@@ -19530,6 +19705,9 @@ def reset_world_channel(host, why, mapno=None, mapkind=None, place=None):
 
     Returns the number armed, so the caller can say nothing happened rather
     than log a reset that did not occur."""
+    queue_world_entry(host, account, {k: v for k, v in
+                                      (("map", mapno), ("zone", mapkind),
+                                       ("place", place)) if v is not None})
     if mapno is not None:
         was = WORLD_MAPS.get(host)
         WORLD_MAPS[host] = mapno
@@ -19577,8 +19755,7 @@ def room_mates(chan):
     if not ROOM:
         return []
     now = time.time()
-    mine = WORLD_MAPS.get(chan.addr[0])
-    mine_zone = WORLD_ZONES.get(chan.addr[0])
+    mine, mine_zone, mine_place = chan_where(chan)
     out = []
     if chan.key == GROUP_KEY:
         return []                       # a group channel carries no world
@@ -19635,14 +19812,17 @@ def room_prune(chan, now):
     ROOM_DEPOP) the stream is KEPT: the unit is still standing on the screen
     under that alias, so when the player comes back the relay resumes onto
     it with the window it already has, and no second entity is created."""
-    mine = WORLD_MAPS.get(chan.addr[0])
-    mine_zone = WORLD_ZONES.get(chan.addr[0])
+    mine, mine_zone, mine_place = chan_where(chan)
     for alias, rs in list(chan.remotes.items()):
         if not rs.popped:
             continue
         other = WORLD_PEERS.get(rs.peer_addr)
-        theirs = WORLD_MAPS.get(rs.peer_addr[0])
-        theirs_zone = WORLD_ZONES.get(rs.peer_addr[0])
+        if other is not None:
+            theirs, theirs_zone, theirs_place = chan_where(other)
+        else:
+            theirs = WORLD_MAPS.get(rs.peer_addr[0])
+            theirs_zone = WORLD_ZONES.get(rs.peer_addr[0])
+            theirs_place = WORLD_PLACES.get(rs.peer_addr[0])
         if other is None:
             why = "their world channel is gone"
         elif other.left:
@@ -19650,13 +19830,16 @@ def room_prune(chan, now):
         elif now - other.seen_at > ROOM_TTL:
             why = (f"silent for {now - other.seen_at:.0f}s > ROOM_TTL "
                    f"{ROOM_TTL:g}s")
+        elif _is_battle_chan(other) != _is_battle_chan(chan):
+            why = ("went into a battle" if _is_battle_chan(other)
+                   else "went back to the lobby")
         elif ROOM_SAME_MAP and theirs != mine:
             why = f"moved to MapNo {theirs} (we are in {mine})"
         elif ROOM_SAME_ZONE and theirs_zone != mine_zone:
             why = f"moved to zone {theirs_zone} (we are in zone {mine_zone})"
-        elif PLACES and WORLD_PLACES.get(rs.peer_addr[0]) != WORLD_PLACES.get(chan.addr[0]):
-            why = (f"moved to {place_name(WORLD_PLACES.get(rs.peer_addr[0]))} "
-                   f"(we are in {place_name(WORLD_PLACES.get(chan.addr[0]))})")
+        elif PLACES and theirs_place != mine_place:
+            why = (f"moved to {place_name(theirs_place)} "
+                   f"(we are in {place_name(mine_place)})")
         else:
             if rs.gone:
                 log(f"[udp {chan.addr[0]}:{chan.addr[1]}] room: "
@@ -19818,6 +20001,9 @@ BATTLE_SQUADS = {}
 #: landed in the battle's unit list (the review file recorded 18 units for a
 #: 4-unit fight) and their name tags flashed over the battlefield. The lobby
 #: cast is held while the battle stream is live (lobby_cast_paused).
+#: WARNING: Keyed by PLAYER (chan_bkey), not address: live 09-27 22:21Z the Deck's
+#: battle held the lobby cast for the PC on the same router, which entered a
+#: lobby with no NPCs until 15 s after the Deck withdrew.
 BATTLE_SEEN = {}
 BATTLE_CAST_HOLD = 15.0
 
@@ -19855,8 +20041,8 @@ def battle_squad_for(chan, base, nation, parts, now=None, mates=None):
     """(squad, owner channel or None) for the room `chan` stands in. Creates a
     squad owned by `chan`'s host when there is none, when its owner has left
     the room, or when the owner's sortie is not the one it was made for."""
-    ip = chan.addr[0]
-    key = battle_room_key(ip)
+    ip = chan_bkey(chan)
+    key = chan_where(chan)          # the room THIS channel stands in
     sq = BATTLE_SQUADS.get(key)
     mates = [o for o in (room_mates(chan) if mates is None else mates)
              if _is_battle_chan(o)]
@@ -19864,7 +20050,7 @@ def battle_squad_for(chan, base, nation, parts, now=None, mates=None):
     if sq is not None:
         granted = (BATTLE_STATE.get(sq["owner"]) or {}).get("granted_at")
         if sq["owner"] != ip:
-            owner_chan = next((o for o in mates if o.addr[0] == sq["owner"]), None)
+            owner_chan = next((o for o in mates if chan_bkey(o) == sq["owner"]), None)
         if (sq["owner"] != ip and owner_chan is None) or granted != sq["granted"]:
             sq = None
     if sq is None:
@@ -19994,8 +20180,8 @@ def squad_relay(chan, addr, cmd, body, arg8):
     pilot in the same squad, on their self stream, header +0x08 kept. The
     owner's records about its OWN unit are never forwarded (a receiver would
     look them up as ITS own unit). Returns how many pilots got it."""
-    sq = (BATTLE_STATE.get(addr[0]) or {}).get("squad")
-    if not sq or sq["owner"] != addr[0]:
+    sq = (BATTLE_STATE.get(chan_bkey(chan)) or {}).get("squad")
+    if not sq or sq["owner"] != chan_bkey(chan):
         return 0
     ids = set(sq["ids"])
     if cmd == CMD_BM_MOVE_BATCH:
@@ -20014,7 +20200,7 @@ def squad_relay(chan, addr, cmd, body, arg8):
     rec = fmoworld.record(cmd, body, arg8=arg8)
     n = 0
     for o in room_mates(chan):
-        if _is_battle_chan(o) and (BATTLE_STATE.get(o.addr[0]) or {}).get("squad") is sq:
+        if _is_battle_chan(o) and (BATTLE_STATE.get(chan_bkey(o)) or {}).get("squad") is sq:
             o.pending.append(rec)
             n += 1
     return n
@@ -20043,7 +20229,7 @@ def squad_note_hits(chan, body, arg8):
     """Remember who last HIT each squad unit, from a cmd-43 hit list: a squad
     id (an enemy hit its own side) or the host whose pilot fired. Returns
     [(target, shooter)] noted."""
-    sq = (BATTLE_STATE.get(chan.addr[0]) or {}).get("squad")
+    sq = (BATTLE_STATE.get(chan_bkey(chan)) or {}).get("squad")
     hl = parse_hitlist(body)
     if not sq or not hl or arg8 is None:
         return []
@@ -20051,9 +20237,10 @@ def squad_note_hits(chan, body, arg8):
     if arg8 in ids:
         who = ("npc", arg8)
     elif arg8 == chan.self_unit():
-        who = ("host", chan.addr[0])
+        who = ("host", chan_bkey(chan))
     else:
-        who = next((("host", a[0]) for a, al in getattr(chan, "alias_of", {}).items()
+        who = next((("host", chan_bkey(WORLD_PEERS.get(a)) or a[0])
+                    for a, al in getattr(chan, "alias_of", {}).items()
                     if al == arg8), ("npc", arg8))
     out = []
     for t, _d, _a, _p in hl["hits"]:
@@ -20091,7 +20278,7 @@ def squad_credit_kill(sq, target, reporter, now=None, chans=None):
             continue
         if best is None or t > best.last_fire:
             best = o
-    host = (best or reporter).addr[0]
+    host = chan_bkey(best or reporter)
     battle_state(host).setdefault("kills", []).append((target, now))
     return host
 
@@ -20131,8 +20318,14 @@ def room_queue(chan):
         alias = chan.alias_for(other.addr)
         rs = chan.remotes[alias]
         if not rs.popped:
-            n1, n2, _src = pop_names_for(other.addr[0])
-            _rf, _rs, _ = pop_model_for(other.addr[0])
+            # WARNING: AS `other`, not as the channel being served: with two devices
+            # behind one address, account_for(other's ip) inside this datagram
+            # answered for `chan` -- so the room-mate wore the LISTENER's name
+            # (live 2026-09-27, PC and Deck). The lookups must run in the
+            # other channel's context.
+            with _as_world_channel(other.addr):
+                n1, n2, _src = pop_names_for(other.addr[0])
+                _rf, _rs, _ = pop_model_for(other.addr[0])
             # Create bare and dress late here too -- same reasoning as the self
             # POP (POP_LOOK_DEFER), and the stakes are higher: this record runs
             # on somebody ELSE's client.
@@ -20162,7 +20355,7 @@ def room_queue(chan):
                 _rlook_now, rs.look_due = None, None     # the parts are the look
                 _hostile = battle_room_hostile(chan, other)
                 if _hostile:
-                    _bs = battle_state(chan.addr[0])
+                    _bs = battle_state(chan_bkey(chan))
                     _bs.setdefault("enemies", set()).add(alias)
                     _bs["pvp"] = True            # war_settle weighs it double
                 log(f"[udp {chan.addr[0]}:{chan.addr[1]}] BATTLE ROOM: "
@@ -20325,7 +20518,7 @@ def referee_shot(chan, addr):
     # THE KILL: complete the destroy objective (so FMO_BATTLE_END=objective wins)
     # and remove the enemy from the field.
     chan.dummy_kill_sent = True
-    st = battle_state(addr[0])
+    st = battle_state(bkey(addr[0]))
     st.setdefault("kills", []).append((chan.dummy_id, time.time()))
     try:
         chan.pending.append(fmoworld.record_depop(
@@ -20339,6 +20532,31 @@ def referee_shot(chan, addr):
     banners = ["Enemy destroyed!"]
     banners += objective_tick(st, chan, time.time())
     return banners
+
+
+def chan_bkey(c):
+    """WHOSE battle a channel is: its bound account, else its host.
+
+    WARNING: BATTLE_STATE / the squad / kill credit were keyed by the client's IP.
+    Live 2026-09-27, PC and Deck on one router in one battle: BOTH were told
+    they OWN the enemy squad (two AI brains per enemy), kills were credited to
+    the address, the Deck took the 'all enemies destroyed' WIN for the PC's
+    kills, and the shared 'ended' flag then stranded the PC in the battle with
+    no way to end it. A bound channel names its player (claim_world_account),
+    so that is the key; the address only for an unbound channel."""
+    return (getattr(c, "account", None) or c.addr[0]) if c is not None else None
+
+
+def bkey(ip):
+    """chan_bkey for the channel being served (serve_udp's context), when it is
+    `ip`'s; else the IP. Use inside a datagram handler, where `addr[0]` is all
+    the code has."""
+    a = getattr(_udp_ctx, "addr", None)
+    if a is not None and a[0] == ip:
+        c = WORLD_PEERS.get(a)
+        if c is not None and getattr(c, "account", None):
+            return c.account
+    return ip
 
 
 def battle_state(host, reset=False):
@@ -20457,7 +20675,7 @@ def _credit_room_kill(victim, addr):
             f"{BATTLE_KILL_WINDOW:.0f}s, so no kill is credited.")
         return None
     alias = killer.alias_for(victim.addr)
-    kst = battle_state(killer.addr[0])
+    kst = battle_state(chan_bkey(killer))
     if any(t == alias for t, _w in kst.get("kills", [])):
         return None
     kst.setdefault("kills", []).append((alias, time.time()))
@@ -20495,7 +20713,7 @@ def _note_battle_record(chan, addr, cmd, body):
             f"once per battle.")
     if cmd in (fmoworld.CLI_ESCAPE, fmoworld.CLI_ESCAPE_B):
         esc = fmoworld.parse_escape(body)
-        st = battle_state(addr[0])
+        st = battle_state(bkey(addr[0]))
         if esc and not st["escaped"]:
             st["escaped"] = (esc[0], esc[1], time.time())
         log(f"[udp {addr[0]}:{addr[1]}]   cmd {cmd} = CLI -> BM EMERGENCY ESCAPE"
@@ -20524,12 +20742,12 @@ def _note_battle_record(chan, addr, cmd, body):
         hits = ([fmoworld.parse_hit(body)] if cmd == fmoworld.CMD_BM_HIT
                 else fmoworld.parse_hit_batch(body))
         hits = [h for h in hits if h]
-        st = battle_state(addr[0])
+        st = battle_state(bkey(addr[0]))
         _sq = st.get("squad")
         for h in hits:
             if h["died"]:
                 if _sq and h["target"] in _sq["ids"]:
-                    if _sq["owner"] == addr[0]:
+                    if _sq["owner"] == bkey(addr[0]):
                         _who = squad_credit_kill(_sq, h["target"], chan)
                         if _who is None and h["target"] in _sq["dead"] and any(
                                 t == h["target"] for t, _s in _sq.get("friendly_fire", [])):
@@ -20562,7 +20780,7 @@ def _note_battle_record(chan, addr, cmd, body):
         for b in objective_tick(st, chan, time.time()):
             hud_banner(chan, b)
     elif cmd == fmoworld.CMD_MOVE:
-        st = BATTLE_STATE.get(addr[0])
+        st = BATTLE_STATE.get(bkey(addr[0]))
         if st is not None and OBJECTIVE:
             for b in objective_tick(st, chan, time.time()):
                 log(f"[udp {addr[0]}:{addr[1]}]   objective: {b}")
@@ -20749,7 +20967,7 @@ def _serve_datagram(sock, peers, dg, addr):
         alias_rs.adopted = True
         return
     if _is_battle_chan(chan):
-        BATTLE_SEEN[addr[0]] = time.time()      # see lobby_cast_paused
+        BATTLE_SEEN[chan_bkey(chan)] = time.time()   # see lobby_cast_paused
     chan.seen += 1
     if got["records"] or chan.seen <= 3:
         log(f"[udp {addr[0]}:{addr[1]}] peer={got['peer']} hid={got['hid']} "
@@ -21250,7 +21468,7 @@ def _serve_datagram(sock, peers, dg, addr):
                 chan.dummy_id = _duid
                 chan.dummy_pos = tuple(_dp[:3]) if _dp else None
                 # an enemy whose destruction pays (battle_kills)
-                battle_state(addr[0]).setdefault("enemies", set()).add(_duid)
+                battle_state(bkey(addr[0])).setdefault("enemies", set()).add(_duid)
                 if BATTLE_DUMMY_KILL > 0:
                     chan.dummy_kill_due = time.time() + BATTLE_DUMMY_KILL
                     chan.dummy_kill_sent = False
@@ -21295,9 +21513,9 @@ def _serve_datagram(sock, peers, dg, addr):
             pop_nation_for(addr[0])[0], 2)
         _sparts = pop_parts_for(addr[0])[0]
         _sq, _och = battle_squad_for(chan, _base, _snat, _sparts)
-        _mine = _sq["owner"] == addr[0]
+        _mine = _sq["owner"] == bkey(addr[0])
         _owner = _selfuid if _mine else (chan.alias_for(_och.addr) if _och else 0)
-        _bst = battle_state(addr[0])
+        _bst = battle_state(bkey(addr[0]))
         _bst["squad"] = _sq
         _bst.setdefault("enemies", set())
         for _i, (_eid, _epos) in enumerate(zip(_sq["ids"], _sq["pos"])):
@@ -21401,8 +21619,8 @@ def _serve_datagram(sock, peers, dg, addr):
     # the banner lands. See fmoworld.record_battle_start.
     if (BATTLE_START and chan.popped and chan.key
             and chan.key.endswith(b"battle")
-            and not battle_state(addr[0])["start_sent"]):
-        _bst = battle_state(addr[0])
+            and not battle_state(bkey(addr[0]))["start_sent"]):
+        _bst = battle_state(bkey(addr[0]))
         _bst["start_sent"] = True
         try:
             # WARNING: cmd 138's +0x00 is WRITTEN to block+0x48 (0x611EFB2B,
@@ -21437,9 +21655,9 @@ def _serve_datagram(sock, peers, dg, addr):
     # clock's milliseconds; until a keepalive has been seen it waits.
     if (BATTLE_OBJECTIVE and chan.popped and chan.key
             and chan.key.endswith(b"battle")
-            and not battle_state(addr[0])["objective_sent"]
-            and battle_state(addr[0])["clock"]):
-        _bst = battle_state(addr[0])
+            and not battle_state(bkey(addr[0]))["objective_sent"]
+            and battle_state(bkey(addr[0]))["clock"]):
+        _bst = battle_state(bkey(addr[0]))
         _bst["objective_sent"] = True
         _csec, _cusec, _cat = _bst["clock"]
         _cnow_ms = (_csec * 1000 + _cusec // 1000
@@ -21471,7 +21689,7 @@ def _serve_datagram(sock, peers, dg, addr):
     # See POP_NPC.
     if (npc_cast_configured() and chan.popped and not chan.npcs_popped
             and chan.key and not chan.key.endswith(b"battle")
-            and not lobby_cast_paused(addr[0])):
+            and not lobby_cast_paused(chan_bkey(chan))):
         _self_pos = ((chan.pop_args or {}).get("pos")
                      or next_pop_pos(WORLD_MAPS.get(addr[0]))[0])
         _n_ok = 0
@@ -21536,7 +21754,7 @@ def _serve_datagram(sock, peers, dg, addr):
             and not chan.npc_relook_sent
             and chan.npc_relook_due and time.time() >= chan.npc_relook_due
             and chan.key and not chan.key.endswith(b"battle")
-            and not lobby_cast_paused(addr[0])):
+            and not lobby_cast_paused(chan_bkey(chan))):
         _rl_self = ((chan.pop_args or {}).get("pos")
                     or next_pop_pos(WORLD_MAPS.get(addr[0]))[0])
         _rl_n = 0
@@ -30224,6 +30442,14 @@ def selftest():
                  and not lobby_cast_paused("cast-test", now=time.time() + 60)
                  and not lobby_cast_paused("never-battled"))
     BATTLE_SEEN.pop("cast-test", None)
+    # one router, two players: the Deck in battle must not hold the PC's cast
+    from types import SimpleNamespace as _SN
+    _cdeck = _SN(account="member:11", addr=("198.51.100.9", 1))
+    _cpc = _SN(account="member:3", addr=("198.51.100.9", 2))
+    BATTLE_SEEN[chan_bkey(_cdeck)] = time.time()
+    _h_ok &= _hc(8, lobby_cast_paused(chan_bkey(_cdeck))
+                 and not lobby_cast_paused(chan_bkey(_cpc)))
+    BATTLE_SEEN.pop(chan_bkey(_cdeck), None)
     print(f"  cmd 43 hit list: decoded; echoed verbatim to the shooter and to a "
           f"room-mate with the shooter/target ids rewritten into its numbering; "
           f"the battle side byte at block+0x{MB_BATTLE_SIDE:X}: "
