@@ -186,5 +186,5 @@ try:
     POP = _parse_pop(popself.POP_SPEC)
 except ValueError:
     POP = None
-    print(f"[fmo] \WARNING: FMO_UDP_POP={popself.POP_SPEC!r} is not "
+    print(f"[fmo] WARNING: FMO_UDP_POP={popself.POP_SPEC!r} is not "
           f"'<unitid>[:<unittype>]' -- THE POP PROBE IS OFF")
