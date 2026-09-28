@@ -1,9 +1,7 @@
 """Who is playing from which address: login tokens, the POL member behind an IP, the account
 key."""
-import datetime
 import json
 import os
-import sqlite3
 import threading
 import time
 from .deps import fmostore
@@ -111,20 +109,21 @@ def account_for(ip):
     return "addr:" + ip
 
 
-def _default_accounts_db():
-    """Same resolution trick as _default_store: services/ is bind-mounted at
-    /app in the container, so `_HERE/../data` is pol-server/data on the host
-    and /data in prod -- which is where docker-compose.prod.yml puts
-    accounts.db (POL_ACCOUNTS_DB: /data/accounts.db) for every other service."""
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        os.pardir, "data", "accounts.db")
+#: FMO_MEMBER_LOOKUP=0 disables member keying entirely (the store falls back to
+#: the 0x0321 identity -- the pre-2026-08-24 behaviour, one shared roster per
+#: server). The lookup reads OpenLobby's account database (POL_DATABASE_URL)
+#: through `accounts`; there is no file path to configure.
+MEMBER_LOOKUP = os.environ.get("FMO_MEMBER_LOOKUP", "1").strip().lower() not in (
+    "", "0", "off", "no", "false")
 
 
-#: Empty disables member keying entirely (store falls back to the 0x0321
-#: identity -- the pre-2026-08-24 behaviour, one shared roster per server).
-ACCOUNTS_DB = os.environ.get(
-    "FMO_ACCOUNTS_DB",
-    os.environ.get("POL_ACCOUNTS_DB", _default_accounts_db()))
+def accounts_conn():
+    """(accounts module, a connection) to the stack's account database.
+    Raises when OpenLobby's accounts module or the database is unavailable;
+    every caller catches that and logs it."""
+    from .deps import fmodb  # noqa: F401  -- puts OpenLobby's services/ on sys.path
+    import accounts
+    return accounts, accounts.connect()
 
 #: How far back a POL session row still names the member at this address. The
 #: FMO launch always follows a POL login from the same box, so the freshest
@@ -150,24 +149,19 @@ def member_for_ip(ip):
     if pinned:
         return pinned, (f"FMO_ACCOUNT_PIN ({ip} is pinned to {pinned}; the "
                         f"freshest-POL-session lookup was NOT consulted)")
-    if not ACCOUNTS_DB:
+    if not MEMBER_LOOKUP:
         return None
-    cutoff = (datetime.datetime.now(datetime.timezone.utc)
-              - datetime.timedelta(seconds=MEMBER_WINDOW))
     try:
-        db = sqlite3.connect(ACCOUNTS_DB, timeout=2)
+        acc, db = accounts_conn()
         try:
-            rows = db.execute(
-                "SELECT member_id, nick, created_at FROM session"
-                " WHERE peer_ip = ? AND created_at >= ?"
-                " ORDER BY created_at DESC LIMIT 8",
-                (ip, cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))).fetchall()
+            # freshest first: (member_id, nick, created_at)
+            rows = acc.sessions_by_ip(db, ip, MEMBER_WINDOW, limit=8)
         finally:
             db.close()
     except Exception as e:
-        log(f"WARNING: POL member lookup for {ip} failed ({e!r}; accounts.db at "
-            f"{ACCOUNTS_DB}) -- falling back to the 0x0321 identity, which "
-            f"COLLIDES across machines against our K=0 login")
+        log(f"WARNING: POL member lookup for {ip} failed ({e!r}) -- falling back "
+            f"to the 0x0321 identity, which COLLIDES across machines against "
+            f"our K=0 login")
         return None
     if not rows:
         return None

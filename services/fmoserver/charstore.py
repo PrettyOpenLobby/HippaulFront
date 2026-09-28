@@ -69,8 +69,8 @@ NAME_TAKEN_CODE = 0xC43B
 # identity, and a store keyed by it is one roster shared by every machine.
 #
 # So the store keys by POL MEMBER instead: authsess writes a session row
-# (member_id, nick, peer_ip, created_at) to accounts.db on every POL sign-in,
-# this container mounts the same /data, and an FMO launch can only follow a POL
+# (member_id, nick, peer_ip, created_at) to the account database on every POL
+# sign-in (accounts.sessions_by_ip reads it back), and an FMO launch can only follow a POL
 # login from the same box -- so the freshest session row for this address names
 # the member (member_for_ip below). The 0x0321 identity survives only as the
 # fallback when no session row is found, and "addr:<ip>" after that.

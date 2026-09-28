@@ -110,7 +110,7 @@ SQUADRON_INSIGNIA = _env_int("FMO_SQUADRON_INSIGNIA", 1)
 #: is the tell that it is a time_t and not an id.
 SQ_FORMED = 0x0C                       # u32  Unix time -> "Formed on"
 #: Override the formed-on date (Unix seconds). -1 = use the group's own
-#: creation time from accounts.db, which is the earliest `group_member` row
+#: creation time from the account database, the earliest `group_member` row
 #: for that group -- the owner's, i.e. when the group was made.
 SQUADRON_FORMED = _env_int("FMO_SQUADRON_FORMED", -1)
 SQ_MY_SLOT = SQ_SLOTS * SQ_SLOT_LEN    # 0x40, s32 -> 0x613C1591; negative = none
@@ -125,7 +125,7 @@ SERVE_SQUADRON = _env_int("FMO_SQUADRON", 0)
 #: match or `0x611BA1E0` drops the row from the Squadron List and `0x611BBD40`
 #: declines to auto-activate -- so an override is a probe, not a setting.
 SQUADRON_NATION = _env_int("FMO_SQUADRON_NATION", -1)
-#: PROBE: treat THESE POL group ids as squadrons instead of asking accounts.db
+#: PROBE: treat THESE POL group ids as squadrons instead of asking the accounts
 #: which groups this member is in. Comma-separated. Only for a box where the
 #: group lookup cannot run -- an id listed here is annotated for EVERY member,
 #: which is wrong for anyone not actually in that group.
@@ -274,8 +274,8 @@ def reply_01ad(req=b"", groups=(), char=None):
     client that a code address is a squadron of its nation.
 
     So a slot is annotated **only when its id is a POL group this member is
-    actually in** (`Session.pol_groups`, straight out of accounts.db's
-    `group_member`). That is authoritative rather than heuristic, and litter
+    actually in** (`Session.pol_groups`, straight out of the account
+    database's `group_member`, through accounts.member_groups). That is authoritative rather than heuristic, and litter
     cannot pass it except by colliding with a real group id -- in which case
     the id was real anyway. `groups` empty = annotate nothing."""
     if FILL_01AD or FIELDS_01AD:
@@ -302,8 +302,8 @@ def reply_01ad(req=b"", groups=(), char=None):
     if SQUADRON_NATION >= 0:
         nation, nation_src = SQUADRON_NATION, "FMO_SQUADRON_NATION (a PROBE)"
     known = set(SQUADRON_GROUPS) if SQUADRON_GROUPS else set(groups)
-    where = ("FMO_SQUADRON_GROUPS (a PROBE -- accounts.db was NOT consulted)"
-             if SQUADRON_GROUPS else "accounts.db group_member")
+    where = ("FMO_SQUADRON_GROUPS (a PROBE -- the accounts were NOT consulted)"
+             if SQUADRON_GROUPS else "accounts.member_groups")
 
     def formed_for(gid):
         """The "Formed on" Unix time for one group. The knob wins; otherwise

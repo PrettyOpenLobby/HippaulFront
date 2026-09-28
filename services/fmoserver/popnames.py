@@ -34,7 +34,7 @@ def pop_names_for(host_ip):
 
     `account_for` now falls through to a fresh POL-member lookup when the
     login-time carry has aged out (IDENTITY_TTL), so a re-pop long after login
-    still names the right roster as long as accounts.db has the session row.
+    still names the right roster as long as the account database has the session row.
     A remaining fallback to the placeholders is logged by the caller via the
     returned `source` so a wrong name on screen is attributable from the log
     alone."""
