@@ -8,7 +8,7 @@ built from the pilot database (fmostore.py) the game writes.
 Loaded with POL_TITLES=fmotitle in the core's login and authsess services;
 see docker-compose.title.yml. The pilots are in the stack's PostgreSQL
 database (POL_DATABASE_URL, which those services already have), in the game's
-own fmo_ tables; the first read applies CrystalFront's migrations if the game
+own fmo_ tables; the first read applies HippaulFront's migrations if the game
 service has not yet (fmodb.py).
 """
 import struct

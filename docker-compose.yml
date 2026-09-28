@@ -26,7 +26,7 @@
 # fmo owns the image build; the optional services consume it with
 # pull_policy: never so parallel builds cannot race on the tag.
 x-fmo: &fmo
-  image: crystalfront:latest
+  image: hippaulfront:latest
   pull_policy: never
   restart: unless-stopped
   environment: &fmoenv
@@ -34,7 +34,7 @@ x-fmo: &fmo
     POL_LOG_DIR: /logs
     PYTHONUNBUFFERED: "1"
     # PostgreSQL and Valkey, OpenLobby's services (its docs/database.md).
-    # The game's tables are CrystalFront's own migrations (fmo_*), applied
+    # The game's tables are HippaulFront's own migrations (fmo_*), applied
     # by the service at start.
     POL_DATABASE_URL: "postgresql://openlobby:${POL_DB_PASSWORD:-openlobby}@postgres:5432/openlobby"
     POL_VALKEY_URL: "valkey://valkey:6379/0"
@@ -57,7 +57,7 @@ services:
   fmo:
     <<: *fmo
     build:
-      context: ../crystalfront/services
+      context: ../hippaulfront/services
       args:
         OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
     pull_policy: build

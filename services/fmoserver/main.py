@@ -42,7 +42,7 @@ def run():
         log(f"WARNING: character store OFF (FMO_CHAR_STORE empty): every character "
             f"the client creates is acknowledged and DISCARDED, and 0x012F "
             f"serves {charlist.LIST_COUNT} synthetic entr(y/ies)")
-    # THE DATABASE: apply CrystalFront's migrations (the fmo_* tables) before
+    # THE DATABASE: apply HippaulFront's migrations (the fmo_* tables) before
     # the first login, then let the character store make its first use (the
     # one-shot JSON import, and the log line saying where the pilots are),
     # load the sector-win ledger a restart must not lose, and load the war
@@ -56,7 +56,7 @@ def run():
         db_ok = True
         try:
             fmodb.ready()
-            log("database: CrystalFront's migrations applied (the fmo_* tables)")
+            log("database: HippaulFront's migrations applied (the fmo_* tables)")
         except fmodb.ERRORS as e:
             db_ok = False
             log(f"WARNING: database unusable at start ({e!r}) -- every store "

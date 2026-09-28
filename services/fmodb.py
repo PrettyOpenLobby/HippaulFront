@@ -5,7 +5,7 @@ live in the database the OpenLobby core runs (POL_DATABASE_URL), in tables
 whose names start with `fmo_`. Their schema is this repository's own set of
 migrations, `services/fmo_migrations/`, applied with OpenLobby's runner
 (polcore.db.migrate). Versions 2001-2999 of the shared schema_migrations
-table belong to CrystalFront; OpenLobby and the other titles number theirs
+table belong to HippaulFront; OpenLobby and the other titles number theirs
 in their own ranges, so the sets never collide.
 
 polcore comes with the OpenLobby image this service is built on. Outside the
@@ -108,7 +108,7 @@ def migration_files():
     lo, hi = VERSION_RANGE
     bad = [name for version, name, _ in files if not lo <= version <= hi]
     if bad:
-        raise db.MigrationError(f"{', '.join(bad)}: CrystalFront's migrations "
+        raise db.MigrationError(f"{', '.join(bad)}: HippaulFront's migrations "
                                 f"are numbered {lo}-{hi}")
     return files
 
@@ -461,7 +461,7 @@ def import_war(path, merge=False, dry_run=False, out=print):
         ready()
     status, added, differs = None, [], []
     try:
-        with db.transaction(lock="crystalfront.import") as conn:
+        with db.transaction(lock="hippaulfront.import") as conn:
             exists = conn.execute("SELECT to_regclass('fmo_war') IS NOT NULL AS ok"
                                   ).fetchone()["ok"]
             if not exists and not dry_run:
@@ -553,7 +553,7 @@ def import_source(store, path, merge=False, dry_run=False, out=print):
         ready()
     status = None
     try:
-        with db.transaction(lock="crystalfront.import") as conn:
+        with db.transaction(lock="hippaulfront.import") as conn:
             for p in plans:
                 p.exists = conn.execute("SELECT to_regclass(%s) IS NOT NULL AS ok",
                                         (p.table,)).fetchone()["ok"]
@@ -649,7 +649,7 @@ def _main(argv):
         return _import_main(argv[1:])
     import argparse
     ap = argparse.ArgumentParser(prog="python fmodb.py",
-                                 description="CrystalFront's migrations "
+                                 description="HippaulFront's migrations "
                                  "(uses POL_DATABASE_URL).")
     ap.add_argument("cmd", choices=("migrate", "status"))
     args = ap.parse_args(argv)

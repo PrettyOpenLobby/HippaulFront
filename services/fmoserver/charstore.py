@@ -163,7 +163,7 @@ CHAR_STORE = os.environ.get("FMO_CHAR_STORE", _default_store())
 
 #: KEY: THE PLAYER DATABASE (2026-09-08) -- see fmostore.py for what moved into it.
 #: Since 2026-09 it is the stack's PostgreSQL database (POL_DATABASE_URL), in
-#: CrystalFront's own `fmo_` tables; before that it was the SQLite file fmo.db.
+#: HippaulFront's own `fmo_` tables; before that it was the SQLite file fmo.db.
 #:
 #: `FMO_DB` is the switch: empty or 0 keeps using the JSON store, which is the
 #: state every measurement before 2026-09-08 ran against. Any other value (the

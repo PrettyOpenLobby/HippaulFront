@@ -13,14 +13,14 @@
 
 services:
   fmo:
-    image: ghcr.io/prettyopenlobby/crystalfront:${CRYSTALFRONT_TAG:-latest}
+    image: ghcr.io/prettyopenlobby/hippaulfront:${HIPPAULFRONT_TAG:-${CRYSTALFRONT_TAG:-latest}}
     pull_policy: missing
     build: !reset null
     volumes:
-      - ../crystalfront/services/fmodata:/app/fmodata:ro
+      - ../hippaulfront/services/fmodata:/app/fmodata:ro
   board:
-    image: ghcr.io/prettyopenlobby/crystalfront:${CRYSTALFRONT_TAG:-latest}
+    image: ghcr.io/prettyopenlobby/hippaulfront:${HIPPAULFRONT_TAG:-${CRYSTALFRONT_TAG:-latest}}
     pull_policy: missing
     volumes:
-      - ../crystalfront/services/fmodata:/app/fmodata:ro
-      - ../crystalfront/services/boardart/fmo:/app/boardart/fmo:ro
+      - ../hippaulfront/services/fmodata:/app/fmodata:ro
+      - ../hippaulfront/services/boardart/fmo:/app/boardart/fmo:ro

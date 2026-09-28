@@ -23,9 +23,9 @@
 
 services:
   login:
-    image: crystalfront-title:latest
+    image: hippaulfront-title:latest
     build:
-      context: ../crystalfront
+      context: ../hippaulfront
       dockerfile: Dockerfile.title
       args:
         OPENLOBBY_IMAGE: "${OPENLOBBY_IMAGE:-openlobby:latest}"
@@ -34,7 +34,7 @@ services:
       POL_TITLES: "${POL_TITLES:-fmotitle}"
 
   authsess:
-    image: crystalfront-title:latest
+    image: hippaulfront-title:latest
     pull_policy: never
     environment:
       POL_TITLES: "${POL_TITLES:-fmotitle}"

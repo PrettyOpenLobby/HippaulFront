@@ -1,6 +1,6 @@
-# Contributing to CrystalFront
+# Contributing to HippaulFront
 
-CrystalFront is the Front Mission Online server that plugs into OpenLobby,
+HippaulFront is the Front Mission Online server that plugs into OpenLobby,
 the PlayOnline core. This page says where things are, how to run the checks,
 and what a pull request needs.
 
@@ -19,7 +19,7 @@ services/
   fmostore.py     the player database (fmo_character and fmo_squadron_insignia
                   in PostgreSQL, or JSON when FMO_DB is 0)
   fmodb.py        reaches the core's polcore; migrate, status and import
-  fmo_migrations/ CrystalFront's migrations, numbered from 2001
+  fmo_migrations/ HippaulFront's migrations, numbered from 2001
   fmolayout.py    the lobby NPC layout file and the floor-plan geometry
   fmodevtool.py   the lobby NPC editor page, served by fedevtool.py
   fmotitle.py     the title plugin the core loads for the Viewer's profile
@@ -154,7 +154,7 @@ such as the lobby NPC layout.
 A schema change is a new file in `services/fmo_migrations/` with the next
 number. A shipped migration is never edited. The core's `schema_migrations`
 table is keyed by the number alone and shared with the core and the other
-titles, so CrystalFront keeps to 2001-2999 and a table name that starts
+titles, so HippaulFront keeps to 2001-2999 and a table name that starts
 with `fmo_`; a reused number is silently skipped.
 
 Moving a file into the database comes with an importer in `fmodb.py`
