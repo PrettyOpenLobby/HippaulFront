@@ -23,7 +23,6 @@ services/
   boardfmo.py     the City Control board, hosted by polboards.py
 tools/            self-tests (`*_test.py`, `fmo_run_all.py`), the data build
                   (`fmodata_build.py`) and the cipher tables
-tools/split/      the generator and name map that cut fmo.py into fmoserver/
 ```
 
 `fmoserver/` is split along the protocol: one module per lobby message
@@ -91,34 +90,28 @@ every patch the tools and the selftest make, and runs with the other suites.
 `fmoserver/__init__.py` imports every module in one fixed order. A module
 imports at its top only the modules it reads while it is being imported (a
 constant built from another module's constant); the ones it only calls at
-run time are imported at its end. `tools/split/split_fmo.py` derives the
-order and refuses to write a package in which a module would read another
-before that one has run. If you add a module-level constant that reads
-another module, run the generator's check (below) or import the package once
-(`python -c "import fmo"` from `services/`) to see that the order still
-holds.
+run time are imported at its end. If you add a module-level constant that
+reads another module, import the package once (`python -c "import fmo"` from
+`services/`) to see that the order still holds.
 
-### tools/split
+### Changing the package
 
-The package was generated from the single-file `fmo.py` of commit 48067ab
-by `tools/split/split_fmo.py`, with `tools/split/split_fmo_map.txt` naming
-the module that owns each top-level name. The split is deterministic, so
-work written against the single file (older branches, changes still being
-ported from the private deployment) is merged into that file and the
-package regenerated:
+The package was generated once from the single-file `fmo.py` of commit
+48067ab, in commit cec8ab1. It is the source now and is edited directly;
+nothing regenerates it. Work written against the single file (an older
+branch, or a change still being ported from the private deployment) is
+carried over by hand into the module that owns that code today.
 
-```
-git show 48067ab:services/fmo.py > fmo_flat.py     # then merge the change into it
-python tools/split/split_fmo.py --src fmo_flat.py --map tools/split/split_fmo_map.txt \
-    --package fmoserver --title "The Front Mission Online world server" --check
-python tools/split/split_fmo.py --src fmo_flat.py --map tools/split/split_fmo_map.txt \
-    --package fmoserver --title "The Front Mission Online world server" \
-    --out services/fmoserver --facade services/fmo.py
-```
-
-A new top-level name goes into the map under the module that should own
-it; the tool lists any name the map does not place and refuses to write
-until it does.
+`fmo.py` stays as the entry point and as the facade described above. It
+forwards only the names listed in its `_OWNERS` table, each mapped to the
+module that owns it, so a new top-level name is not reachable as `fmo.NAME`
+until it has a line there. Code inside the package does not need one,
+because it reaches the name as `module.NAME`. A tool or test that reads or
+patches the name through `fmo`, or a selftest patch through `flat_globals()`,
+does: without the line a read raises AttributeError and a write stays on the
+facade, where nothing reads it. `tools/facade_rebind_check.py` lists such a
+write as a note and does not fail on it. A new module goes into the import
+list in `fmoserver/__init__.py` and into `_MODULES` in `fmo.py`.
 
 ## Running the checks
 

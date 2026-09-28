@@ -134,7 +134,8 @@ fmo.py (one directory up) is the entry point and the compatibility
 facade over these modules.
 """
 # Every module, in the order that lets each one read another's constants
-# while it is imported (tools/split/split_fmo.py derives and checks it).
+# while it is imported. Importing the package is the check: an order that
+# no longer holds fails there.
 from . import (
     defaults, deps, knobs, wirelog, popself, popsweep, packet, handshake, addressing, charlist,
     charstore, identity, charselect, resume, status, classes, ranks, economy, servicerecord,
