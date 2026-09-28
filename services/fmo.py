@@ -7556,6 +7556,10 @@ BATTLE_GROUPS = {}
 #: every group handed out by a 0x0158: (peer, GroupID, leader, when). GroupIDs
 #: count from 1 per process; they are what the client's FmoGroup logs in with.
 BATTLE_GROUPS_MADE = []
+#: {GroupID: account key} of the pilot who CREATED it -- the leader test by
+#: ACCOUNT, since two pilots behind one router share the host that
+#: BATTLE_GROUPS_MADE records (both read as leader, live 2026-09-27).
+GROUP_CREATOR_ACCOUNT = {}
 #: THE IN-GROUP OPERATIONS -- seven small classes, each {send, poll}, sent from
 #: the battle-group window. All but one want a bare message 1 on their own seq.
 #:
@@ -12824,6 +12828,21 @@ class Session:
                 f"{GROUP_OP_NAMES.get(p['msg'], 'a GROUP request')} ({len(_b)}B, "
                 f"u32[0]={_gid} = GroupID?, bytes {_b[:16].hex(' ')}) -> message 1 "
                 f"on its seq (the object's poll wants word[+6] == 1).")
+            if p["msg"] == 0x0173 and len(_b) >= 8:
+                # KEY: THE SORTIE SETTING (sender 0x6116CFF0): +0x04 1 = Ready,
+                # 2 = Standing By; +0x07 1 = Continue, 2 = Do not continue;
+                # 0 = unchanged. The client SHOWS it from its own member blob
+                # (+0x54 bit 1 / bit 8), so it only changes once a cmd 191
+                # rewrites that blob -- sent here to every member's channel.
+                _old = GROUP_READY.get(self.account, (0, 0))
+                _rd = _b[4] or _old[0]
+                _ct = _b[7] or _old[1]
+                GROUP_READY[self.account] = (_rd, _ct)
+                _nq = group_push_flags(self.account)
+                log(f"{self.peer}   SORTIE SETTING: {self.account} is "
+                    f"{'READY' if _rd == 1 else 'STANDING BY' if _rd == 2 else 'unset'}"
+                    f", continuation {'on' if _ct == 1 else 'off' if _ct == 2 else 'unset'} "
+                    f"-> cmd 191 queued on {_nq} group channel(s)")
             return [build(MSG_SESSION_START, b"", p["seq"], p["conn"])]
 
         if p["msg"] == MSG_GROUP_COMMENT_REQ:
@@ -12964,6 +12983,17 @@ class Session:
             # sortie, and a marked run must not drag the player into a battle.
             _j[S158_ON_SORTIE] = 0
             struct.pack_into("<I", _j, S158_SECTOR, JOIN_SECTOR & 0xFFFFFFFF)
+            # KEY: THE PLAYER LIST: u32 count at
+            # +0x80, 0x40-byte rows from +0x84. Zeros drew "[NO PLAYER]"
+            # (10:48) -- the rows are the group's members, joiner included.
+            group_join(_gid, self.account)
+            queue_group_entry(self.ip, self.account)   # its group channel claims it
+            if not GROUP_BOARD_MARK:
+                _pn, _prows = group_player_rows(_gid)
+                struct.pack_into("<I", _j, S158_PLAYERS_N, _pn)
+                _j[S158_PLAYERS:S158_PLAYERS + len(_prows)] = _prows
+                log(f"{self.peer}   0x0158 Player List: {_pn} member(s) of group "
+                    f"{_gid} at +0x80/+0x84 -> {GROUP_MEMBERS.get(_gid)}")
             log(f"{self.peer}   0x{MSG_0157_REQ:04X} = JOIN BATTLE GROUP "
                 f"({len(_b)}B): GroupID {_gid} at payload+0x00 (the board "
                 f"window's +0x19A). -> 0x{MSG_0158_REPLY:04X}, "
@@ -12980,7 +13010,11 @@ class Session:
             # carries no LoginGroup entry. 0x0174 is the push that does it.
             if GROUP_ATTACH and _gid:
                 try:
-                    outs.append(group_attach_packet(p["conn"], _gid))
+                    # host_for: a GROUP_HOST on a private network is unreachable
+                    # for an internet client, which then never sends a single
+                    # group datagram, so its member list stays empty.
+                    outs.append(group_attach_packet(
+                        p["conn"], _gid, host=host_for(GROUP_HOST, self.ip)))
                     log(f"{self.peer}   -> 0x{MSG_GROUP_ATTACH:04X} GROUP "
                         f"ATTACH push, {G174_BODY_LEN}B on queue seq "
                         f"0x{QUEUE_SEQ:08X}: GroupID {_gid}, type {GROUP_TYPE}, "
@@ -13065,7 +13099,11 @@ class Session:
             # unidentified structure 0x0153 carries at +0x124; zeros, like there.
             _gid = len(BATTLE_GROUPS_MADE) + 1
             BATTLE_GROUPS_MADE.append((self.peer, _gid, _leader, time.time()))
-            _entry = group_entry(_gid, GROUP_HOST, GROUP_PORT, 1)
+            GROUP_CREATOR_ACCOUNT[_gid] = self.account
+            group_join(_gid, self.account)
+            queue_group_entry(self.ip, self.account)   # its group channel claims it
+            _entry = group_entry(_gid, host_for(GROUP_HOST, self.ip),
+                                 GROUP_PORT, 1)
             log(f"{self.peer}   -> 0x0158, {len(_entry)}B = a LoginGroup entry: "
                 f"GroupID={_gid} Type=1 endpoint {GROUP_HOST}:{GROUP_PORT} (FMO_GROUP_HOST/"
                 f"_PORT), block88 zeros. The client now tears down [0x613CA3F8] and "
@@ -13087,10 +13125,21 @@ class Session:
                 log(f"{self.peer}   -> message 2 (id != 0x163): UI event 0x10D2, "
                     f"word[+8] = the code.")
                 return [build(2, b"", p["seq"], p["conn"])]
-            log(f"{self.peer}   -> 0x0163, EMPTY, on the client's seq: the poller "
-                f"posts 0x10D1 (training sector accepted). Whatever the client sends "
-                f"next is the training door's real protocol.")
-            return [build(MSG_0163_REPLY, b"", p["seq"], p["conn"])]
+            # KEY: CORRECTED 2026-09-27: 0x0162 is the
+            # board's GET BATTLE GROUP INFO (row select 0x611812A0, payload+0x00
+            # = the GroupID), not a training sector. 0x0163 feeds the Player
+            # List ("[NO PLAYER]" when empty -- the creator's and a pre-join
+            # viewer's), the Battle Map panel and the on-sortie flag that
+            # offers 9:10. The client re-asks on every row click.
+            _qg = struct.unpack_from("<I", _b, 0)[0] if len(_b) >= 4 else 0
+            _gid = _qg or GROUP_OF.get(self.account) or 0
+            _body = reply_0163(_gid)
+            log(f"{self.peer}   -> 0x0163 GROUP INFO for group {_gid}: "
+                f"{struct.unpack_from('<I', _body, S158_PLAYERS_N)[0]} member(s) "
+                f"{GROUP_MEMBERS.get(_gid)}"
+                + (f", ON A SORTIE to map {GROUP_SORTIE[_gid]['map']} (9:10 offers "
+                   f"to follow)" if _body[S163_ON_SORTIE] else ", not on a sortie"))
+            return [build(MSG_0163_REPLY, _body, p["seq"], p["conn"])]
 
         if p["msg"] == MSG_01F4_REQ:
             # KEY: 0x01F4 -> 0x01F5: the war-map window's BATTLE MAP LIST (see
@@ -14411,6 +14460,16 @@ class Session:
             # RESUME, or the war map never opened) this is FMO_SORTIE_MAPNO,
             # exactly as every sortie before 2026-09-08.
             _mn = str(self.sector[2]) if self.sector else None
+            # KEY: A GROUP FOLLOWER (the 9:10 YES) never opened the war map: its
+            # 0x0139 +0x00 is the map our 0x0163 offered. Live 2026-09-27 a follower
+            # asked for 267 and was sent FMO_SORTIE_MAPNO's 418 -- two maps.
+            _gs = GROUP_SORTIE.get(GROUP_OF.get(self.account))
+            if _gs and q.get("id") and q["id"] == _gs.get("map"):
+                if _mn != str(_gs["map"]):
+                    log(f"{self.peer}   sortie map {_gs['map']} = the battle "
+                        f"group's (followed via 9:10), not "
+                        f"{_mn or 'FMO_SORTIE_MAPNO'}")
+                _mn = str(_gs["map"])
             _side = nation_for_session(self.playing_char() if CHAR_STORE
                                        else None, STATUS_NATION,
                                        "FMO_STATUS_NATION")[0]
@@ -14444,6 +14503,35 @@ class Session:
         for label, off, raw, src in fields:
             log(f"{self.peer}      {label} payload+0x{off:03X} = "
                 f"{raw.hex() if raw else '(zero)'}  source: {src}")
+        # KEY: A GROUP SORTIE (bgflag): remember where the group went, so the
+        # other members' 0x0163 carries the on-sortie flag + map and their
+        # client offers 9:10 "The battle group is on a sortie" -- whose YES
+        # sends a 0x0139 for that same map.
+        # WARNING: _mn is the STRING sortie_mapno() takes; the row wants the int
+        # (live 22:20Z: a str & int here closed the leader's connection).
+        # Bookkeeping only, so it must never cost the player the sortie.
+        if body is not None:
+            try:
+                SORTIE_MAP[self.battle_key()] = int(sortie_mapno(_mn)[0])
+            except Exception:
+                pass
+        _gid = GROUP_OF.get(self.account)
+        if q.get("bgflag") and _gid:
+            try:
+                _map = int(sortie_mapno(_mn)[0])
+                _tile = int(self.sector[0]) if self.sector else 0
+                _zone = int(getattr(self, "sector_zone", None) or 0)
+                GROUP_SORTIE[_gid] = {
+                    "map": _map,
+                    "sector": (_zone * 1_000_000 + _tile) & 0xFFFFFFFF,
+                    "row": (warmap_rows([_map]) or [b""])[0],
+                    "at": time.time(), "by": self.account}
+                log(f"{self.peer}   GROUP SORTIE: group {_gid} is on a sortie "
+                    f"to map {_map} (sector {GROUP_SORTIE[_gid]['sector']}) -- "
+                    f"the other members' 0x0163 now offers them 9:10 to follow")
+            except Exception as e:
+                log(f"{self.peer}   WARNING: GROUP SORTIE not recorded ({e!r}); the "
+                    f"sortie itself goes ahead")
         log(f"{self.peer}   WARNING: THIS ENTERS SCENE 4: 0x61006270 sets "
             f"[globals+0x1D0]=4; 0x61004C30 then registers type-1 id "
             f"{next(struct.unpack_from('<I', r)[0] for l, _o, r, _s in fields if l == 'MapNo')} "
@@ -16861,7 +16949,16 @@ def scene_reply_hid(chan):
     if UDP_HID_ECHO and chan.key and chan.key.endswith(b"battle"):
         return UDP_HID_BATTLE
     if UDP_HID_ECHO and chan.key and chan.key.endswith(b"group"):
-        return UDP_HID_GROUP
+        # KEY: The group manager's id FOLLOWS THE GROUP'S TYPE, and the client
+        # stamps it on its own datagrams as `kind` (live 2026-09-27): the
+        # CREATOR (0x0158 entry type 1) sends kind 1 and took hid 1 at once;
+        # the JOINER (0x0174 attach type 0) sends kind 5, never acked a hid-1
+        # reply, looped every 5 s and crashed ~37 s after joining -- twice.
+        # Lobby (kind 2 / hid 2) and battle (kind 0 / hid 0) already pair the
+        # same way. Answer on the kind the channel sends; UDP_HID_GROUP only
+        # until its first datagram is read.
+        k = getattr(chan, "group_kind", None)
+        return UDP_HID_GROUP if k is None else k
     return UDP_HID
 #: The character ids to try when deriving the key. The key needs the id the
 #: client SELECTED, which it never tells us over TCP -- but a wrong key fails
@@ -19707,12 +19804,247 @@ GROUP_LEADER_MODE = os.environ.get("FMO_UDP_GROUP_LEADER", "auto").strip() or "a
 GROUP_POP_LEADER = 1 if GROUP_LEADER_MODE == "auto" else int(GROUP_LEADER_MODE, 0)
 
 
+#: KEY: WHO IS IN WHICH BATTLE GROUP, by ACCOUNT.
+#: {GroupID: [account, ...]} in join order, and the reverse. Filled by 0x0156
+#: CREATE and 0x0157 JOIN; the group channels and the 0x0158 player rows read it.
+GROUP_MEMBERS = {}
+GROUP_OF = {}
+#: Offsets of the group peer ctor inside a cmd 190 body (0x611E4870): NOT the
+#: world POP's -- key +0x0C, tag +0x3F, port +0x40 (u16), IPv4 +0x44.
+G190_MODE, G190_GATE, G190_KEY = 0x04, 0x08, 0x0C
+G190_TAG, G190_PORT, G190_IP = 0x3F, 0x40, 0x44
+G190_VOICE = 0x58            # bit 0 = voice ON for this member (the send gate)
+G190_STATUS_BIT0 = 0x01      # +0x54 bit 0: a 191 drops a member without it
+#: The 0x0158 JOIN reply's Player List: u32 count at +0x80, 0x40-byte rows from
+#: +0x84 (0x61181ABC). Row: name1 +0x00, name2 +0x11, nation +0x22 (must equal
+#: the VIEWER's nation or "[NO PLAYER]", systext 10:48, is drawn).
+S158_PLAYERS_N, S158_PLAYERS, S158_ROW_LEN = 0x80, 0x84, 0x40
+S158_ROW_NATION = 0x22
+
+
+#: {host: [(account, monotonic)]} -- a 0x0156 CREATE / 0x0157 JOIN is followed
+#: seconds later by a NEW group channel from that host; it claims the oldest.
+_group_entries = {}
+
+
+def queue_group_entry(host, account):
+    if not account:
+        return
+    now = time.monotonic()
+    with _world_entries_lock:
+        q = [e for e in _group_entries.get(host, [])
+             if now - e[1] <= WORLD_ENTRY_TTL and e[0] != account]
+        q.append((account, now))
+        _group_entries[host] = q
+
+
+def claim_group_entry(host):
+    now = time.monotonic()
+    with _world_entries_lock:
+        q = [e for e in _group_entries.get(host, [])
+             if now - e[1] <= WORLD_ENTRY_TTL]
+        got = q.pop(0)[0] if q else None
+        _group_entries[host] = q
+    return got
+
+
+#: {GroupID: {"map", "sector", "row", "at", "by"}} -- set when a member sorties
+#: with the group flag; the other members' 0x0163 carries it (see reply_0163).
+GROUP_SORTIE = {}
+#: {account: (ready, cont)} from 0x0173 CHANGE SORTIE SETTING (+0x04 1 = Ready,
+#: 2 = Standing By; +0x07 1 = Continue, 2 = Do not continue; 0 = unchanged).
+GROUP_READY = {}
+G191_BLOB_FROM = 0x4C       # cmd 191 copies body+0x08.. to blob+0x4C..
+G_FLAG_LISTED, G_FLAG_READY, G_FLAG_CONT = 0x01, 0x02, 0x100
+#: 0x0163 (the board's GROUP INFO reply, requested by 0x0162 on a row click):
+S163_ON_SORTIE, S163_SECTOR, S163_MAPROW = 0x00, 0x10, 0x14
+REPLY_0163_LEN = 0x668
+
+
+def reply_0163(gid):
+    """The 0x0163 body for group `gid`: its members at +0x80/+0x84 (the
+    board's Player List, for creator, joiner and a pre-join viewer alike) and,
+    if it has sortied, the on-sortie flag + sector + map row, which makes the
+    client offer 9:10 and sortie to that map on YES."""
+    b = bytearray(REPLY_0163_LEN)
+    n, rows = group_player_rows(gid)
+    struct.pack_into("<I", b, S158_PLAYERS_N, n)
+    b[S158_PLAYERS:S158_PLAYERS + len(rows)] = rows
+    so = GROUP_SORTIE.get(gid)
+    if so and time.time() - so["at"] < max(MISSION_TIME, 600):
+        b[S163_ON_SORTIE] = 1
+        struct.pack_into("<I", b, S163_SECTOR, so["sector"])
+        row = so["row"][:0x6C]
+        b[S163_MAPROW:S163_MAPROW + len(row)] = row
+    return bytes(b)
+
+
+def group_member_flags(account, gid):
+    """+0x54 of `account`'s member blob: listed, plus ready / continue."""
+    flags = G_FLAG_LISTED
+    ready, cont = GROUP_READY.get(account, (0, 0))
+    if ready == 1 or GROUP_CREATOR_ACCOUNT.get(gid) == account:
+        flags |= G_FLAG_READY
+    if cont == 1:
+        flags |= G_FLAG_CONT
+    return flags
+
+
+def group_blob_update(uid, leader, flags, voice=True):
+    """A cmd 191 for member `uid`: the blob from +0x4C onward, full length (the
+    handler copies body+0x08.. to blob+0x4C.., so a short body would copy
+    whatever follows it). +0x54 bit 0 must stay set or the member is dropped."""
+    tail = bytearray(0x1C8 - G191_BLOB_FROM)
+    struct.pack_into("<I", tail, GROUP_POP_LEADER_OFF - G191_BLOB_FROM, 1 if leader else 0)
+    struct.pack_into("<I", tail, GROUP_POP_FLAGS_OFF - G191_BLOB_FROM, flags | G_FLAG_LISTED)
+    tail[G190_VOICE - G191_BLOB_FROM] = 1 if voice else 0
+    body = struct.pack("<I", uid & 0xFFFFFFFF) + bytes(4) + bytes(tail)
+    return fmoworld.record(GROUP_BLOB_UPDATE_CMD, body)
+
+
+def group_push_flags(account):
+    """Queue a cmd 191 for `account` on every group channel of its group: its
+    own (self id) and each other member's (the alias they know it by)."""
+    gid = GROUP_OF.get(account)
+    if not gid:
+        return 0
+    leader = GROUP_CREATOR_ACCOUNT.get(gid) == account
+    flags = group_member_flags(account, gid)
+    n = 0
+    gchans = [c for k, c in list(WORLD_PEERS.items())
+              if isinstance(k, tuple) and len(k) == 3 and k[2] == "group"
+              and getattr(c, "account", None) in GROUP_MEMBERS.get(gid, [])]
+    mine = next((c for c in gchans if c.account == account), None)
+    for c in gchans:
+        if c.account == account:
+            uid = getattr(c, "group_uid", None)
+        elif mine is not None:
+            uid = c.alias_of.get(getattr(mine, "peer_key", mine.addr))
+        else:
+            uid = None
+        if not uid:
+            continue
+        c.pending.append(group_blob_update(uid, leader, flags))
+        n += 1
+    return n
+
+
+def group_join(gid, account):
+    """Record `account` as a member of battle group `gid` (and of no other)."""
+    if not gid or not account:
+        return
+    old = GROUP_OF.get(account)
+    if old and old != gid and account in GROUP_MEMBERS.get(old, []):
+        GROUP_MEMBERS[old].remove(account)
+    mem = GROUP_MEMBERS.setdefault(gid, [])
+    if account not in mem:
+        mem.append(account)
+    GROUP_OF[account] = gid
+
+
+def group_member_row(account):
+    """One 0x40-byte Player List row for `account`'s pilot, or None."""
+    roster = load_roster(account) if account else []
+    c = next((c for c in roster if c.get("first")), None)
+    if c is None:
+        return None
+    row = bytearray(S158_ROW_LEN)
+    for off, txt in ((0x00, c.get("first", "")), (0x11, c.get("last", ""))):
+        s = (txt or "").encode("cp932", "replace")[:GROUP_NAME_LEN - 1]
+        row[off:off + len(s)] = s
+    row[S158_ROW_NATION] = (character_nation(c)[0] or 0) & 0xFF
+    return bytes(row)
+
+
+def group_player_rows(gid, limit=20):
+    """(count, rows bytes) for the 0x0158 Player List of group `gid`."""
+    rows = [r for r in (group_member_row(a) for a in GROUP_MEMBERS.get(gid, []))
+            if r][:limit]
+    return len(rows), b"".join(rows)
+
+
+def group_remote_member_record(uid, first, last, leader, key, tag, host, port,
+                               voice=True, flags=None):
+    """A cmd 190 that makes the receiving client CREATE a group peer for
+    another member (0x611E56B0 on an unknown body+0x00): the peer's key, tag
+    and address are ours, like the world peer link; +0x54 bit 0 keeps it
+    listed; +0x58 bit 0 lets that client SEND it voice (cmd 123)."""
+    b = bytearray(0x1C8)
+    struct.pack_into("<I", b, 0x00, uid & 0xFFFFFFFF)
+    struct.pack_into("<I", b, G190_MODE, 0)       # 0 -> mode 0 (others crash)
+    struct.pack_into("<I", b, G190_GATE, 0)       # create
+    k = (key or b"")[:0x0F]
+    b[G190_KEY:G190_KEY + len(k)] = k
+    for off, txt in ((GROUP_POP_NAME1_OFF, first), (GROUP_POP_NAME2_OFF, last)):
+        s = (txt or "").encode("cp932", "replace")[:GROUP_NAME_LEN - 1]
+        b[off:off + len(s)] = s
+    b[G190_TAG] = tag & 0xFF
+    b[G190_PORT:G190_PORT + 2] = int(port).to_bytes(2, "big")
+    b[G190_IP:G190_IP + 4] = socket.inet_aton(host)
+    struct.pack_into("<I", b, GROUP_POP_LEADER_OFF, 1 if leader else 0)
+    struct.pack_into("<I", b, GROUP_POP_FLAGS_OFF,
+                     (flags or 0) | G190_STATUS_BIT0)
+    b[G190_VOICE] = 1 if voice else 0
+    return fmoworld.record(GROUP_POP_CMD, bytes(b))
+
+
+def group_queue(chan):
+    """Introduce every OTHER member of this client's battle group on its group
+    self stream (cmd 190 only works there), once per member, as an alias with
+    a peer link -- so the member list is real and voice has somewhere to go."""
+    if not (PEER_LINK and chan.key == GROUP_KEY and chan.tables
+            and getattr(chan, "group_popped", False)):
+        return 0
+    gid = GROUP_OF.get(getattr(chan, "account", None))
+    if not gid:
+        return 0
+    n = 0
+    for acct in GROUP_MEMBERS.get(gid, []):
+        if acct == chan.account:
+            continue
+        other = next((c for k, c in list(WORLD_PEERS.items())
+                      if isinstance(k, tuple) and len(k) == 3 and k[2] == "group"
+                      and getattr(c, "account", None) == acct), None)
+        if other is None:
+            continue
+        okey = getattr(other, "peer_key", other.addr)
+        alias = chan.alias_for(okey)
+        rs = chan.remotes[alias]
+        if rs.popped:
+            continue
+        row = group_member_row(acct)
+        first = row[0x00:0x11].split(b"\0")[0].decode("cp932", "replace") if row else ""
+        last = row[0x11:0x22].split(b"\0")[0].decode("cp932", "replace") if row else ""
+        host = host_for(GROUP_HOST, chan.addr[0])
+        try:
+            host = socket.gethostbyname(host)
+        except OSError:
+            continue
+        leader = GROUP_CREATOR_ACCOUNT.get(gid) == acct
+        chan.pending.append(group_remote_member_record(
+            alias, first, last, leader, GROUP_KEY, rs.tag, host, GROUP_PORT,
+            flags=group_member_flags(acct, gid)))
+        rs.popped = True
+        n += 1
+        log(f"[udp {chan.addr[0]}:{chan.addr[1]}] VERIFIED: GROUP: member {acct} "
+            f"({first} {last}{', leader' if leader else ''}) introduced as "
+            f"{alias:#x} (tag {rs.tag:#x}) by cmd 190 on the group self stream -- "
+            f"its peer link carries voice (cmd 123)")
+    return n
+
+
 def group_leader_for(host_ip):
     """(leader byte, why) for the member blob this host should receive."""
     if GROUP_LEADER_MODE != "auto":
         return GROUP_POP_LEADER, f"FMO_UDP_GROUP_LEADER={GROUP_LEADER_MODE!r}"
+    # By ACCOUNT when the creator's is known (account_for answers for the
+    # channel being served -- a group channel shares its lobby socket); by host
+    # only for a group recorded without one.
+    me = account_for(host_ip)
     made = [g for g in BATTLE_GROUPS_MADE
-            if str(g[0]).split(":")[0] == host_ip]
+            if (GROUP_CREATOR_ACCOUNT.get(g[1]) == me
+                if GROUP_CREATOR_ACCOUNT.get(g[1])
+                else str(g[0]).split(":")[0] == host_ip)]
     if made:
         return 1, (f"auto: this host created group #{made[-1][1]}, so it is "
                    f"the LEADER -- Change Leader / Kick / Disband / Edit "
@@ -19822,6 +20154,10 @@ def reset_world_channel(host, why, mapno=None, mapkind=None, place=None,
     return len(live)
 
 
+#: battle_key -> the MapNo its last served sortie (0x013A) sent it to.
+SORTIE_MAP = {}
+
+
 def room_mates(chan):
     """The other live channels standing in the same zone as `chan`.
 
@@ -19841,11 +20177,28 @@ def room_mates(chan):
             continue
         if other.left or now - other.seen_at > ROOM_TTL:
             continue
-        if ROOM_SAME_MAP and WORLD_MAPS.get(a[0]) != mine:
+        # WARNING: SAME SCENE KIND. A battle channel and a lobby channel share the
+        # lobby's map/zone (battle rooms are grouped by the lobby the pilots
+        # sortied from), so without this a lobby HUMAN was popped into a battle
+        # scene -- live 2026-09-27 19:10: Lex sortied, Ned stood in the same
+        # O.C.U. lobby, Ned's UnitType-4 body landed in Lex's scene 4 and the
+        # client closed two seconds later.
+        if _is_battle_chan(other) != _is_battle_chan(chan):
             continue
-        if ROOM_SAME_ZONE and WORLD_ZONES.get(a[0]) != mine_zone:
+        # WARNING: ...and the SAME BATTLE MAP: the lobby grouping alone paired a
+        # pilot on map 267 with one on 418 (live 22:33Z, each blinking on the
+        # other's screen).
+        if _is_battle_chan(chan):
+            _sm, _so = (SORTIE_MAP.get(chan_bkey(chan)),
+                        SORTIE_MAP.get(chan_bkey(other)))
+            if _sm is not None and _so is not None and _sm != _so:
+                continue
+        theirs, theirs_zone, theirs_place = chan_where(other)
+        if ROOM_SAME_MAP and theirs != mine:
             continue
-        if PLACES and WORLD_PLACES.get(a[0]) != WORLD_PLACES.get(chan.addr[0]):
+        if ROOM_SAME_ZONE and theirs_zone != mine_zone:
+            continue
+        if PLACES and theirs_place != mine_place:
             continue
         out.append(other)
     return out
@@ -21091,18 +21444,44 @@ def _serve_datagram(sock, peers, dg, addr):
         if chan is None:
             chan = peers[gkey] = WorldChannel(addr)
             chan.key, chan.tables, chan.char_id = GROUP_KEY, GROUP_TABLES, 0
+            chan.peer_key = gkey          # its WORLD_PEERS key (not chan.addr)
+            # Same client socket as its lobby channel, so the same player.
+            _lobby = peers.get(addr)
+            chan.account = getattr(_lobby, "account", None)
+            # The CFmoGroup socket may not be the one the lobby channel was
+            # bound on (live 09-27: the Deck's group channel came from an
+            # unbound port) -- so the create/join that opened it queued its
+            # account; claim that. It names the member whose group this is.
+            _gacct = claim_group_entry(addr[0])
+            if _gacct:
+                chan.account = _gacct
             log(f"[udp {addr[0]}:{addr[1]}] first GROUP datagram, {len(dg)}B -- "
                 f"key {GROUP_KEY.decode()!r} verifies it; a separate channel "
                 f"(reply hid {UDP_HID_GROUP}, no world POP, hello-ack without a POP)")
         chan.seen_at = time.time()
         got = fmoworld.parse(*chan.tables, dg)
+        if got and got.get("kind") is not None and \
+                getattr(chan, "group_kind", None) != got["kind"]:
+            log(f"[udp {addr[0]}:{addr[1]}] GROUP channel sends kind "
+                f"{got['kind']} -> replies go out on hid {got['kind']} "
+                f"(creator = 1, joiner = 5; see scene_reply_hid)")
+            chan.group_kind = got["kind"]
     else:
         chan = peers.get(addr)
         if chan is not None:
             chan.seen_at = time.time()
+            if chan.account:
+                settle_world_entry(chan)
+            else:
+                # Created before any entry was queued (e.g. across a restart).
+                claim_world_account(addr[0], chan)
         if chan is None:
             chan = peers[addr] = WorldChannel(addr)
-            log(f"[udp {addr[0]}:{addr[1]}] first datagram, {len(dg)}B")
+            claim_world_account(addr[0], chan)
+            log(f"[udp {addr[0]}:{addr[1]}] first datagram, {len(dg)}B"
+                + (f" -- bound to {chan.account} at {chan.loc} (the oldest "
+                   f"unclaimed world entry from this address)"
+                   if chan.account else ""))
         got = chan.unlock(dg) if chan.key is None else \
             fmoworld.parse(*chan.tables, dg)
     # WARNING: A LATCHED KEY CAN STOP VERIFYING WHEN THE SCENE RE-KEYS. restart()
@@ -21166,6 +21545,27 @@ def _serve_datagram(sock, peers, dg, addr):
                "scene we did not grant. Worth reading.")
             + ". The once-per-channel probes are re-armed for it.")
         chan.expect_restart = False
+        _was_acct = chan.account
+        if chan.key == GROUP_KEY:
+            # A GROUP channel restarts a second after the 0x0156/0x0157 that
+            # re-armed it (live 09-27 21:28Z: the channels survived from before
+            # the create/join, so their CREATION claimed nothing). Its own
+            # queued entry is the only one due -- claim it here, never on an
+            # arbitrary datagram, or the other device's channel could take it.
+            _g = claim_group_entry(addr[0])
+            if _g:
+                chan.account = _g
+                chan.remotes.clear()
+                chan.alias_of.clear()
+                log(f"[udp {addr[0]}:{addr[1]}]   GROUP: channel bound to {_g} "
+                    f"(the create/join that restarted it) -- members will be "
+                    f"introduced by cmd 190")
+        _new_acct = rebind_on_restart(chan) if chan.key != GROUP_KEY else None
+        if _new_acct:
+            log(f"[udp {addr[0]}:{addr[1]}]   room: this port was {_was_acct}; "
+                f"a waiting world entry says the client behind it is now "
+                f"{_new_acct} at {chan.loc} -- rebound (a relaunch from the "
+                f"same source port reuses the channel object)")
     if (got and alias_rs is None and (chan.tx_base or chan.popped) and not chan.pending
             and got.get("ack") == 0 and not chan.desync_warned):
         chan.desync_warned = True
@@ -21469,6 +21869,7 @@ def _serve_datagram(sock, peers, dg, addr):
             _s = (_txt or "").encode("cp932", "replace")[:GROUP_NAME_LEN - 1]
             _body[_off:_off + len(_s)] = _s
         chan.pending.append(fmoworld.record(GROUP_POP_CMD, bytes(_body)))
+        chan.group_uid = _guid          # its own member id (cmd 191 updates)
         chan.group_popped = True        # NOT chan.popped: the NPC pops key off that
         log(f"[udp {addr[0]}:{addr[1]}] -> GROUP MEMBER-INFO queued: cmd "
             f"{GROUP_POP_CMD:#x} body+0x00={_guid} (peer key == character id "
@@ -22204,6 +22605,7 @@ def _serve_datagram(sock, peers, dg, addr):
     # Introduce any newcomers BEFORE the reply is built, so their cmd-7 POP
     # rides this datagram rather than the next one -- see room_queue.
     room_queue(chan)
+    group_queue(chan)          # a group channel: the OTHER members, by cmd 190
     chan.retire(got["ack"])
     # WARNING: Only as many records as fit the client's 1,400-B recv buffer (see
     # UDP_MAX_DATAGRAM). TO covers the slice, not the tail; the rest waits for
@@ -24008,6 +24410,290 @@ def selftest():
           f"zero prefix with NO member: "
           f"{'OK' if _gz is not None and _gz[2] is None else 'FAIL'}")
     ok &= _gz is not None and _gz[2] is None
+
+    # WORLD CHANNEL BINDING (2026-09-27): two devices, one address. Each new
+    # channel takes the oldest entry; a bound channel's own re-entry is settled
+    # so it cannot be handed to the other device; account_for answers for the
+    # channel being served, and the TWIN (no context) still answers per address.
+    _h = "203.0.113.9"
+    _world_entries.pop(_h, None)
+    queue_world_entry(_h, "member:3")
+    queue_world_entry(_h, "member:11")
+    _c1, _c2 = WorldChannel((_h, 19155)), WorldChannel((_h, 39047))
+    _c1.account = claim_world_account(_h)
+    _c2.account = claim_world_account(_h)
+    _wb1 = (_c1.account, _c2.account) == ("member:3", "member:11")
+    queue_world_entry(_h, "member:3")            # the PC Moves (re-entry)
+    settle_world_entry(_c1)                      # its channel keeps talking
+    queue_world_entry(_h, "member:11")           # the Deck relaunches, new port
+    _c3 = WorldChannel((_h, 40000))
+    _c3.account = claim_world_account(_h)
+    _wb2 = _c3.account == "member:11"
+    WORLD_PEERS[(_h, 19155)], WORLD_PEERS[(_h, 39047)] = _c1, _c2
+    try:
+        _udp_ctx.addr = (_h, 19155)
+        _ac1 = account_for(_h)
+        with _as_world_channel((_h, 39047)):     # the room-mate's pop, from c1
+            _acm = account_for(_h)
+        _acb = account_for(_h)                   # back to the served channel
+        _udp_ctx.addr = (_h, 39047)
+        _ac2 = account_for(_h)
+        _udp_ctx.addr = None
+        _proven_by_ip[_h] = ("member:11", time.monotonic())
+        _ac0 = account_for(_h)                   # twin: TCP thread, no channel
+    finally:
+        _udp_ctx.addr = None
+        WORLD_PEERS.pop((_h, 19155), None)
+        WORLD_PEERS.pop((_h, 39047), None)
+        _proven_by_ip.pop(_h, None)
+        _world_entries.pop(_h, None)
+    _wb3 = (_ac1, _ac2) == ("member:3", "member:11") and _ac0 == "member:11"
+    print(f"  world binding: entries claimed in order: {'OK' if _wb1 else 'FAIL'}; "
+          f"a Move is settled, the relaunch gets ITS entry: "
+          f"{'OK' if _wb2 else 'FAIL'}; account_for per channel, per address "
+          f"with no channel: {'OK' if _wb3 else 'FAIL ' + repr((_ac1, _ac2, _ac0))}")
+    ok &= _wb1 and _wb2 and _wb3
+    # Nations apart: O.C.U. entry in zone 200, U.S.N. in zone 400, SAME map
+    # 102, one address. They must not be room-mates -- and the twin (same
+    # zone) must be.
+    _world_entries.pop(_h, None)
+    queue_world_entry(_h, "member:11", {"map": 102, "zone": 400})
+    queue_world_entry(_h, "member:3", {"map": 102, "zone": 200})
+    _d1, _d2 = WorldChannel((_h, 19155)), WorldChannel((_h, 63097))
+    claim_world_account(_h, _d1)
+    claim_world_account(_h, _d2)
+    for _d in (_d1, _d2):
+        _d.key, _d.seen_at = b"xlobby", time.time()
+    WORLD_PEERS[_d1.addr], WORLD_PEERS[_d2.addr] = _d1, _d2
+    WORLD_ZONES[_h], _saved_room = 200, (ROOM, ROOM_SAME_ZONE)
+    try:
+        globals()["ROOM"], globals()["ROOM_SAME_ZONE"] = True, True
+        _apart = _d2 not in room_mates(_d1) and _d1 not in room_mates(_d2)
+        _d1.loc["zone"] = 200
+        _together = _d2 in room_mates(_d1)
+        _d1.key = b"xbattle"                     # Lex sorties; Ned stays
+        _scene = _d2 not in room_mates(_d1) and _d1 not in room_mates(_d2)
+        _d2.key = b"xbattle"                     # both in battle: one room
+        _both = _d2 in room_mates(_d1)
+    finally:
+        globals()["ROOM"], globals()["ROOM_SAME_ZONE"] = _saved_room
+        WORLD_PEERS.pop(_d1.addr, None)
+        WORLD_PEERS.pop(_d2.addr, None)
+        WORLD_ZONES.pop(_h, None)
+        _world_entries.pop(_h, None)
+    print(f"  world binding: O.C.U. and U.S.N. on one address are NOT room-mates "
+          f"(zone per channel, not per address): {'OK' if _apart else 'FAIL'}; "
+          f"twin, same zone: {'OK' if _together else 'FAIL'}")
+    ok &= _apart and _together
+    print(f"  world binding: a BATTLE channel and a LOBBY channel in the same "
+          f"zone are NOT room-mates (the 19:10 crash): "
+          f"{'OK' if _scene else 'FAIL'}; two battle channels are: "
+          f"{'OK' if _both else 'FAIL'}")
+    ok &= _scene and _both
+    # Relaunch on the SAME port (live 2026-09-27 19:00): a channel bound to
+    # Lex restarts with Ned's entry waiting -> rebound to Ned. Twin: Lex Moves
+    # (own entry settled a moment ago) while Ned's entry waits -> stays Lex.
+    _world_entries.pop(_h, None)
+    _r = WorldChannel((_h, 19155))
+    _r.account, _r.loc = "member:3", {"map": 102, "zone": 200}
+    queue_world_entry(_h, "member:11", {"map": 102, "zone": 200})
+    _rb = rebind_on_restart(_r)
+    _relaunch = _rb == "member:11" and _r.account == "member:11"
+    _world_entries.pop(_h, None)
+    _m = WorldChannel((_h, 19155))
+    _m.account, _m.loc = "member:3", {"map": 102, "zone": 200}
+    queue_world_entry(_h, "member:3", {"map": 103, "zone": 200})
+    settle_world_entry(_m)                       # its datagram before the restart
+    queue_world_entry(_h, "member:11", {"map": 102, "zone": 400})
+    _mv = rebind_on_restart(_m)
+    _move = _mv is None and _m.account == "member:3" and _m.loc["map"] == 103
+    _left = [e[0] for e in _world_entries.get(_h, [])]
+    _world_entries.pop(_h, None)
+    print(f"  world binding: a relaunch on the same port rebinds to the waiting "
+          f"entry: {'OK' if _relaunch else 'FAIL ' + repr(_rb)}; a Move keeps "
+          f"its player and leaves the other entry queued: "
+          f"{'OK' if _move and _left == ['member:11'] else 'FAIL ' + repr((_mv, _m.account, _left))}")
+    ok &= _relaunch and _move and _left == ["member:11"]
+    # GROUP: the joiner's channel (kind 5) is answered on hid 5, the creator's
+    # (kind 1) on 1; and on one address only the CREATOR's account is leader.
+    _g = WorldChannel((_h, 1427))
+    _g.key = GROUP_KEY
+    _h0 = scene_reply_hid(_g)
+    _g.group_kind = 5
+    _h5 = scene_reply_hid(_g)
+    _ghid = _h0 == UDP_HID_GROUP and _h5 == 5
+    _gb, _gc = list(BATTLE_GROUPS_MADE), dict(GROUP_CREATOR_ACCOUNT)
+    _lc, _ld = WorldChannel((_h, 19155)), WorldChannel((_h, 1427))
+    _lc.account, _ld.account = "member:11", "member:3"
+    WORLD_PEERS[_lc.addr], WORLD_PEERS[_ld.addr] = _lc, _ld
+    try:
+        BATTLE_GROUPS_MADE[:] = [(_h + ":43545", 91, "Ned.Test", 0.0)]
+        GROUP_CREATOR_ACCOUNT.clear()
+        GROUP_CREATOR_ACCOUNT[91] = "member:11"
+        with _as_world_channel(_lc.addr):
+            _lead_c = group_leader_for(_h)[0]
+        with _as_world_channel(_ld.addr):
+            _lead_d = group_leader_for(_h)[0]
+    finally:
+        BATTLE_GROUPS_MADE[:] = _gb
+        GROUP_CREATOR_ACCOUNT.clear()
+        GROUP_CREATOR_ACCOUNT.update(_gc)
+        WORLD_PEERS.pop(_lc.addr, None)
+        WORLD_PEERS.pop(_ld.addr, None)
+    _glead = (_lead_c, _lead_d) == (1, 0)
+    print(f"  group: the joiner's kind-5 channel is answered on hid 5 "
+          f"(was {UDP_HID_GROUP} before its first datagram): "
+          f"{'OK' if _ghid else 'FAIL ' + repr((_h0, _h5))}; on one address "
+          f"only the creator's ACCOUNT is leader: "
+          f"{'OK' if _glead else 'FAIL ' + repr((_lead_c, _lead_d))}")
+    ok &= _ghid and _glead
+    # BATTLE STATE PER PLAYER (live 2026-09-27 20:31-20:34): PC and Deck on one
+    # address were BOTH made squad owner, and the Deck took the win for the
+    # PC's kills. Keyed by the bound account, the second pilot joins the first
+    # one's squad, and each has its own state.
+    _bh = "203.0.113.77"
+    _p1, _p2 = WorldChannel((_bh, 37531)), WorldChannel((_bh, 19155))
+    for _c, _a in ((_p1, "member:3"), (_p2, "member:11")):
+        _c.account, _c.key, _c.seen_at = _a, b"xbattle", time.time()
+        _c.loc = {"map": 418, "zone": 200}
+        WORLD_PEERS[_c.addr] = _c
+    _sv_room = (ROOM, ROOM_SAME_ZONE)
+    try:
+        globals()["ROOM"], globals()["ROOM_SAME_ZONE"] = True, True
+        battle_state("member:3", reset=True)
+        battle_state("member:11", reset=True)
+        _sq1, _o1 = battle_squad_for(_p1, (64, 5, 64, 0), 2, None)
+        _sq2, _o2 = battle_squad_for(_p2, (64, 5, 64, 0), 2, None)
+        _per = (_sq1["owner"] == "member:3" and _sq2 is _sq1 and _o2 is _p1
+                and BATTLE_STATE["member:3"] is not BATTLE_STATE["member:11"])
+    finally:
+        globals()["ROOM"], globals()["ROOM_SAME_ZONE"] = _sv_room
+        WORLD_PEERS.pop(_p1.addr, None)
+        WORLD_PEERS.pop(_p2.addr, None)
+        BATTLE_STATE.pop("member:3", None)
+        BATTLE_STATE.pop("member:11", None)
+        BATTLE_SQUADS.pop(chan_where(_p1), None)
+    print(f"  battle per player: two pilots on one address -> ONE squad owner "
+          f"(the first), the second joins it, separate battle state: "
+          f"{'OK' if _per else 'FAIL'}")
+    ok &= _per
+    # BATTLE GROUP MEMBERS + VOICE. Two group
+    # channels in one group: A's self stream gets a cmd 190 for B (alias, tag,
+    # our endpoint, voice bit), the 0x0158 rows name both, and a cmd 123 A sends
+    # on B's link reaches B's group SELF stream byte-for-byte.
+    if PEER_LINK and GROUP_TABLES is not None:
+        _ga, _gb2 = ("203.0.113.50", 1427), ("203.0.113.50", 19155)
+        _kA, _kB = _ga + ("group",), _gb2 + ("group",)
+        _sv = (dict(GROUP_MEMBERS), dict(GROUP_OF), dict(GROUP_CREATOR_ACCOUNT))
+        _rost = {}
+        _cA, _cB = WorldChannel(_ga), WorldChannel(_gb2)
+        for _c, _k, _acc in ((_cA, _kA, "member:3"), (_cB, _kB, "member:11")):
+            _c.key, _c.tables, _c.char_id = GROUP_KEY, GROUP_TABLES, 0
+            _c.peer_key, _c.account, _c.group_popped = _k, _acc, True
+            _c.seen_at = time.time()
+            WORLD_PEERS[_k] = _c
+        _real_lr = globals()["load_roster"]
+        globals()["load_roster"] = lambda a: {
+            "member:3": [{"id": 1, "first": "Lex", "last": "Arden", "nation_byte": 1}],
+            "member:11": [{"id": 1, "first": "Ned", "last": "Test", "nation_byte": 1}]}.get(a, [])
+        try:
+            GROUP_MEMBERS.clear(); GROUP_OF.clear()
+            group_join(77, "member:11"); group_join(77, "member:3")
+            GROUP_CREATOR_ACCOUNT[77] = "member:11"
+            _nq = group_queue(_cA)
+            _al = _cA.alias_of.get(_kB)
+            _rsA = _cA.remotes.get(_al)
+            _rec = _cA.pending[-1] if _cA.pending else b""
+            _bd = _rec[fmoworld.REC_HDR:]
+            _g_ok = (_nq == 1 and _rsA is not None and len(_bd) >= 0x5C
+                     and struct.unpack_from("<I", _bd, 0)[0] == _al
+                     and _bd[G190_TAG] == _rsA.tag and _bd[G190_VOICE] == 1
+                     and _bd[G190_KEY:G190_KEY + 5] == GROUP_KEY
+                     and _bd[GROUP_POP_NAME1_OFF:GROUP_POP_NAME1_OFF + 3] == b"Ned"
+                     and struct.unpack_from("<I", _bd, GROUP_POP_LEADER_OFF)[0] == 1
+                     and group_queue(_cA) == 0)
+            _pn, _prows = group_player_rows(77)
+            _rows_ok = _pn == 2 and _prows[0:3] == b"Ned" and _prows[0x40:0x43] == b"Lex" \
+                and _prows[S158_ROW_NATION] == 1
+            group_queue(_cB)                         # B learns A too
+            # 0x0163: members for creator AND joiner alike, and a group sortie
+            # sets the on-sortie flag + map row (the 9:10 offer).
+            _r163 = reply_0163(77)
+            _s163_ok = (struct.unpack_from("<I", _r163, S158_PLAYERS_N)[0] == 2
+                        and _r163[S163_ON_SORTIE] == 0)
+            GROUP_SORTIE[77] = {"map": 267, "sector": 200000020,
+                                "row": struct.pack("<I", 267) + bytes(104),
+                                "at": time.time(), "by": "member:11"}
+            _r163 = reply_0163(77)
+            _s163_ok &= (_r163[S163_ON_SORTIE] == 1
+                         and struct.unpack_from("<I", _r163, S163_SECTOR)[0] == 200000020
+                         and struct.unpack_from("<I", _r163, S163_MAPROW)[0] == 267)
+            GROUP_SORTIE.pop(77, None)
+            # Sortie Setting: A (member:3) goes READY -> a cmd 191 with +0x54
+            # bit 1 on A's own channel (its self id) and on B's (A's alias).
+            _cA.group_uid = 0x1001
+            _nA0, _nB0 = len(_cA.pending), len(_cB.pending)
+            GROUP_READY["member:3"] = (1, 0)
+            _np = group_push_flags("member:3")
+            GROUP_READY.pop("member:3", None)
+            _uA = _cA.pending[_nA0:]
+            _uB = _cB.pending[_nB0:]
+
+            def _fl(r):
+                return struct.unpack_from(
+                    "<I", r, fmoworld.REC_HDR + 8 + GROUP_POP_FLAGS_OFF - G191_BLOB_FROM)[0]
+            _rdy_ok = (_np == 2 and len(_uA) == 1 and len(_uB) == 1
+                       and struct.unpack_from("<I", _uA[0], 4)[0] == 191
+                       and struct.unpack_from("<I", _uA[0], fmoworld.REC_HDR)[0] == 0x1001
+                       and struct.unpack_from("<I", _uB[0], fmoworld.REC_HDR)[0]
+                       == _cB.alias_of.get(_kA)
+                       and _fl(_uA[0]) & G_FLAG_READY and _fl(_uB[0]) & G_FLAG_LISTED)
+            print(f"  group: 0x0163 lists both members, and a group sortie sets the "
+                  f"on-sortie flag + map: {'OK' if _s163_ok else 'FAIL'}; Ready -> a "
+                  f"cmd 191 (+0x54 bit 1) on both channels, self id and alias: "
+                  f"{'OK' if _rdy_ok else 'FAIL'}")
+            ok &= _s163_ok and _rdy_ok
+            _cB.pending.clear()
+            _gsent = []
+
+            class _GS:
+                def sendto(self, d, to):
+                    _gsent.append(d)
+            _vbody = bytes(range(40))
+            _dg = fmoworld.build(*GROUP_TABLES, peer=1, hid=_rsA.tag, kind=5, ack=0,
+                                 flag=0, frm=0, to=1,
+                                 body=fmoworld.record(123, _vbody, arg8=1))
+            _serve_datagram(_GS(), WORLD_PEERS, _dg, _ga)
+            # Twin first: B has never sent voice (its voice system may be down
+            # -- a client hung on receiving it), so nothing is relayed.
+            _vx0 = [r for r in _cB.pending
+                    if struct.unpack_from("<I", r, 4)[0] == 123]
+            _cB.voice_seen = True                     # B has talked
+            _dg2 = fmoworld.build(*GROUP_TABLES, peer=1, hid=_rsA.tag, kind=5,
+                                  ack=0, flag=2, frm=1, to=2,
+                                  body=fmoworld.record(123, _vbody, arg8=1))
+            _serve_datagram(_GS(), WORLD_PEERS, _dg2, _ga)
+            _vx = [r for r in _cB.pending
+                   if struct.unpack_from("<I", r, 4)[0] == 123]
+            _v_ok = (not _vx0 and bool(_vx)
+                     and _vx[0][fmoworld.REC_HDR:fmoworld.REC_HDR + 40] == _vbody)
+        finally:
+            globals()["load_roster"] = _real_lr
+            WORLD_PEERS.pop(_kA, None); WORLD_PEERS.pop(_kB, None)
+            GROUP_MEMBERS.clear(); GROUP_MEMBERS.update(_sv[0])
+            GROUP_OF.clear(); GROUP_OF.update(_sv[1])
+            GROUP_CREATOR_ACCOUNT.clear(); GROUP_CREATOR_ACCOUNT.update(_sv[2])
+        print(f"  group: the other member arrives as a cmd 190 on the group self "
+              f"stream (alias, tag, key, names, leader, voice bit), once: "
+              f"{'OK' if _g_ok else 'FAIL'}; the 0x0158 Player List names both "
+              f"(nation byte set): {'OK' if _rows_ok else 'FAIL'}; a cmd 123 on "
+              f"the member link reaches the other's group self stream verbatim: "
+              f"{'OK' if _v_ok else 'FAIL'}")
+        ok &= _g_ok and _rows_ok and _v_ok
+    _wb4 = _acm == "member:11" and _acb == "member:3"
+    print(f"  world binding: a room-mate's pop is named AS the mate, then the "
+          f"served channel again: {'OK' if _wb4 else 'FAIL ' + repr((_acm, _acb))}")
+    ok &= _wb4
 
     # REGRESSION: the TITLE MENU GATE. An empty roster is NOT 'no character'
     # to FMO -- the menu selector at 0x61042CD0 takes descriptors[ eax < 0 ]
@@ -27294,13 +27980,14 @@ def selftest():
     rf6 = [parse(o) for o in s6.on_packet(parse(build(MSG_01F6_REQ, bytes(136),
                                                        seq=0x5163, conn_id=1)))]
     sb_ok = (len(r62) == 1 and r62[0]["msg"] == MSG_0163_REPLY
-             and r62[0]["seq"] == 0x5161 and r62[0]["payload"] == b""
+             and r62[0]["seq"] == 0x5161
+             and len(r62[0]["payload"]) == REPLY_0163_LEN   # the GROUP INFO body
              and len(rf4) == 1 and rf4[0]["msg"] == MSG_01F5_REPLY
              and rf4[0]["seq"] == 0x5162 and len(rf4[0]["payload"]) == S1F5_BODY_LEN
              and struct.unpack_from("<I", rf4[0]["payload"])[0] == len(BATTLE_MAPS)
              and len(rf6) == 1 and rf6[0]["msg"] == MSG_SESSION_START
              and rf6[0]["seq"] == 0x5163)
-    print(f"  board: 0x0162 -> empty 0x0163, 0x01F4 -> {S1F5_BODY_LEN}-B 0x01F5 "
+    print(f"  board: 0x0162 -> {REPLY_0163_LEN}-B 0x0163 GROUP INFO, 0x01F4 -> {S1F5_BODY_LEN}-B 0x01F5 "
           f"(count {len(BATTLE_MAPS)}), 0x01F6 -> message 1, each on the client's "
           f"seq: {'OK' if sb_ok else 'FAIL'}")
     ok &= sb_ok
@@ -27518,6 +28205,100 @@ def selftest():
                   f"{struct.unpack_from('<I', _pl13a, R13A_BLOCK + MB_MAPNO)[0] if len(_pl13a) > R13A_BLOCK + 4 else '?'}, "
                   f"NOT FMO_SORTIE_MAPNO's 418: {'OK' if _e2e else 'FAIL'}")
             ok &= _e2e
+
+            # WARNING: THE SAME SORTIE AS A GROUP MEMBER (bgflag +0x08 = 1), through
+            # the real handler: live 22:20Z the group bookkeeping did str & int
+            # on the map and closed the leader's connection. The reply must
+            # still be 0x013A and GROUP_SORTIE must hold map 232 as an int.
+            s7b = Session("selftest:0")
+            _bpc = s7b.playing_char() if CHAR_STORE else None
+            if _bpc is not None and fmostore is not None:
+                fmostore.set_flag_byte(_bpc, 128, 99)
+            s7b._account = _bacct = "member:selftest-group"
+            _bprev = GROUP_OF.get(_bacct)
+            GROUP_OF[_bacct] = 991
+            _z7 = WORLD_ZONES.get("selftest")
+            WORLD_ZONES["selftest"] = 200
+            try:
+                s7b.on_packet(parse(build(
+                    MSG_015E_REQ, struct.pack("<I", 71121) + bytes(16),
+                    seq=0x516A, conn_id=1)))
+                _q139 = bytearray(REQ_0139_LEN)
+                _q139[0x08] = 1
+                _rb = [parse(o) for o in s7b.on_packet(parse(build(
+                    MSG_SORTIE_REQ, bytes(_q139), seq=0x516B, conn_id=1)))]
+            finally:
+                if _z7 is None:
+                    WORLD_ZONES.pop("selftest", None)
+                else:
+                    WORLD_ZONES["selftest"] = _z7
+                if _bprev is None:
+                    GROUP_OF.pop(_bacct, None)
+                else:
+                    GROUP_OF[_bacct] = _bprev
+            _gs = GROUP_SORTIE.pop(991, None)
+            _gs_ok = (_rb and _rb[0]["msg"] == MSG_SORTIE_REPLY and _gs
+                      and _gs["map"] == 232 and isinstance(_gs["map"], int)
+                      and _gs["row"][:4] == struct.pack("<I", 232))
+            print(f"  group sortie through the 0x0139 handler: 0x013A served and "
+                  f"GROUP_SORTIE = map {_gs and _gs['map']!r}: "
+                  f"{'OK' if _gs_ok else 'FAIL'}")
+            ok &= bool(_gs_ok)
+
+            # WARNING: THE FOLLOWER (9:10 YES): no war map opened, 0x0139 +0x00 =
+            # the group's map. Live 22:33Z it was sent FMO_SORTIE_MAPNO's 418
+            # while the leader fought on 267. It must get the group's map.
+            s7f = Session("selftest:0")
+            _fpc = s7f.playing_char() if CHAR_STORE else None
+            if _fpc is not None and fmostore is not None:
+                fmostore.set_flag_byte(_fpc, 128, 99)
+            s7f._account = "member:selftest-follower"
+            GROUP_OF[s7f._account] = 992
+            GROUP_SORTIE[992] = {"map": 232, "sector": 200071121,
+                                 "row": struct.pack("<I", 232) + bytes(104),
+                                 "at": time.time(), "by": "x"}
+            try:
+                _qf = bytearray(REQ_0139_LEN)
+                struct.pack_into("<I", _qf, 0x00, 232)
+                _rf = [parse(o) for o in s7f.on_packet(parse(build(
+                    MSG_SORTIE_REQ, bytes(_qf), seq=0x516C, conn_id=1)))]
+            finally:
+                GROUP_OF.pop(s7f._account, None)
+                GROUP_SORTIE.pop(992, None)
+            _plf = _rf[0]["payload"] if _rf else b""
+            _f_ok = (_rf and _rf[0]["msg"] == MSG_SORTIE_REPLY
+                     and struct.unpack_from("<I", _plf, R13A_BLOCK + MB_MAPNO)[0] == 232)
+            print(f"  group follower: a 9:10 0x0139 for the group's map 232 is "
+                  f"sent map "
+                  f"{struct.unpack_from('<I', _plf, R13A_BLOCK + MB_MAPNO)[0] if len(_plf) > R13A_BLOCK + 4 else '?'}"
+                  f" (not FMO_SORTIE_MAPNO 418): {'OK' if _f_ok else 'FAIL'}")
+            ok &= bool(_f_ok)
+
+            # WARNING: two battle channels from one lobby are room-mates only on
+            # the SAME sortie map (live 22:33Z: 267 vs 418, each blinking).
+            from types import SimpleNamespace as _SN
+            _rsave = (dict(WORLD_PEERS), dict(SORTIE_MAP))
+            try:
+                _ra = _SN(addr=("198.51.100.7", 1), key=b"xxbattle", left=None,
+                          seen_at=time.time(), account="member:ra",
+                          loc={"map": 102, "zone": 200})
+                _rb2 = _SN(addr=("198.51.100.7", 2), key=b"xxbattle", left=None,
+                           seen_at=time.time(), account="member:rb",
+                           loc={"map": 102, "zone": 200})
+                WORLD_PEERS.clear()
+                WORLD_PEERS[_ra.addr] = _ra
+                WORLD_PEERS[_rb2.addr] = _rb2
+                SORTIE_MAP["member:ra"], SORTIE_MAP["member:rb"] = 267, 418
+                _apart = room_mates(_ra) == []
+                SORTIE_MAP["member:rb"] = 267
+                _together = room_mates(_ra) == [_rb2]
+            finally:
+                WORLD_PEERS.clear(); WORLD_PEERS.update(_rsave[0])
+                SORTIE_MAP.clear(); SORTIE_MAP.update(_rsave[1])
+            print(f"  battle room: same lobby but maps 267/418 -> not mates; "
+                  f"both 267 -> mates: "
+                  f"{'OK' if _apart and _together else 'FAIL'}")
+            ok &= _apart and _together
 
             # ...and with no war map opened at all, the sortie is still
             # FMO_SORTIE_MAPNO -- the kycli RESUME path, unchanged.
