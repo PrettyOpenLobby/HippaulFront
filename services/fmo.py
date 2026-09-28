@@ -183,7 +183,8 @@ import types
 if __name__ == "__main__":
     sys.modules.setdefault("fmo", sys.modules[__name__])
 
-# Which fmoserver module owns each top-level name of the old fmo.py.
+# Which fmoserver module owns each name that `fmo.<name>` reaches. A new
+# top-level name that a tool or test reads or patches through fmo gets a line.
 _OWNERS = {
     'A2_KINDS': 'cosmetics',
     'A2_PILOT': 'cosmetics',
