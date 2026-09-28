@@ -1,0 +1,359 @@
+"""The service record (0x0175 -> 0x0176): paydays, salary, the ceasefire bonus and the officer
+review."""
+import datetime
+import os
+import struct
+import time
+from .knobs import _env_int
+
+
+#: 0x0176 body (payload+0x20..): the 476-B block the mission-result machine
+#: copies to itself (0x6119291C, `rep movsd 0x77`) and applies field by field.
+S176_CONTRIB_SHOWN = 0x04     # -> machine+0x218, clamped below a ladder threshold
+S176_CONTRIB_STORED = 0x08    # -> lobby+0xFC8 (S14A_CONTRIB), same clamp
+S176_B0C = 0x0C               # -> lobby+0x8BC (status+0x30), unread by us
+S176_RANK = 0x0D              # -> lobby+0x8BB (S14A_RANK)
+#: WARNING: +0x0F is the PROMOTION-OUTLOOK index, NOT a rank name (renamed 2026-09-12
+#: after the live read). It selects systext GROUP 36 -- 36:1 "highly valued",
+#: 36:2 "an order will come soon", 36:3 "not recognised, under review", 36:4
+#: "no message from the top brass", 36:11..14 / 21..24 the promotion and
+#: demotion review variants -- which 0x61175540 sprintf's (with the nation
+#: name) into lobby+0x7C, and the SAME arm then prints to chat (0x611929E7 ->
+#: 0x61184330). SE chose it from the pilot's review state; we have none.
+#: 0 = the client's own "nothing pending": 36:0 is `$(予備)`, and 0x61175540
+#: clears the buffer on a leading '$' or an empty string, so nothing is printed
+#: and the script's E315 gate (0x610FB480) answers "no orders pending".
+S176_OUTLOOK = 0x0F
+S176_RANK_NAME = S176_OUTLOOK   # the old name, kept for readers of older notes
+#: FMO_OUTLOOK: the group-36 index to serve. Default 0 = say nothing.
+OUTLOOK = _env_int("FMO_OUTLOOK", "0")
+#: KEY: +0x10 is the NEXT PAYDAY, a time_t (static 2026-09-12). The machine
+#: holds the body at machine+0x34, and 0x61192980 passes [machine+0x44] =
+#: body+0x10 to 0x611754D0, which formats it in mode 8 of 0x611E3D00 --
+#: "%04d/%02d/%02d %02d:%02d", local time -- into lobby+0x7B7C ("%s"). That
+#: buffer is the blank (FMDT token FF 12) in the Personnel Officer's line
+#: AH/F98/D64 record 53, "The next payday is ___." We had it named as a
+#: money field and the paybook fill wrote its H$ TOTAL here, so the officer announced a
+#: payday of 1970/01/01 plus that many seconds ("1970/01/01 09:48").
+S176_NEXT_PAYDAY = 0x10
+
+
+def next_payday_unix(now=None):
+    """The next payday: the coming UTC midnight, the same day boundary
+    paydays_owed() pays on (a pilot is paid for every UTC day it has not
+    been paid yet)."""
+    return (int(_now_unix(now) // DAY) + 1) * DAY
+
+
+def service_record_block(char, ladder=None, now=None):
+    """(0x0176 body, info) for one pilot -- SE's service-record check.
+
+    The rank and contribution come from the CHARACTER (the knob is only the
+    seed, exactly as 0x014A resolves them), and the rank is PROMOTED to the
+    highest ladder row the contribution meets. Never demotes: a pilot seeded
+    above what their contribution earns (every pilot on this server today,
+    seeded at FMO_RANK with contribution 0) keeps the seeded rank. Pure --
+    the caller banks `info["rank"]` when `info["promoted"]`. `ladder=()`
+    disables the promotion (no table, no ladder walk)."""
+    char = char or {}
+    ladder = ranks.RANK_LADDER if ladder is None else ladder
+    rank, rank_src = economy._econ_value("rank", None, status.START_RANK, "FMO_RANK", char)
+    contrib, contrib_src = economy._econ_value("contribution", None, status.STATUS_CONTRIB,
+                                               "FMO_STATUS_CONTRIB", char)
+    rank = int(rank or 0) & 0xFF
+    contrib = int(contrib or 0)
+    earned = ranks.rank_for_contribution(contrib, ladder) if ladder else rank
+    promoted = earned > rank
+    new_rank = earned if promoted else rank
+    blk = bytearray(S176_BODY_LEN)
+    struct.pack_into("<i", blk, S176_CONTRIB_SHOWN, contrib)
+    struct.pack_into("<i", blk, S176_CONTRIB_STORED, contrib)
+    blk[S176_B0C] = 0
+    blk[S176_RANK] = new_rank & 0xFF
+    # WARNING: NOT the rank. +0x0F indexes systext GROUP 36, the Personnel Officer's
+    # promotion-OUTLOOK lines, and 0x61175540 sprintf's the chosen one into
+    # lobby+0x7C -- which the same arm then PRINTS TO CHAT (0x611929E7 ->
+    # 0x61184330). Serving the rank byte made a rank-24 pilot read 36:24,
+    # "your contribution has been reviewed and the demotion hearing has been
+    # cancelled", on every service-record check: a review that never happened.
+    # 0 is the client's own "nothing pending": 36:0 is `$(予備)` and 0x61175540
+    # CLEARS the buffer for a leading '$' (or an empty string), so no line is
+    # printed and E315 (0x610FB480, "is an orders message pending?") answers 0.
+    # FMO_OUTLOOK serves a real group-36 index once there is a review state to
+    # report -- 4 is "There is no message for you from the top brass."
+    blk[S176_OUTLOOK] = OUTLOOK & 0xFF
+    # The officer's "next payday" (see S176_NEXT_PAYDAY): only when there IS
+    # a salary -- with FMO_SALARY=0 no day ever pays, and 0 keeps the old line.
+    struct.pack_into("<I", blk, S176_NEXT_PAYDAY,
+                     (next_payday_unix(now) if SALARY else 0) & 0xFFFFFFFF)
+    nxt = ranks.rank_threshold(new_rank + 1, ladder) if ladder else None
+    return bytes(blk), {
+        "rank": new_rank, "rank_was": rank, "rank_src": rank_src,
+        "promoted": promoted,
+        "threshold": ranks.rank_threshold(new_rank, ladder) if ladder else None,
+        "next_threshold": nxt if nxt is not None else "no next row",
+        "contribution": contrib, "contribution_src": contrib_src,
+    }
+
+
+#: KEY: THE PAYBOOK (static 2026-09-12). Past the rank fields, the 0x0176
+#: body is what the counter's Paybook screen lists (0x611925C0; headers
+#: 11:20..24 Date / Name / H$ / MP / Paybook): +0x34 u32 row count (<= 20),
+#: +0x38 rows of 0x14 = {u8 kind, s8 sub, u16 pad, u32 date (a time_t --
+#: polcore's decompose [0x613AE380]+0xAD0, rendered local), s32 H$, s32 MP,
+#: u32 pad}. Row text (0x61192316): kind 0 = a DAY HEADER (the date, then
+#: '     %s'); kind 1..14 = a line item labelled by 0x61191420 -- 1 Base pay,
+#: 2 Kill bonus, 3 Mission participation bonus, 4 Pay cut, 5 Mission bonus,
+#: 6 Mission cancellation, 7 City control adjustment (%+2d%% from `sub`),
+#: 8 Promotion bonus, 9 Platoon bonus, 10 Platoon bonus refund, 11 Sortie
+#: cost refund, 12 Key mission bonus, 13 Arena reward, 14 Arena hosting
+#: cancellation (systext group 11). The list appends its own TOTAL row from
+#: body+0x00 (H$) and body+0x14 (MP) (0x611926C8), and 0x611754D0 formats
+#: body+0x10 as "H$ %s" into lobby+0x7B7C. State 3 of the machine
+#: (0x61192AEB) scans all 20 slots for kind == 1, so unused slots stay 0.
+#: The rows sort by date (0x61191500 mode 0). WARNING: NOT CONFIRMED IN A LIVE SESSION: the screen
+#: has never drawn a row from this server.
+S176_TOTAL_MONEY = 0x00
+S176_TOTAL_MP = 0x14
+S176_ROW_COUNT = 0x34
+S176_ROWS = 0x38
+S176_ROW_LEN = 0x14
+S176_ROW_MAX = 20
+PAY_HEADER, PAY_BASE = 0, 1
+PAY_KINDS = {1: "Base pay", 2: "Kill bonus", 3: "Mission participation bonus",
+             4: "Pay cut", 5: "Mission bonus", 6: "Mission cancellation",
+             7: "City control adjustment", 8: "Promotion bonus",
+             9: "Platoon bonus", 10: "Platoon bonus refund",
+             11: "Sortie cost refund", 12: "Key mission bonus",
+             13: "Arena reward", 14: "Arena hosting cancellation"}
+DAY = 86400
+
+# --------------------------------------------------------------------------- #
+# THE CEASEFIRE BONUS and THE OFFICER REVIEW (2026-09-27). SE's RULES, OUR
+# NUMBERS: the archived pages give the mechanisms and almost no figures
+# (SE's guide pages: phase, topics20060406,
+# update/050719qk2ld8). Every amount, period and count below is ours and is
+# named as ours in the knob comments.
+# --------------------------------------------------------------------------- #
+#: SE (phase:48-53): at each phase end First Sergeant and above get a rank-
+#: based ceasefire bonus whatever the result -- First Sergeant..Captain H$ +
+#: contribution, Major..Colonel H$ + MP, below First Sergeant nothing. Both
+#: sides are paid the SAME amount unless the economic-city points differ by
+#: 6:4 or more, then each side's share follows the ratio (topics20060406:50-52).
+#: FMO_CEASEFIRE=1 pays it at the Personnel Officer after a judged phase, as a
+#: paybook "City control adjustment" line (kind 7: SE scales it by the city
+#: points) plus the contribution banked. A pilot's first check only records
+#: the phases already judged, so nobody is back-paid for wars they missed.
+CEASEFIRE = (os.environ.get("FMO_CEASEFIRE", "").strip() or "0") != "0"
+#: OURS: H$ = this many days of the rank's base pay (D15.DAT's pay column).
+CEASEFIRE_DAYS = _env_int("FMO_CEASEFIRE_DAYS", "5")
+#: OURS: contribution (First Sergeant..Captain) = this % of the rank's bar.
+CEASEFIRE_CONTRIB_PCT = _env_int("FMO_CEASEFIRE_CONTRIB_PCT", "2")
+#: OURS: MP (Major..Colonel) = this many times the rank's MP pay.
+CEASEFIRE_MP_DAYS = _env_int("FMO_CEASEFIRE_MP_DAYS", "5")
+RANK_FIRST_SERGEANT, RANK_CAPTAIN, RANK_MAJOR, RANK_COLONEL = 10, 20, 21, 23
+PAY_CITY = 7                   #: paybook kind 7 = "City control adjustment"
+
+
+def ceasefire_share(rec, nation):
+    """The multiplier for `nation`'s pilots from one judged phase record
+    {ocu, usn}: 1.0 below a 6:4 split, else own share / 0.5. Pure."""
+    ocu, usn = int(rec.get("ocu") or 0), int(rec.get("usn") or 0)
+    tot = ocu + usn
+    if tot <= 0 or max(ocu, usn) / tot < 0.6:
+        return 1.0
+    own = ocu if nation == 1 else usn if nation == 2 else tot / 2
+    return own / tot / 0.5
+
+
+def ceasefire_bonus(rank, nation, rec, ladder=None):
+    """(H$, contribution, MP) one pilot is owed for one judged phase, or None
+    below First Sergeant / above Colonel. Pure."""
+    rank = int(rank or 0)
+    if not RANK_FIRST_SERGEANT <= rank <= RANK_COLONEL:
+        return None
+    m = ceasefire_share(rec, nation)
+    pay, mp = ranks.rank_pay(rank)
+    hs = int(round(pay * CEASEFIRE_DAYS * m))
+    if rank <= RANK_CAPTAIN:
+        bar = ranks.rank_threshold(rank, ladder) or 0
+        return hs, int(round(max(0, bar) * CEASEFIRE_CONTRIB_PCT / 100 * m)), 0
+    return hs, 0, int(round(mp * CEASEFIRE_MP_DAYS * m))
+
+
+def ceasefire_owed(char, phases):
+    """[(phase number, record)] judged phases this pilot has not been paid.
+    MUTATES char["ceasefire_paid"]: the first call only records what is
+    already judged (returns []), so the bonus starts with the NEXT phase."""
+    judged = sorted((int(k), v) for k, v in (phases or {}).items())
+    paid = char.get("ceasefire_paid")
+    if not isinstance(paid, list):
+        char["ceasefire_paid"] = [n for n, _r in judged]
+        return []
+    return [(n, r) for n, r in judged if n not in paid]
+
+
+#: SE (update 050719qk2ld8:58-71): contribution promotes only up to Captain.
+#: Above it a periodic review decides: Captain KEEPS the rank with one
+#: SECTOR-mission success in the period, is PROMOTED to Major with "the
+#: prescribed count or more", and with none is DEMOTED to First Lieutenant
+#: with the contribution bar at about 90%; Major and above the same on AREA
+#: missions. Every rank has a headcount limit and a promotion needs a free
+#: slot. FMO_REVIEW: 0 (default) off; 'promote' = keep/promote only (no
+#: demotion); 'full' = SE's rule with demotion. WARNING: 'full' DEMOTES seeded
+#: pilots who never ran a mission -- arm it deliberately.
+REVIEW = (os.environ.get("FMO_REVIEW", "").strip() or "0").lower()
+REVIEW_DAYS = _env_int("FMO_REVIEW_DAYS", "7")           #: OURS: SE says only "a set period"
+REVIEW_PROMOTE = _env_int("FMO_REVIEW_PROMOTE", "3")     #: OURS: SE's count is not published
+#: OURS: "rank:cap,..." pilots allowed per rank and nation; empty = no cap.
+REVIEW_CAPS_SPEC = os.environ.get("FMO_REVIEW_CAPS", "").strip()
+
+
+def parse_review_caps(spec):
+    out = {}
+    for piece in (spec or "").split(","):
+        if piece.strip():
+            r, c = piece.split(":")
+            out[int(r, 0)] = int(c, 0)
+    return out
+
+
+try:
+    REVIEW_CAPS = parse_review_caps(REVIEW_CAPS_SPEC)
+except ValueError:
+    REVIEW_CAPS = {}
+
+
+def _iso_unix(s):
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(str(s), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def review_successes(char, rank, since, now):
+    """Completed missions that count for this rank's review in [since, now]:
+    SECTOR (category 2) for Captain, AREA (category 3) for Major+."""
+    cat = 2 if int(rank) <= RANK_CAPTAIN else 3
+    n = 0
+    for m in (char or {}).get("missions") or ():
+        if not isinstance(m, dict) or m.get("status") != "complete":
+            continue
+        if int(m.get("cat") or 0) != cat:
+            continue
+        t = _iso_unix(m.get("reported"))
+        if t is not None and since <= t <= now:
+            n += 1
+    return n
+
+
+def review_verdict(rank, successes, mode, promote_n=None, slot_free=True):
+    """'promote' / 'keep' / 'demote' / None (not reviewed). Pure."""
+    rank = int(rank)
+    if mode not in ("promote", "full", "1") or not RANK_CAPTAIN <= rank <= RANK_COLONEL:
+        return None
+    need = REVIEW_PROMOTE if promote_n is None else promote_n
+    if successes >= need and rank < RANK_COLONEL and slot_free:
+        return "promote"
+    if successes >= 1 or mode == "promote":
+        return "keep"
+    return "demote"
+
+
+def review_demoted_contribution(new_rank, ladder=None):
+    """SE: a demoted officer's contribution bar sits at about 90% toward the
+    rank they lost, so contribution alone cannot promote them straight back."""
+    lo = ranks.rank_threshold(new_rank, ladder) or 0
+    hi = ranks.rank_threshold(new_rank + 1, ladder)
+    if hi is None or hi <= lo:
+        return lo
+    return int(lo + 0.9 * (hi - lo))
+
+
+def _now_unix(now=None):
+    return (float(now) if now is not None
+            else datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+
+def paydays_owed(char, now=None, max_days=None):
+    """(days, [midnight-UTC time_t per payday, oldest first], today).
+
+    SE pays once a day and banks at most five days at the Personnel desk.
+    `last_payday` on the record is a DAY NUMBER (days since the epoch, UTC);
+    every day after it up to today is owed, capped at FMO_SALARY_MAX_DAYS.
+    A pilot with no `last_payday` yet is owed one day -- on the roll since
+    creation, first visit pays today."""
+    max_days = SALARY_MAX_DAYS if max_days is None else int(max_days)
+    today = int(_now_unix(now) // DAY)
+    last = (char or {}).get("last_payday")
+    days = 1 if last is None else max(0, today - int(last))
+    if SALARY_EVERY:
+        days = max(1, days)          # FMO_SALARY=every: a row in every reply
+    days = max(0, min(days, max_days))
+    stamps = [(today - days + 1 + i) * DAY for i in range(days)]
+    return days, stamps, today
+
+
+def paybook_rows(char, rank, now=None):
+    """([(kind, sub, time_t, H$, MP)], today): a day header + a Base pay line
+    per payday owed, paid at the rank's own figures (fmo-ranks.tsv pay/mp)."""
+    days, stamps, today = paydays_owed(char, now)
+    pay, mp = ranks.rank_pay(rank)
+    rows = []
+    for st in stamps:
+        rows.append((PAY_HEADER, 0, st, 0, 0))
+        rows.append((PAY_BASE, 0, st, pay, mp))
+    return rows, today
+
+
+def paybook_fill(blk, rows):
+    """Write paybook rows and their totals into a 0x0176 body.
+    Returns (body, total H$, total MP); rows past 20 are dropped."""
+    blk = bytearray(blk)
+    rows = list(rows)[:S176_ROW_MAX]
+    tm = sum(int(r[3]) for r in rows)
+    tmp = sum(int(r[4]) for r in rows)
+    struct.pack_into("<I", blk, S176_ROW_COUNT, len(rows))
+    for i, (kind, sub, stamp, money, mp) in enumerate(rows):
+        struct.pack_into("<BbHIiiI", blk, S176_ROWS + i * S176_ROW_LEN,
+                         kind & 0xFF, int(sub), 0, int(stamp) & 0xFFFFFFFF,
+                         int(money), int(mp), 0)
+    struct.pack_into("<i", blk, S176_TOTAL_MONEY, tm)
+    struct.pack_into("<i", blk, S176_TOTAL_MP, tmp)
+    return bytes(blk), tm, tmp
+
+
+#: KEY: 0x0175 -> 0x0176: the service-record / promotion exchange the counter
+#: operators run (see the handler). The reply block is the `rep movsd 0x77` at
+#: 0x6119291C = 476 B from packet+0x34 = payload+0x20.
+MSG_0175_REQ = 0x0175
+MSG_0176_REPLY = 0x0176
+
+
+S176_BODY_LEN = 0x77 * 4               # 476
+ANSWER_0175 = os.environ.get("FMO_ANSWER_0175", "1").strip() or "1"
+#: KEY: SALARY rides the same exchange (2026-09-12, static). SE: 「給与は1日に1度支給
+#: され、最大5日分まで人事課に貯めておくことができます」 (guide/addmanual:107) and
+#: 「階級が上がると、支給される給与の額が増える」 (intro/flow3:23). The 0x0176
+#: body IS the paybook the counter shows (systext group 11: Base pay / Kill
+#: bonus / ... / Total; the graceful arm's own string is 11:8 "Pay and rank
+#: processing failed"). FMO_SALARY=0 keeps the rank half and pays nothing.
+#:
+#: KEY: `every` = PAY ON EVERY CHECK, not once a day. A probe, and the only way
+#: to open the CITY CONTROL screen on demand: the machine's state 3
+#: (0x61192AEB) scans the 20 paybook slots at block+0x38 for a row whose kind
+#: byte is 1 (Base pay) and ONLY on a hit allocates 0x1F0 and calls the City
+#: Control ctor (0x61192B46 -> 0x610E86E0); with no Base pay row it falls
+#: straight through to the Personal Ratings screen. So once the day's pay is
+#: taken, that NPC can never show City Control again until tomorrow -- which
+#: is exactly what was hit live on 2026-09-12. `every` keeps a row in
+#: every reply (and keeps paying for it, so the screen stays truthful).
+SALARY_RAW = os.environ.get("FMO_SALARY", "").strip() or "1"
+SALARY = SALARY_RAW != "0"
+SALARY_EVERY = SALARY_RAW == "every"
+SALARY_MAX_DAYS = _env_int("FMO_SALARY_MAX_DAYS", "5")
+
+
+# Called at run time only; imported last so that import cycles resolve.
+from . import economy, ranks, status  # noqa: E402
