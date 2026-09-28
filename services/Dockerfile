@@ -14,6 +14,7 @@ COPY . /app/
 # run tools/gen_blowfish_tables.py before building). The game data under
 # fmodata/ is optional: the server runs without it, with the gaps the README
 # lists, until tools/fmodata_build.py has been run against your client.
+# It also refuses an image whose live_sessions.py is not the core's.
 RUN python - <<'EOF'
 import os, sys
 missing = [p for p in ("fmo_blowfish_P.bin", "fmo_blowfish_S.bin") if not os.path.exists(p)]
@@ -21,6 +22,9 @@ if missing:
     sys.exit("missing generated tables: %s - run tools/gen_blowfish_tables.py first" % ", ".join(missing))
 if not os.path.isdir("polcore"):
     sys.exit("the base image has no polcore/ - build it FROM the OpenLobby image")
+import live_sessions
+if not hasattr(live_sessions, "marker_key"):
+    sys.exit("live_sessions.py is not the core's (no marker_key) - an old copy was built into the image")
 if not os.path.exists("fmodata/fmo-ranks.tsv"):
     print("NOTE: fmodata/ holds only the authored events table; run "
           "tools/fmodata_build.py against your client install for the rank "

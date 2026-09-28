@@ -18,7 +18,8 @@ It READS three things and writes none of them:
   * the sector-win ledger, the fmo_sector_win table (fmo.py
     sector_win_record): one row per win, kept two days. The "Recent
     battles" sidebar.
-  * /data/fmo-sessions-live.json -- {count, stamp}, rewritten every 10 s:
+  * fmo.py's live-session marker, `live:fmo` in Valkey (the core's
+    live_sessions.py) -- {count, stamp}, rewritten every 10 s:
     TCP CONNECTIONS, not players (one player can be two). Labelled so.
 
 THE ONE TRAP (fmowar's docstring has the rest): War.tick() JUDGES phases and
@@ -69,8 +70,9 @@ KIND_NAME = {1: "O.C.U. Control Zone", 2: "O.C.U. Occupied Zone",
 
 #: the sidebar's newest wins, across every sector
 RECENT_MAX = 12
-#: fmo.py's live marker; trusted for pol-git-sync's grace, as the Jan board does
-LIVE_MARKER = "fmo-sessions-live.json"
+#: the service fmo.py's live marker is published under (live_sessions.py);
+#: trusted for pol-git-sync's grace, as the Jan board does
+LIVE_MARKER = "fmo"
 LIVE_GRACE_S = float(os.environ.get("POL_DEPLOY_MATCH_GRACE_S", "900") or 900)
 
 #: THE COLUMN MODEL, in the window's native 800x600: ONE x and ONE alignment
@@ -97,10 +99,6 @@ _SNAP_LOCK = threading.Lock()
 _RENDER = {"sig": None, "png": None}
 _RENDER_LOCK = threading.Lock()
 _ROWS = {"d": None}
-
-
-def data_dir():
-    return os.environ.get("POL_DATA_DIR", "/data")
 
 
 def zone_label(selector):
@@ -209,10 +207,12 @@ def connections(now=None):
     """fmo.py's connection count while its stamp is fresh, 0 once stale, None
     with no marker (the page then claims nothing)."""
     try:
-        with open(os.path.join(data_dir(), LIVE_MARKER), encoding="utf-8") as fh:
-            d = json.load(fh) or {}
+        import live_sessions
+        d = live_sessions.read_marker(LIVE_MARKER)
+        if d is None:
+            return None
         stamp, count = float(d.get("stamp") or 0), int(d.get("count") or 0)
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (ImportError, ValueError, TypeError, AttributeError):
         return None
     now = time.time() if now is None else now
     return count if 0 <= now - stamp < LIVE_GRACE_S else 0

@@ -45,6 +45,8 @@ def _main(db, argv=None):
     os.makedirs(data)
     os.makedirs(empty)
     os.environ["POL_DATA_DIR"] = data
+    # the live-session marker stays in this process's own store
+    os.environ.pop("POL_VALKEY_URL", None)
     os.environ.pop("FMO_WAR_STATE", None)
     import fmowar
     import boardfmo
@@ -62,8 +64,8 @@ def _main(db, argv=None):
         (200, 69118, 2, int(now) - 90000), (509, 103102, 1, int(now) - 7200)]
     db.execute_many("INSERT INTO fmo_sector_win (zone, tile, nation, won_at)"
                     " VALUES (%s, %s, %s, %s)", wins)
-    with open(os.path.join(data, "fmo-sessions-live.json"), "w") as fh:
-        json.dump({"count": 2, "stamp": now}, fh)
+    import live_sessions
+    live_sessions.write_marker(boardfmo.LIVE_MARKER, 2)
     port = free_port()
     args = polboards.build_parser().parse_args(["--fmo-port", str(port)])
     srv = polboards.serve(boardfmo, args, port)
