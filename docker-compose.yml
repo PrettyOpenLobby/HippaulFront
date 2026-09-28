@@ -58,6 +58,14 @@ services:
       FMO_CHAR_STORE: /data/fmo_characters.json
       FMO_WAR_STATE: /data/fmowar.json
       FMO_NPC_LAYOUT: /data/fmo_npc_layout.json
+      # play between pilots (README.md, Configuration): the peer link, the
+      # character ids the client sees, the defeat delay, group voice routing
+      # and Change Nations; empty = the release default
+      FMO_UDP_PEER_LINK: "${FMO_UDP_PEER_LINK:-}"
+      FMO_CHAR_WIRE_BASE: "${FMO_CHAR_WIRE_BASE:-}"
+      FMO_BATTLE_DEATH_END: "${FMO_BATTLE_DEATH_END:-}"
+      FMO_GROUP_VOICE_TO: "${FMO_GROUP_VOICE_TO:-}"
+      FMO_NATION_CHANGE_TOGGLE: "${FMO_NATION_CHANGE_TOGGLE:-}"
       # the lobby NPC editor: set FMO_DEVTOOL_PORT=8798 and use --profile
       # editor to reach it; it refuses a LAN bind without FMO_DEVTOOL_TOKEN
       FMO_DEVTOOL_PORT: "${FMO_DEVTOOL_PORT:-}"
