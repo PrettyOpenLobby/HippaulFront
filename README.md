@@ -47,8 +47,9 @@ numbers it has is still unknown.
 ## How it fits the core
 
 The core does the login, the DNS and the member profile; this repository is
-one service, `fmo.py`, holding the TCP session the client keeps for its whole
-lobby stay and the UDP world channel beside it (both on 61300). It joins the
+one service, `fmo.py` (the `fmoserver` package behind it), holding the TCP
+session the client keeps for its whole lobby stay and the UDP world channel
+beside it (both on 61300). It joins the
 core's data volume for the shared account and session database (which tells
 it who is playing from which address) and keeps its own player database
 beside it. The client is sent here by the core's games menu (content id 4)
@@ -116,9 +117,9 @@ catalogue beyond the built-in rows, no editor overlays.
 
 About three hundred `FMO_*` environment variables decide what this server
 serves; they were added one at a time while the protocol was worked out. The values a fresh
-server runs with are the private deployment's, listed in `services/fmo.py`
-(`RELEASE_DEFAULTS`); `docker-compose.yml` carries only the deployment-shaped
-ones. To change a knob, set it in `.env` and add it to the `fmo` service's
+server runs with are the private deployment's, listed in
+`services/fmoserver/defaults.py` (`RELEASE_DEFAULTS`); `docker-compose.yml`
+carries only the deployment-shaped ones. To change a knob, set it in `.env` and add it to the `fmo` service's
 environment (compose enumerates what reaches the container).
 
 These battle and economy knobs are on by default (set one to 0 in `.env` to

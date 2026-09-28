@@ -39,7 +39,7 @@ volumes:
 services:
   # THE WORLD RESPONDER: the TCP session the client holds for the whole of
   # its time in the lobby, and the UDP world channel beside it (both 61300).
-  # Every FMO_* game knob has its release default inside fmo.py; only the
+  # Every FMO_* game knob has its release default in fmoserver/defaults.py; only the
   # deployment-shaped values are set here. To override a knob, add it to
   # this list (compose enumerates what reaches the container) and set it in
   # .env.

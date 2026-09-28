@@ -43,6 +43,9 @@ SUITES = [
     ("fmo_board",  [PY, "fmo_board_test.py"],           HERE),
     # the title plugin: the Viewer's profile out of the pilot database
     ("fmo_title",  [PY, "fmo_title_test.py"],           HERE),
+    # every patch a test makes through fmo.py reaches the fmoserver module
+    # that owns the name
+    ("facade",     [PY, "facade_rebind_check.py"],      HERE),
 ]
 
 
