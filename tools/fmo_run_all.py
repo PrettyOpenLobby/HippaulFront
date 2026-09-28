@@ -37,6 +37,8 @@ SUITES = [
     ("fmostore",   [PY, "fmostore.py", "--selftest"],   SERVICES),
     # (under the code defaults, as fmo.py --selftest runs: FMO_RELEASE_DEFAULTS=0)
     ("fmo_store",  [PY, os.path.join(HERE, "fmo_store_test.py")], SERVICES),
+    # fmo.db and the board's Discord state files, imported into PostgreSQL
+    ("fmo_import", [PY, os.path.join(HERE, "fmo_import_test.py")], HERE),
     # the lobby NPC layout file the editor writes
     ("fmolayout",  [PY, "fmolayout.py", "--selftest"],  SERVICES),
     # the City Control board and its place in the boards host
