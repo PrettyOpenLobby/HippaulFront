@@ -207,5 +207,50 @@ print("0x018E row 0: id",
       struct.unpack_from("<I", body, rec + m.ML_KEY)[0],
       "name", body[rec + m.ML_NAME:rec + m.ML_NAME + 11].decode())
 
+# ---- the POL member behind an address, and that member's POL groups ---------
+# Both are read through OpenLobby's accounts functions (sessions_by_ip,
+# member_groups) on this same database, and the rows are made with accounts'
+# own functions, never by hand.
+import accounts  # noqa: E402
+os.environ.setdefault("POL_LOGIN_PW_KEY", "fmo-selftest")
+c = accounts.connect()
+mids = {}
+for nm in ("FMOALPHA", "FMOBRAVO"):
+    accounts.create_polid(c, nm, "Passw0rdTest")
+    mids[nm] = accounts.add_member(c, nm, nm, "Passw0rdTest")
+    accounts.set_handle(c, mids[nm], nm)
+tok = accounts.open_session(c, mids["FMOALPHA"], nick="FMOALPHA",
+                            peer_ip="198.51.100.9")
+with c:                          # backdated: open_session always stamps "now"
+    c.execute("UPDATE session SET created_at = %s WHERE token = %s",
+              ("2000-01-01T00:00:00Z", tok))
+accounts.open_session(c, mids["FMOALPHA"], nick="FMOALPHA", peer_ip="198.51.100.9")
+accounts.open_session(c, mids["FMOBRAVO"], nick="FMOBRAVO", peer_ip="198.51.100.10")
+accounts.open_session(c, mids["FMOALPHA"], nick="FMOALPHA", peer_ip="198.51.100.10")
+found = m.member_for_ip("198.51.100.9")
+assert found and found[0] == "member:%d" % mids["FMOALPHA"], found
+assert "FMOALPHA" in found[1], found
+two = m.member_for_ip("198.51.100.10")
+assert two and two[0] in ("member:%d" % mids["FMOALPHA"],
+                          "member:%d" % mids["FMOBRAVO"]), two
+assert m.member_for_ip("198.51.100.77") is None
+print("member_for_ip:", found[0], "/ two at one address:", two[0])
+
+hid = accounts.primary_handle_row(c, mids["FMOBRAVO"])["id"]
+for name, pending in (("Squad", 0), ("Invite", 1)):
+    accounts.add_friend(c, hid, name, kind=accounts.KIND_GROUP)
+    gid = accounts.group_id(c, hid, name)
+    accounts.add_group_member(c, gid, "FMOBRAVO", member_handle=hid,
+                              cls=accounts.GROUP_CLASS_MASTER, pending=pending)
+squad = accounts.group_id(c, hid, "Squad")
+c.close()
+bravo = m.Session("198.51.100.20:4000")
+bravo._account = "member:%d" % mids["FMOBRAVO"]
+groups = bravo.pol_groups
+assert set(groups) == {squad}, groups                     # the invite is left out
+assert groups[squad]["class"] == accounts.GROUP_CLASS_MASTER, groups
+assert groups[squad]["formed"] > 0, groups
+print("pol_groups:", groups)
+
 _TEST_DB.__exit__(None, None, None)
 print("ALL OK")
