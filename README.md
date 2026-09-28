@@ -49,12 +49,22 @@ numbers it has is still unknown.
 The core does the login, the DNS and the member profile; this repository is
 one service, `fmo.py` (the `fmoserver` package behind it), holding the TCP
 session the client keeps for its whole lobby stay and the UDP world channel
-beside it (both on 61300). It joins the
-core's data volume for the shared account and session database (which tells
-it who is playing from which address) and keeps its own player database
-beside it. The client is sent here by the core's games menu (content id 4)
-and dials `fmo01.pol.com`, which the core's DNS answers with the advertised
-address.
+beside it (both on 61300). It runs in the core's compose project: it reads
+the shared account and session database on the core's data volume (which
+tells it who is playing from which address), and keeps its pilots, squadron
+insignia, war state and sector wins in the core's PostgreSQL database, in
+tables of its own (`fmo_*`). Their schema is this repository's migrations
+(`services/fmo_migrations/`, numbered 2001 and up), applied by the service
+when it starts. The client is sent here by the core's games menu (content
+id 4) and dials `fmo01.pol.com`, which the core's DNS answers with the
+advertised address.
+
+The stores this server kept as files before it moved onto the database are
+imported the first time the database is empty and left where they were:
+`fmo_characters.json` (the character store, which `FMO_DB=0` still switches
+back to), `fmowar.json` and `fmo_sector_wins.json`. `fmo.db`, the SQLite
+player database of earlier versions, is not read by the server; an install
+that has one keeps it until its pilots are imported.
 
 ## The title plugin (the Viewer's profile)
 
@@ -69,13 +79,15 @@ checked out beside it:
 docker compose --project-directory ../openlobby     -f ../openlobby/docker-compose.yml -f docker-compose.title.yml     up -d --build login authsess
 ```
 
-Without it the game plays the same; only the Viewer's profile screen for a Front Mission Content ID stays empty. The plugin reads the pilot database (`FMO_DB`, on the shared data volume). To run several titles, build each title image on the previous
+Without it the game plays the same; only the Viewer's profile screen for a Front Mission Content ID stays empty. The plugin reads the pilots from the core's PostgreSQL database, which `login` and `authsess` are already connected to. To run several titles, build each title image on the previous
 one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
 `.env`, for example `POL_TITLES=tmtitle,fmotitle`.
 
 ## Prerequisites
 
-- The core lobby stack (OpenLobby) running on the same Docker host
+- The core lobby stack (OpenLobby) checked out beside this repository, with
+  its image built (`openlobby:latest`), because this service's image is built
+  on top of it
 - A Front Mission Online client install of your own
 - Docker with Compose v2, and Python 3.10+ on the host for the two
   generation steps
@@ -89,10 +101,19 @@ python tools/gen_blowfish_tables.py
 # 2. game tables, extracted from YOUR client install:
 python tools/fmodata_build.py --client "C:\path\to\FRONT MISSION ONLINE"
 
-# 3. the service:
+# 3. the service, in the core's compose project:
 cp .env.example .env      # set POL_ADVERTISE to your server's LAN/VPN IP
-docker compose up -d --build
+docker compose --project-directory ../openlobby \
+    --env-file ../openlobby/.env --env-file .env \
+    -f ../openlobby/docker-compose.yml -f docker-compose.yml \
+    up -d --build fmo
 ```
+
+`docker-compose.yml` is an override of OpenLobby's compose file, the way
+`docker-compose.title.yml` is: the service joins the core's network and
+starts after its PostgreSQL and Valkey. OpenLobby's `.env` comes first so
+its `POL_DB_PASSWORD` reaches the connection string; this repository's
+`.env` carries the `FMO_*` knobs.
 
 Without building: the image is published to
 `ghcr.io/prettyopenlobby/crystalfront` on every push (it carries the cipher
@@ -101,7 +122,10 @@ override mounts your `services/fmodata/` (and the baked board art) into the
 containers:
 
 ```
-docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
+docker compose --project-directory ../openlobby \
+    --env-file ../openlobby/.env --env-file .env \
+    -f ../openlobby/docker-compose.yml -f docker-compose.yml \
+    -f docker-compose.ghcr.yml up -d fmo
 ```
 
 Step 2 writes `services/fmodata/`: the rank ladder and class experience
@@ -162,12 +186,10 @@ marks it draws come from step 2.
 
 ## The City Control board (optional)
 
-```
-docker compose --profile board up -d
-```
-
-serves the war (the nineteen cities, who holds each, the phase score and
-clock) as a web page on port 8792, read-only over the war state, and can post
+Add `--profile board` to the compose command above and name `board`
+(`... up -d board`). It serves the war (the nineteen cities, who holds each,
+the phase score and clock) as a web page on port 8792, read-only over the
+war state in the database, and can post
 it to Discord through a webhook or as a bot (`.env`; a bot needs no webhook
 and posts wherever `/fmoboard` is run). The page's backdrop is the game's own
 satellite image, baked from your client with `tools/fmo_boardart_bake.py`;
@@ -183,6 +205,15 @@ runs the offline suite: every request the client sends driven through the
 real dispatcher, the world channel's cipher and framing, the community server
 codec, the war model, the player database and the board. Checks that need
 the generated game tables skip themselves until step 2 has been run.
+
+The suites import OpenLobby's `polcore` from the checkout beside this one
+(or `OPENLOBBY_DIR`, or `OPENLOBBY_SERVICES` for its `services/` directory)
+and need `pip install "psycopg[binary]" psycopg-pool valkey`. The ones that
+touch the database each get a new, empty one from OpenLobby's
+`tools/pgtest.py`, which starts a throwaway `postgres:17-alpine` in Docker
+(or uses the server `POL_TEST_DATABASE_URL` names) and removes it afterwards;
+they never use `POL_DATABASE_URL`. Without Docker or that variable those
+checks report SKIP, and `POL_TEST_REQUIRE_DB=1` turns that into a failure.
 
 ## What is not included, and why
 
