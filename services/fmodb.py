@@ -350,6 +350,16 @@ def read_old_fmo_db(path):
             Plan("fmo_character", ("account", "id"), char_cols, chars)], skipped
 
 
+#: The start of every Discord state file the City Control board wrote.
+#: polboards names a feed's file <feed key>_discord.json and the bot's <feed
+#: key>_bot_<guild>_discord.json, and board "fmo"'s feed keys are "fmo" and
+#: "fmo_<feed>", so each of its files starts with "fmo_": fmo_discord.json, and
+#: the bot's fmo_bot_<guild>_discord.json. The old state directory was shared
+#: by every board, so a directory import takes only these and
+#: discord_channels.json, and lists the other boards' files as skipped.
+BOARD_PREFIX = "fmo_"
+
+
 def read_old_board_state(path, table):
     """([Plan], skipped) from a board's old Discord state: one
     <name>_discord.json or discord_channels.json, or every such file directly
@@ -370,6 +380,10 @@ def read_old_board_state(path, table):
         if not (n.endswith("_discord.json") or n == "discord_channels.json"):
             skipped.append((n, "not a board state file (<name>_discord.json, "
                                "discord_channels.json)"))
+            continue
+        if n != "discord_channels.json" and not n.startswith(BOARD_PREFIX):
+            skipped.append((n, "another board's state (this board's files "
+                               "start with %s)" % BOARD_PREFIX))
             continue
         try:
             with open(f, encoding="utf-8") as fh:
