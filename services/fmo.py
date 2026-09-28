@@ -9315,6 +9315,9 @@ CHARSEL = {
 # rather than tuned.
 NATION_POP = (os.environ.get("FMO_NATION_POP", "").strip() or "1000,1000")
 NATION_ENABLE = _env_int("FMO_NATION_ENABLE", "1", 10)
+#: Change Nations (0x01AA) carries no target nation (+0x28 is 0 in every submit
+#: on record), so the switch is to the OTHER one. 0 = leave the nation alone.
+NATION_CHANGE_TOGGLE = os.environ.get("FMO_NATION_CHANGE_TOGGLE", "1") != "0"
 REPLY_019D_LEN = 36
 
 
@@ -9898,6 +9901,17 @@ except ValueError as _e:
 BATTLE_END_WON_SET = bool(os.environ.get("FMO_BATTLE_END_WON", "").strip())
 BATTLE_END_WON = (os.environ.get("FMO_BATTLE_END_WON", "").strip() or "1") != "0"
 BATTLE_END_CONTRIB = _env_int("FMO_BATTLE_END_CONTRIB", "0")
+#: KEY: SE'S DEFEAT CONDITION: "自分の機体が撃破されること" -- your own machine is
+#: destroyed (topics/060308, 敗北条件), and the squadron "生還率" counted members
+#: who came back WITHOUT being destroyed. So a destroyed pilot's OWN battle ends
+#: as a loss; room-mates fight on. Live 2026-09-27: both pilots died, the client
+#: offers no Emergency Escape once destroyed, and they sat out the 30-minute
+#: limit. N seconds after the pilot's DIED record (checked on the keepalive, so
+#: up to ~15 s later). On whenever FMO_BATTLE_END is set; 0 disables.
+BATTLE_DEATH_END = _env_float("FMO_BATTLE_DEATH_END", "5")
+#: {account key: time.time()} of the pilot's own unit's last DIED record --
+#: per ACCOUNT, never per address (two pilots behind one router).
+PILOT_DEATHS = {}
 BATTLE_END_EXP = os.environ.get("FMO_BATTLE_END_EXP", "").strip()
 #: FMO_BATTLE_START: 0 (default) = nothing. 1..3 = once per battle channel,
 #: right behind the self-POP, queue BM cmd 138 with that reason, so the client
@@ -13561,11 +13575,20 @@ class Session:
                         hud_banner(_bc, _b)
             if (BATTLE_END and _bst is not None
                     and not getattr(self, "battle_end_done", False)):
-                _trig = battle_end_trigger(_bst, BATTLE_END, time.time(),
-                                           MISSION_TIME)
+                _trig = pilot_death_trigger(
+                    PILOT_DEATHS.get(self.account),
+                    getattr(self, "sortie_granted_at", None), time.time(),
+                    BATTLE_DEATH_END)
+                _own = _trig is not None     # this pilot only -- see below
+                if _trig is None:
+                    _trig = battle_end_trigger(_bst, BATTLE_END, time.time(),
+                                               MISSION_TIME)
                 if _trig:
                     self.battle_end_done = True
-                    _bst["ended"] = True
+                    # A death ends THIS session's battle; the address-wide
+                    # "ended" flag would end a same-router partner's too.
+                    if not _own:
+                        _bst["ended"] = True
                     # VERIFIED: LIVE 2026-09-10 13:08Z: this ended a battle for the
                     # first time -- eject -> 0x014C -> the client's own "EXP
                     # Gain" screen -> its 0x0150 (0xFFFD) re-entry, no 0x013D.
@@ -13834,11 +13857,25 @@ class Session:
                 # log said "nation 2" only because she is female).
                 c["nation"] = p["payload"][0x26]
                 nb = p["payload"][0x28] if len(p["payload"]) >= 0x29 else 0
+                # WARNING: THE SUBMIT DOES NOT NAME THE NEW NATION (live 2026-09-27):
+                # +0x28 is 0 in every Change Nations submit on record, one
+                # switch O.C.U. -> U.S.N. and one U.S.N. -> O.C.U. --
+                # so "left alone" kept every player in the nation they had just
+                # left, while the client showed the change. With two playable
+                # nations the action IS the switch: take the other one.
+                # FMO_NATION_CHANGE_TOGGLE=0 restores leave-alone.
+                was = character_nation(c)[0]
+                how = "named by the submit"
+                if nb not in (1, 2) and NATION_CHANGE_TOGGLE and was in (1, 2):
+                    nb, how = 3 - was, (f"the submit names none (+0x28 = 0): "
+                                        f"switched {was} -> {3 - was}")
                 if nb in (1, 2):
                     c["nation_byte"] = nb
                 log(f"{self.peer}      submit +0x26 (gender) = "
-                    f"{p['payload'][0x26]}, +0x28 (nation) = {nb}"
-                    + ("" if nb in (1, 2) else "  WARNING: not 1/2, nation_byte left alone"))
+                    f"{p['payload'][0x26]}, +0x28 (nation) = "
+                    f"{p['payload'][0x28] if len(p['payload']) >= 0x29 else 0}"
+                    + (f" -> nation {nb} ({how})" if nb in (1, 2)
+                       else "  WARNING: no nation to switch from, nation_byte left alone"))
                 self.commit(f"id {cid} is now {c['first']} {c['last']}, "
                             f"gender {c['nation']}, nation "
                             f"{c.get('nation_byte')} (+0x28)")
@@ -21255,6 +21292,17 @@ def hud_banner(chan, text):
         log(f"[udp {chan.addr[0]}] banner not queued: {e!r}")
 
 
+def pilot_death_trigger(died_at, granted_at, now, delay):
+    """(why, won=False) when this pilot's own unit died in THIS sortie at
+    least `delay` seconds ago, else None. Pure. See BATTLE_DEATH_END."""
+    if not delay or delay <= 0 or died_at is None or granted_at is None:
+        return None
+    if died_at < granted_at or now - died_at < delay:
+        return None
+    return ("this pilot's wanzer was DESTROYED (SE's 敗北条件: "
+            "自分の機体が撃破されること)", False)
+
+
 def battle_end_trigger(st, triggers, now, limit_secs):
     """Which FMO_BATTLE_END trigger fires for this state at `now`, as
     (why, won) -- or None. Pure, so the selftest can drive every arm."""
@@ -21378,6 +21426,15 @@ def _note_battle_record(chan, addr, cmd, body):
                 st["kills"].append((h["target"], time.time()))
                 if h["target"] == chan.self_unit():
                     _credit_room_kill(chan, addr)
+                    _dead = account_for(addr[0])   # THIS channel's pilot
+                    if _dead not in PILOT_DEATHS or \
+                            time.time() - PILOT_DEATHS[_dead] > 60:
+                        log(f"[udp {addr[0]}:{addr[1]}]   DEFEAT: {_dead}'s "
+                            f"own wanzer was destroyed -- their battle ends as "
+                            f"a LOSS {BATTLE_DEATH_END:g}s from now, on the "
+                            f"next keepalive (FMO_BATTLE_DEATH_END); "
+                            f"room-mates fight on")
+                    PILOT_DEATHS[_dead] = time.time()
         log(f"[udp {addr[0]}:{addr[1]}]   cmd {cmd} = HIT"
             + (" BATCH" if cmd == fmoworld.CMD_BM_HIT_BATCH else "")
             + f": " + ("; ".join(f"target {h['target']:#x} part {h['part']} value "
@@ -24828,6 +24885,36 @@ def selftest():
         ok &= cycle_ok
     finally:
         globals()["CHAR_STORE"] = _store_was
+
+    # REGRESSION (live 2026-09-27): Change Nations names no nation (+0x28 = 0
+    # -- Ned's real submit bytes below), so the handler left every player in
+    # the nation they had just left. It must SWITCH, both ways; the twin
+    # (toggle off) must leave it alone. A temp store, never the real one.
+    import tempfile as _tf
+    _store_was = CHAR_STORE
+    with _tf.TemporaryDirectory() as _td:
+        globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+        try:
+            _sb = bytearray(0x38)                # Ned's live 18:33:38Z submit
+            struct.pack_into("<I", _sb, 0, 1)
+            _sb[0x04:0x07], _sb[0x15:0x19], _sb[0x26] = b"Ned", b"Test", 1
+            _sub = bytes(_sb)                    # +0x28 stays 0, as on the wire
+            _res = []
+            for _toggle, _start in ((True, 2), (True, 1), (False, 2)):
+                globals()["NATION_CHANGE_TOGGLE"] = _toggle
+                s6 = Session("selftest-nation")
+                s6._roster = [{"id": 1, "first": "Ned", "last": "Test",
+                               "nation_byte": _start, "gender": 1}]
+                s6.on_packet(parse(build(0x01AA, _sub, 0x100C)))
+                _res.append(s6._roster[0].get("nation_byte"))
+        finally:
+            globals()["CHAR_STORE"] = _store_was
+            globals()["NATION_CHANGE_TOGGLE"] = True
+    _nc = _res == [1, 2, 2]
+    print(f"  Change Nations with +0x28 = 0 switches U.S.N.->O.C.U. and "
+          f"O.C.U.->U.S.N.; toggle off leaves it (got {_res}): "
+          f"{'OK' if _nc else 'FAIL'}")
+    ok &= _nc
 
     # REGRESSION: 0x0166 was served as 4357 zeros with no builder, so every
     # setup read "Setup empty" and the pilot's part-model objects came back
@@ -30848,6 +30935,18 @@ def selftest():
     _t_esc = battle_end_trigger(_st_e, {"escape"}, 1051.0, 0)
     _t_done = battle_end_trigger(dict(_st_e, ended=True), {"escape"}, 1051.0, 0)
     _t_off = battle_end_trigger(_st_e, set(), 1051.0, 0)
+    # SE's defeat condition: own wanzer destroyed -> THIS pilot's loss after
+    # the delay. Twins: too soon, a death from a PREVIOUS sortie, disabled.
+    _pd = pilot_death_trigger(1100.0, 1000.0, 1106.0, 5)
+    _pd_ok = (_pd is not None and _pd[1] is False
+              and pilot_death_trigger(1100.0, 1000.0, 1103.0, 5) is None
+              and pilot_death_trigger(900.0, 1000.0, 1106.0, 5) is None
+              and pilot_death_trigger(1100.0, 1000.0, 1106.0, 0) is None
+              and pilot_death_trigger(None, 1000.0, 1106.0, 5) is None)
+    print(f"  defeat: a destroyed pilot's own battle ends as a LOSS after the "
+          f"delay; not before it, not for a death in an earlier sortie, not "
+          f"when FMO_BATTLE_DEATH_END=0: {'OK' if _pd_ok else 'FAIL'}")
+    ok &= _pd_ok
     _tr_ok = (_t_none is None
               and _t_timer and "timer" in _t_timer[0] and _t_timer[1] == BATTLE_END_WON
               and _t_limit and "time limit" in _t_limit[0]
