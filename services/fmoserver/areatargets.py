@@ -106,7 +106,7 @@ def area_target_taken(zone, tile, skip_account=None, rosters=None):
     the selftest; default every account in the character DB."""
     if rosters is None:
         db = charstore.use_db() if charstore.CHAR_STORE else None
-        accts = (fmostore.store_accounts(db)
+        accts = (fmostore.store_accounts()
                  if (db and fmostore is not None) else [])
         rosters = ((a, charstore.load_roster(a)) for a in accts if a != skip_account)
     for acct, roster in rosters:

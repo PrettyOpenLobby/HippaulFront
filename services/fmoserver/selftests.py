@@ -2,7 +2,7 @@
 import os
 import struct
 import time
-from .deps import fmolayout, fmomsn, fmosectors, fmostore, fmowar, fmoworld, flat_globals
+from .deps import fmodb, fmolayout, fmomsn, fmosectors, fmostore, fmowar, fmoworld, flat_globals
 
 
 # --------------------------------------------------------------------------- #
@@ -50,11 +50,41 @@ def status_block_zero_or_knobbed():
 
 
 def selftest():
+    """Checks that need no client: the checksum against real captured bytes.
+
+    The player database is a THROWAWAY one (OpenLobby's tools/pgtest.py),
+    never POL_DATABASE_URL: run inside a deployed container, a selftest that
+    used the configured database would write production (the 09-08 fmo.db
+    lesson). With no test database the database is switched off, the
+    character store falls back to the JSON file, and the checks that need
+    the database SKIP."""
+    import tempfile
+    _store_was = charstore.CHAR_STORE
+    _db_was = (charstore.FMO_DB, charstore._db_ready[0])
+    # the character store's JSON file too: never the configured one, which on
+    # a deployment is the operator's backup of the pilots
+    flat_globals()["CHAR_STORE"] = os.path.join(
+        tempfile.mkdtemp(prefix="fmo-selftest-"), "fmo_characters.json")
+    charstore._db_ready[0] = False              # this database's own first use
+    try:
+        if fmodb is None:
+            flat_globals()["FMO_DB"] = ""
+            return _selftest_run(None)
+        with fmodb.test_database() as url:
+            if url is None:
+                flat_globals()["FMO_DB"] = ""
+            return _selftest_run(url)
+    finally:
+        flat_globals()["CHAR_STORE"] = _store_was
+        flat_globals()["FMO_DB"] = _db_was[0]
+        charstore._db_ready[0] = _db_was[1]
+
+
+def _selftest_run(test_db):
     # WARNING: NEVER the real sector-win ledger: several checks run a WON battle
-    # through the live ledger, and on prod /data is the real one (the 09-08
+    # through the live ledger, and on prod that is the real one (the 09-08
     # fmo.db lesson: a selftest inside the container writes production).
-    flat_globals()["SECTOR_WINS_PATH"] = ""
-    """Checks that need no client: the checksum against real captured bytes."""
+    sectorwins.SECTOR_WINS_STORE = False
     # Declared here because POP is READ earlier in this function than the
     # battle-pop check that reassigns it -- Python forbids `global` after use.
     ok = True
@@ -4740,17 +4770,18 @@ def selftest():
     print(f"  insignia: the id the client registered was one WE offered: "
           f"{'OK' if _set_in else 'FAIL -- the picker has another source'}")
     ok &= _set_in
-    if fmostore is not None:
-        import tempfile as _tf
-        _p = os.path.join(_tf.mkdtemp(), "sq.db")
-        _a, _b0 = fmostore.set_squadron_insignia(3, 131, "selftest", _p)
-        _c, _d = fmostore.set_squadron_insignia(3, 999, "selftest", _p)
+    if fmostore is not None and not test_db:
+        print("  insignia: a registration persists: SKIP (no test database)")
+    if fmostore is not None and test_db:
+        _a, _b0 = fmostore.set_squadron_insignia(3, 131, "selftest")
+        _c, _d = fmostore.set_squadron_insignia(3, 999, "selftest")
         _persist = (_a == 131 and _b0 == 0 and _c == 131 and _d == 131
-                    and fmostore.squadron_insignia(3, _p) == 131
-                    and fmostore.squadron_insignia(45, _p) == 0)
+                    and fmostore.squadron_insignia(3) == 131
+                    and fmostore.squadron_insignia(45) == 0)
         print(f"  insignia: a registration persists and a SECOND one cannot "
               f"overwrite it (86:21): {'OK' if _persist else 'FAIL'}")
         ok &= _persist
+    if fmostore is not None:
         # And the +0x0A word must report the stored value, which is what greys
         # the row -- the whole point of persisting it.
         _word = squadron.squadron_insignia_word(1, 0)
@@ -6358,7 +6389,7 @@ def selftest():
         try:
             _g = flat_globals()
             _g["WAR"], _g["WAR_MAP"], _g["WAR_FIELDS"] = "1", "", ""
-            _st = fmowar.War(path=os.devnull, autosave=False)
+            _st = fmowar.War(autosave=False, load=False)
             _st.data = {"sectors": {}, "phases": {}, "log": []}
             _g["_WAR_STATE"] = _st
             _r1 = community.msn_reply("selftest", 0x10, fmomsn.SECTORS_CAPTURE)
@@ -7228,9 +7259,9 @@ def selftest():
         _ss.commit = lambda why: None
         _svs = (missionboard.MISSION_REPORT, charstore.CHAR_STORE, list(community.MSN_ROWS), community.MSN_FIELDS,
                 warmap.MSN_WINS, dict(rooms.WORLD_ZONES))
-        _sv_swp = sectorwins.SECTOR_WINS_PATH
+        _sv_swp = sectorwins.SECTOR_WINS_STORE
         try:
-            flat_globals()["SECTOR_WINS_PATH"] = ""       # never the real file
+            sectorwins.SECTOR_WINS_STORE = False          # never the real ledger
             sectorwins.SECTOR_WINS.clear()
             flat_globals()["MISSION_REPORT"] = True
             flat_globals()["CHAR_STORE"] = "selftest-stub"
@@ -7259,7 +7290,7 @@ def selftest():
             rooms.WORLD_ZONES.update(_wz)
             sectorwins.SECTOR_WINS.clear()
             sectorwins.SECTOR_WINS.update(_sv_led)
-            flat_globals()["SECTOR_WINS_PATH"] = _sv_swp
+            sectorwins.SECTOR_WINS_STORE = _sv_swp
         # (4) the COUNTER-MISSION arrow: an enemy-side pilot fighting on the
         # map with an open mission for (zone, tile); the viewer's own mission
         # wins the byte; a win there owes a kind-2 line
@@ -7490,21 +7521,33 @@ def selftest():
             rooms.WORLD_ZONES.clear()
             rooms.WORLD_ZONES.update(_wz3)
         # (8) the ledger survives a restart: save, a fresh load, pruning
-        import tempfile as _tf
-        _wd = _tf.mkdtemp(prefix="fmo-wins-")
-        _wp8 = os.path.join(_wd, "w.json")
-        _l8 = {}
-        _T8 = 1_800_000_000
-        sectorwins.sector_win_record(207, 89135, 1, now=_T8 - 10, ledger=_l8)
-        sectorwins.sector_win_record(200, 71122, 2, now=_T8 - 400000, ledger=_l8)
-        _saved = sectorwins.sector_wins_save(_wp8, _l8, now=_T8)
-        _l8b = {}
-        _loaded = sectorwins.sector_wins_load(_wp8, _l8b)
-        _persist_ok = (_saved and _loaded == 1
-                       and _l8b == {(207, 89135, 1): [_T8 - 10]}
-                       and sectorwins.sector_wins_load(os.path.join(_wd, "none.json"),
-                                                       {}) == 0
-                       and sectorwins.sector_wins_save("", _l8b) is False)
+        # (in the throwaway database; SKIPped without one)
+        _persist_ok = None
+        if test_db:
+            import tempfile as _tf
+            _wd = _tf.mkdtemp(prefix="fmo-wins-")
+            _sv_leg = sectorwins.SECTOR_WINS_LEGACY
+            sectorwins.SECTOR_WINS_LEGACY = os.path.join(_wd, "none.json")
+            _l8 = {}
+            _T8 = 1_800_000_000
+            _empty0 = sectorwins.sector_wins_load(True, {}) == 0
+            sectorwins.sector_win_record(207, 89135, 1, now=_T8 - 10, ledger=_l8)
+            sectorwins.sector_win_record(200, 71122, 2, now=_T8 - 400000, ledger=_l8)
+            _saved = sectorwins.sector_wins_save(True, _l8, now=_T8)
+            _l8b = {}
+            _loaded = sectorwins.sector_wins_load(True, _l8b)
+            # the old JSON file fills an EMPTY table once, bad keys skipped
+            sectorwins.sector_wins_save(True, {}, now=_T8)
+            with open(os.path.join(_wd, "old.json"), "w", encoding="utf-8") as _fh:
+                _fh.write('{"505:85102:1": [%d], "bad": [1], "509:94101:x": [2]}' % (_T8 - 5))
+            sectorwins.SECTOR_WINS_LEGACY = os.path.join(_wd, "old.json")
+            _l8c = {}
+            _imp = sectorwins.sector_wins_load(True, _l8c)
+            sectorwins.SECTOR_WINS_LEGACY = _sv_leg
+            _persist_ok = (_empty0 and _saved and _loaded == 1
+                           and _l8b == {(207, 89135, 1): [_T8 - 10]}
+                           and _imp == 1 and _l8c == {(505, 85102, 1): [_T8 - 5]}
+                           and sectorwins.sector_wins_save(False, _l8b) is False)
         # (9) -8: another pilot's active area accept on the same (zone, tile)
         _other = {"missions": [_mm(id=13, name="Deep Strike", cat=3,
                                    sector=71122, zone=200,
@@ -7549,8 +7592,9 @@ def selftest():
                      and _os10.log_order(b"short") is None)
         for _lbl, _v in (
                 ("round 3b: the sector-win ledger is saved and reloaded "
-                 "(FMO_SECTOR_WINS), pruned to FMO_SECTOR_WINS_KEEP; a missing "
-                 "file loads nothing; no path saves nothing", _persist_ok),
+                 "(FMO_SECTOR_WINS, the database), pruned to FMO_SECTOR_WINS_KEEP; "
+                 "an empty table loads nothing; the old JSON file fills an empty "
+                 "table once; memory only saves nothing", _persist_ok),
                 ("round 3b: -8 (27:13): another pilot's ACTIVE area accept on "
                  "the same (zone, tile) refuses the pick; own, other zone, "
                  "closed ones do not", _taken_ok),
@@ -7621,6 +7665,9 @@ def selftest():
                  "G+0x5A58/G+0x5B74, View B carries the same fields", _wire_ok),
                 ("the knob: OFF is byte-identical (724 zeros, id+name rows, no "
                  "deadline); ON with no pilot still answers both", _off_ok)):
+            if _v is None:              # needs the test database, which is absent
+                print(f"  mission report: {_lbl}: SKIP (no test database)")
+                continue
             print(f"  mission report: {_lbl}: {'OK' if _v else 'FAIL'}")
             ok &= _v
         # WARNING: THE KILL. Answering an UNDECODED op with 0x1B killed the client at

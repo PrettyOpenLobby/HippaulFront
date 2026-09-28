@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """fmo_board_browser.py -- drive the FMO City Control page in a real headless
 Chrome (render-web-ui-before-shipping), over a temporary war with three held
-cities and a few battles, then over NO war file at all.
+cities and a few battles, then over NO war state at all. The war and the
+ledger go into a throwaway database (OpenLobby's tools/pgtest.py).
 
     python tools/fmo_board_browser.py [--shots DIR]
 
@@ -25,6 +26,15 @@ from fe_panel_browser import Browser, free_port   # noqa: E402
 
 
 def main(argv=None):
+    import fmodb
+    with fmodb.test_database() as url:
+        if url is None:
+            raise SystemExit("[fmo_board_browser] needs a test database (Docker, "
+                             "or POL_TEST_DATABASE_URL)")
+        _main(fmodb.db, argv)
+
+
+def _main(db, argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--shots", default=tempfile.mkdtemp(prefix="fmo-board-shots-"))
     o = ap.parse_args(argv)
@@ -40,18 +50,18 @@ def main(argv=None):
     import boardfmo
     import polboards
     now = time.time()
-    w = fmowar.War(path=os.path.join(data, "fmowar.json"))
+    w = fmowar.War()
     w.seed_from_sectors({505: {85102: 0}, 509: {94101: 0}, 513: {112101: 0}}, force=True)
     mid = fmowar._ts(2026, 10, 1)
     for _ in range(3):
         w.settle(85102, fmowar.OCU, won=True, now=mid)
         w.settle(112101, fmowar.USN, won=True, now=mid)
         w.settle(94101, fmowar.OCU, won=True, now=mid)
-    wins = {"505:85102:1": [int(now) - 600 * i for i in range(4)],
-            "513:112101:2": [int(now) - 450, int(now) - 5000],
-            "200:69118:2": [int(now) - 90000], "509:103102:1": [int(now) - 7200]}
-    with open(os.path.join(data, "fmo_sector_wins.json"), "w") as fh:
-        json.dump(wins, fh)
+    wins = [(505, 85102, 1, int(now) - 600 * i) for i in range(4)] + [
+        (513, 112101, 2, int(now) - 450), (513, 112101, 2, int(now) - 5000),
+        (200, 69118, 2, int(now) - 90000), (509, 103102, 1, int(now) - 7200)]
+    db.execute_many("INSERT INTO fmo_sector_win (zone, tile, nation, won_at)"
+                    " VALUES (%s, %s, %s, %s)", wins)
     with open(os.path.join(data, "fmo-sessions-live.json"), "w") as fh:
         json.dump({"count": 2, "stamp": now}, fh)
     port = free_port()
@@ -140,12 +150,14 @@ def main(argv=None):
         check("a phone gets the window alone, no sideways scroll",
               b.js("side.hidden") and b.js("document.documentElement.scrollWidth <= innerWidth + 1"))
         b.screenshot(os.path.join(o.shots, "3-phone.png"))
-        # no war file, no ledger, no marker: the honest empty board
+        # no war state, no ledger, no marker: the honest empty board
         os.environ["POL_DATA_DIR"] = empty
+        db.execute("DELETE FROM fmo_war")
+        db.execute("DELETE FROM fmo_sector_win")
         boardfmo._SNAP.update(t=0.0, snap=None)
         b.call("Emulation.setDeviceMetricsOverride", width=1920, height=1080, deviceScaleFactor=1, mobile=False)
         b.goto(url, settle=2.5)
-        check("with no war file every city is Deadlock and the board says why",
+        check("with no war state every city is Deadlock and the board says why",
               b.js("S.cities.every(c => c.nation === 0)")
               and b.js("E.status.textContent").startswith("No war state on file yet")
               and b.js("[E.ocu.textContent, E.usn.textContent]") == ["0", "0"])

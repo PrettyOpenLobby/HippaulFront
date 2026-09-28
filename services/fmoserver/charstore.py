@@ -1,4 +1,4 @@
-"""The character store: the per-account roster in fmo.db or the JSON file, and the 0x013E
+"""The character store: the per-account roster in the database or the JSON file, and the 0x013E
 creation record."""
 import json
 import os
@@ -161,18 +161,16 @@ def _default_store():
 #: LIST_NAME list -- the state every measurement before 2026-08-20 ran against.
 CHAR_STORE = os.environ.get("FMO_CHAR_STORE", _default_store())
 
-#: KEY: THE PLAYER DATABASE (2026-09-08) -- see fmostore.py for what moved into it
-#: and why it is its own file rather than a table in accounts.db.
+#: KEY: THE PLAYER DATABASE (2026-09-08) -- see fmostore.py for what moved into it.
+#: Since 2026-09 it is the stack's PostgreSQL database (POL_DATABASE_URL), in
+#: CrystalFront's own `fmo_` tables; before that it was the SQLite file fmo.db.
 #:
-#: DEFAULTS TO `fmo.db` BESIDE THE CHARACTER STORE, not to a path of its own.
-#: That is deliberate: prod points FMO_CHAR_STORE at /data, the dev stack at
-#: pol-server/data and every test at a temp directory, and a database that did
-#: not follow would have quietly made a test write to the real one. An empty
-#: FMO_CHAR_STORE still disables the whole store, exactly as documented.
-#:
-#: `FMO_DB=` (empty) keeps using the JSON store, which is the state every
-#: measurement before today ran against. The JSON file is never modified once
-#: the database is in use, so that switch is a real rollback, not a hope.
+#: `FMO_DB` is the switch: empty or 0 keeps using the JSON store, which is the
+#: state every measurement before 2026-09-08 ran against. Any other value (the
+#: release default, or an old `/data/fmo.db` path) uses the database. The JSON
+#: file is never modified once the database is in use, so that switch is a
+#: real rollback, not a hope. An empty FMO_CHAR_STORE still disables the
+#: whole store, exactly as documented.
 #:
 #: WARNING: THE SWITCH IS ALSO THE MIGRATION. `use_db()` imports fmo_characters.json
 #: the first time it finds an empty database, once, and refuses to do it again
@@ -182,10 +180,9 @@ CHAR_STORE = os.environ.get("FMO_CHAR_STORE", _default_store())
 if not fmostore:
     FMO_DB = ""
 elif os.environ.get("FMO_DB") is not None:
-    FMO_DB = os.environ["FMO_DB"].strip()
+    FMO_DB = "" if os.environ["FMO_DB"].strip() in ("", "0") else "1"
 elif CHAR_STORE:
-    FMO_DB = os.path.join(os.path.dirname(os.path.abspath(CHAR_STORE)),
-                          "fmo.db")
+    FMO_DB = "1"
 else:
     FMO_DB = ""                         # the store is off; so is the database
 _db_ready = [False]
@@ -193,7 +190,7 @@ _db_lock = threading.Lock()
 
 
 def use_db():
-    """The database path to use, or None to stay on the JSON store.
+    """True to use the database, or None to stay on the JSON store.
 
     Does the one-shot JSON import on the first call that finds an empty
     database. Never raises: a database fault must degrade to the JSON store,
@@ -204,30 +201,31 @@ def use_db():
         return None
     with _db_lock:
         if _db_ready[0]:
-            return FMO_DB
+            return True
         _db_ready[0] = True             # once, whatever happens below
         try:
-            n_a, n_c = fmostore.import_json(CHAR_STORE, FMO_DB)
+            fmostore.ready()
+            n_a, n_c = fmostore.import_json(CHAR_STORE)
             if n_c:
                 log(f"KEY: PLAYER DATABASE: imported {n_c} character(s) for "
-                    f"{n_a} account(s) from {CHAR_STORE} into {FMO_DB}. The "
-                    f"JSON file is UNTOUCHED and is now the backup -- clear "
-                    f"FMO_DB to fall back to it.")
+                    f"{n_a} account(s) from {CHAR_STORE} into the database. The "
+                    f"JSON file is UNTOUCHED and is now the backup -- set "
+                    f"FMO_DB=0 to fall back to it.")
             else:
-                log(f"player database {FMO_DB}: "
-                    f"{fmostore.count(FMO_DB)} character(s) on file")
+                log(f"player database: "
+                    f"{fmostore.count()} character(s) on file")
         except Exception as e:                       # pragma: no cover
-            log(f"WARNING: player database {FMO_DB} unusable ({e!r}) -- falling back "
+            log(f"WARNING: player database unusable ({e!r}) -- falling back "
                 f"to the JSON store {CHAR_STORE}")
             return None
-    return FMO_DB
+    return True
 
 
 def load_roster(account):
     """This account's characters, oldest first. [] when there is no store."""
     db = use_db()
     if db:
-        return fmostore.load_roster(account, db)
+        return fmostore.load_roster(account)
     if not CHAR_STORE:
         return []
     with identity._store_lock:
@@ -253,7 +251,7 @@ def save_roster(account, roster):
         return
     db = use_db()
     if db:
-        fmostore.save_roster(account, roster, db)
+        fmostore.save_roster(account, roster)
         return
     with identity._store_lock:
         try:

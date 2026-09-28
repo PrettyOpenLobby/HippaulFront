@@ -11,19 +11,19 @@ War.score), and the phase clock (fmowar.phase_at). The words are SE's own
 B.G.Cost / Rank / O.C.U. / U.S.N. / Deadlock). The look is SE's war map: grey
 panels over the zone's satellite image (tools/fmo_boardart_bake.py).
 
-It READS three files and writes none of them:
-  * /data/fmowar.json ($FMO_WAR_STATE) -- the war. It may be MISSING: fmo.py
-    creates it on first use. Then every city is Deadlock and the board says
-    there is no war state on file.
-  * /data/fmo_sector_wins.json -- the sector-win ledger (fmo.py
-    sector_win_record): "zone:tile:nation" -> [unix times], kept two days.
-    The "Recent battles" sidebar.
+It READS three things and writes none of them:
+  * the war, the fmo_war row in the stack's database (fmowar.read_state).
+    It may be MISSING: fmo.py creates it on first use. Then every city is
+    Deadlock and the board says there is no war state on file.
+  * the sector-win ledger, the fmo_sector_win table (fmo.py
+    sector_win_record): one row per win, kept two days. The "Recent
+    battles" sidebar.
   * /data/fmo-sessions-live.json -- {count, stamp}, rewritten every 10 s:
     TCP CONNECTIONS, not players (one player can be two). Labelled so.
 
 THE ONE TRAP (fmowar's docstring has the rest): War.tick() JUDGES phases and
 Deadlocks the loser's fortress, and War.sector(tile) INSERTS a default for an
-unknown tile. This module only ever touches War(path, autosave=False).data and
+unknown tile. This module only ever touches War(autosave=False).data and
 .score() -- both pure reads -- and the pure fmowar.phase_at().
 
 HONESTY. SE never published its numbers: the opening map (control 100 %,
@@ -103,17 +103,6 @@ def data_dir():
     return os.environ.get("POL_DATA_DIR", "/data")
 
 
-def war_path():
-    """fmo.py's own rule (fmowar.STATE_PATH): $FMO_WAR_STATE, else the data
-    volume's fmowar.json -- read at call time so a test can point it."""
-    return os.environ.get("FMO_WAR_STATE", "").strip() or os.path.join(data_dir(), "fmowar.json")
-
-
-def wins_path():
-    return (os.environ.get("FMO_SECTOR_WINS", "").strip()
-            or os.path.join(data_dir(), "fmo_sector_wins.json"))
-
-
 def zone_label(selector):
     """505 -> 'FZ-06', 200 -> 'O.C.U. Occupied Zone 01'."""
     kind, idx = divmod(int(selector), 100)
@@ -141,15 +130,11 @@ def sector_row(selector, tile):
     return _ROWS["d"].get((int(selector), int(tile)))
 
 
-def load_war(path=None):
-    """(War, present, mtime). War(autosave=False).load() only READS; a
-    missing or unreadable file is an empty war."""
-    path = path or war_path()
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        mtime = None
-    return fmowar.War(path=path, autosave=False), mtime is not None, mtime
+def load_war():
+    """(War, present, updated_at). War(autosave=False) only READS; a missing
+    or unreadable state is an empty war."""
+    war = fmowar.War(autosave=False)
+    return war, war.present, war.updated_at
 
 
 def holder(s):
@@ -195,26 +180,27 @@ def cities(war):
     return out
 
 
-def recent_battles(limit=RECENT_MAX, path=None):
-    """[{zone, tile, nation, t, area, sector, city}], newest first, from the
-    sector-win ledger. Missing file = no battles, never an error."""
+def _ledger_rows(limit):
+    """The newest `limit` rows of the sector-win ledger; [] with no database."""
     try:
-        with open(path or wins_path(), encoding="utf-8") as fh:
-            raw = json.load(fh) or {}
-    except (OSError, ValueError):
+        import fmodb
+        fmodb.ready()
+        return fmodb.db.query("SELECT zone, tile, nation, won_at FROM fmo_sector_win"
+                              " ORDER BY won_at DESC LIMIT %s", (int(limit),))
+    except Exception:           # no polcore, no database, no table: no battles
         return []
+
+
+def recent_battles(limit=RECENT_MAX):
+    """[{zone, tile, nation, t, area, sector, city}], newest first, from the
+    sector-win ledger. No ledger = no battles, never an error."""
     out = []
-    for key, times in raw.items() if isinstance(raw, dict) else ():
-        try:
-            z, t, n = (int(x) for x in key.split(":"))
-            stamps = [int(x) for x in times]
-        except (ValueError, TypeError, AttributeError):
-            continue
+    for r in _ledger_rows(limit):
+        z, t, n, st = int(r["zone"]), int(r["tile"]), int(r["nation"]), int(r["won_at"])
         city = fmowar.CITIES.get(t) if z // 100 == 5 else None
-        for st in stamps:
-            out.append({"zone": z, "tile": t, "nation": n, "t": st,
-                        "area": zone_label(z), "sector": sector_row(z, t),
-                        "city": city[0] if city else ""})
+        out.append({"zone": z, "tile": t, "nation": n, "t": st,
+                    "area": zone_label(z), "sector": sector_row(z, t),
+                    "city": city[0] if city else ""})
     out.sort(key=lambda b: -b["t"])
     return out[:limit]
 

@@ -5,10 +5,15 @@ its place in the polboards service.
     python tools/fmo_board_test.py
 
 Pins: the nineteen cities and the score exactly as fmowar counts them; the
-board NEVER writes game data (every file in the data dir hashes the same after
-all of it, and a phase past its judgement is NOT judged by a page view); the
-missing-file case; the recent-battles ledger; the connection marker; the
-routes and the art whitelist; the Discord message, edited in place.
+board NEVER writes game data (the stored war is unchanged, and every file in
+the data dir hashes the same, after all of it, and a phase past its judgement
+is NOT judged by a page view); the no-war case; the recent-battles ledger;
+the connection marker; the routes and the art whitelist; the Discord message,
+edited in place.
+
+The war and the ledger live in the database: this runs on a throwaway one
+(OpenLobby's tools/pgtest.py) and SKIPs without Docker or
+POL_TEST_DATABASE_URL (POL_TEST_REQUIRE_DB=1 makes that a failure).
 """
 import ast
 import contextlib
@@ -93,6 +98,15 @@ def fresh(boardfmo):
 
 
 def main():
+    import fmodb
+    with fmodb.test_database() as url:
+        if url is None:
+            print("[fmo_board_test] SKIP -- no test database")
+            return
+        _main(fmodb.db)
+
+
+def _main(db):
     tmp = tempfile.mkdtemp(prefix="boardfmo-")
     data = os.path.join(tmp, "data")
     os.makedirs(data)
@@ -102,22 +116,21 @@ def main():
     import fmowar
     import boardfmo
     import polboards
-    war_file = os.path.join(data, "fmowar.json")
     mid = fmowar._ts(2026, 10, 1)
 
-    print("no war file yet")
+    print("no war state yet")
     s = boardfmo.snapshot(now=mid)
     check("the page still has all nineteen cities, every one Deadlock",
           len(s["cities"]) == 19 and all(c["nation"] == 0 for c in s["cities"]))
     check("...a 0 : 0 score out of 66", (s["score"]["ocu"], s["score"]["usn"], s["score"]["total"]) == (0, 0, 66))
     check("...and says there is no war state on file",
           not s["war"]["present"] and boardfmo.status_text(s).startswith("No war state on file"))
-    check("...without creating the file by looking", not os.path.exists(war_file))
+    check("...without creating it by looking", fmowar.read_state() == (None, None))
     check("no ledger and no marker: no battles, no connection claim",
           s["recent"] == [] and s["connections"] is None)
 
     print("the war as fmo writes it")
-    w = fmowar.War(path=war_file)
+    w = fmowar.War()
     fake = {100: {60126: 0}, 200: {69118: 0}, 505: {85102: 0, 87101: 0},
             509: {94099: 0, 94101: 0, 103100: 0}, 513: {112101: 0}}
     w.seed_from_sectors(fake, force=True)
@@ -138,12 +151,12 @@ def main():
     w.data["sectors"]["85102"]["bg_max"], w.data["sectors"]["85102"]["bg_min"] = 6, -2
     w.save()
     before = tree_hash(data)
-    mtime = os.path.getmtime(war_file)
+    war_before = fmowar.read_state()
     s = boardfmo.snapshot(now=mid)
     by = {c["name"]: c for c in s["cities"]}
     check("the score is fmowar's own count (O.C.U. 7 : 4 U.S.N.)",
           (s["score"]["ocu"], s["score"]["usn"]) == (7, 4)
-          and fmowar.War(path=war_file, autosave=False).score() == {1: 7, 2: 4})
+          and fmowar.War(autosave=False).score() == {1: 7, 2: 4})
     check("Maltaf is O.C.U. at one rate step, Peseta U.S.N., Vienne still Deadlock",
           by["Maltaf"]["nation"] == 1 and by["Maltaf"]["control"] == fmowar.RATE_STEP
           and by["Peseta"]["nation"] == 2 and by["Vienne"]["nation"] == 0)
@@ -165,11 +178,11 @@ def main():
     s_late = boardfmo.snapshot(now=late)
     check("a page view past the judgement does NOT judge the phase (tick() is never called)",
           s_late["phase"]["ceasefire"] and s_late["phase"]["judged"] is None
-          and json.load(open(war_file))["phases"] == {})
+          and fmowar.read_state()[0]["phases"] == {})
     check("...and never inserts a sector it does not have",
-          len(json.load(open(war_file))["sectors"]) == len(w.data["sectors"]))
-    check("every file in the data dir is byte-identical after the snapshots",
-          tree_hash(data) == before and os.path.getmtime(war_file) == mtime)
+          len(fmowar.read_state()[0]["sectors"]) == len(w.data["sectors"]))
+    check("the stored war and every file in the data dir are identical after the snapshots",
+          tree_hash(data) == before and fmowar.read_state() == war_before)
 
     print("the phase clock")
     p = s["phase"]
@@ -180,7 +193,7 @@ def main():
     check("the ceasefire and the time before the war read as such",
           boardfmo.clock_text(s_late["phase"]).startswith("Phase 1 ceasefire   Phase 2 begins 2026/11/05")
           and boardfmo.clock_text(boardfmo.phase(w, fmowar._ts(2026, 9, 1))).startswith("No war yet"))
-    judged = fmowar.War(path=os.devnull, autosave=False)
+    judged = fmowar.War(autosave=False, load=False)
     judged.data = json.loads(json.dumps(w.data))
     judged.tick(now=late)                                   # in MEMORY, for the event test
     check("a judged phase is read from the file's own record",
@@ -196,11 +209,12 @@ def main():
 
     print("recent battles and connections")
     now = time.time()
-    with open(os.path.join(data, "fmo_sector_wins.json"), "w") as fh:
-        json.dump({"505:85102:1": [int(now) - 300, int(now) - 60],
-                   "200:69118:2": [int(now) - 120], "bad": [1], "509:94101:x": [2]}, fh)
+    db.execute_many("INSERT INTO fmo_sector_win (zone, tile, nation, won_at)"
+                    " VALUES (%s, %s, %s, %s)",
+                    [(505, 85102, 1, int(now) - 300), (505, 85102, 1, int(now) - 60),
+                     (200, 69118, 2, int(now) - 120)])
     rb = boardfmo.recent_battles()
-    check("newest first, across sectors; bad keys skipped",
+    check("newest first, across sectors",
           [(b["area"], b["sector"], b["nation"]) for b in rb]
           == [("FZ-06", 12, 1), ("O.C.U. Occupied Zone 01", 1, 2), ("FZ-06", 12, 1)], rb)
     check("a frontline city carries its name, other sectors none",
@@ -342,10 +356,10 @@ def main():
         check("/healthz", get("/healthz")[0] == 200)
     finally:
         srv.shutdown()
-    check("after everything, the game data is still byte-identical",
-          {k: v for k, v in tree_hash(data).items()
-           if k not in ("fmo_sector_wins.json", boardfmo.LIVE_MARKER)}
-          == {k: v for k, v in before.items()})
+    check("after everything, the game data is still identical",
+          {k: v for k, v in tree_hash(data).items() if k != boardfmo.LIVE_MARKER}
+          == {k: v for k, v in before.items()}
+          and fmowar.read_state() == war_before)
     print("[fmo_board_test] OK -- %d checks" % len(CHECKS))
 
 

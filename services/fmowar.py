@@ -29,8 +29,15 @@ STATE OF PROOF (2026-09-12), stated plainly:
     cap, tick size) are knobs with labelled defaults, not SE's -- SE never
     published them.
 
-Deliberately import-light (json/os/struct/time/datetime only) so fmo.py can
-use it inside the container, like fmoworld.py and fmomsn.py.
+Deliberately import-light (json/os/struct/time/datetime; the database through
+fmodb, imported when the state is first read or written) so the board and the
+tests can use the rules without a database, like fmoworld.py and fmomsn.py.
+
+WHERE THE STATE LIVES. One JSON document in the stack's PostgreSQL database
+(the fmo_war table, see fmodb.py), read whole and written whole as the file
+fmowar.json was until 2026-09. The first writer to find the table empty
+imports that file once (FMO_WAR_STATE, else /data/fmowar.json) and leaves it
+as it was.
 """
 import argparse
 import datetime
@@ -44,9 +51,10 @@ OCU, USN = 1, 2
 NATIONS = (OCU, USN)
 
 #: Knobs (read once; fmo.py may override the module attributes for a test).
-#: FMO_WAR_STATE -- the JSON file the state lives in. Default: /data (the
-#: container's volume, where fmo.db lives) else next to this module.
-STATE_PATH = os.environ.get("FMO_WAR_STATE", "").strip() or os.path.join(
+#: FMO_WAR_STATE -- the JSON file the state lived in before it moved into the
+#: database: imported once into an empty table, never written. Default: /data
+#: (the container's volume) else next to this module.
+LEGACY_PATH = os.environ.get("FMO_WAR_STATE", "").strip() or os.path.join(
     "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__)),
     "fmowar.json")
 #: 制圧カウンター: wins a nation needs in a sector before the control rate
@@ -165,38 +173,114 @@ def parse_binding(spec):
     return out
 
 
-class War:
-    """The state: {"sectors": {tile: {...}}, "phases": {n: {...}}}."""
+def _fmodb():
+    """fmodb, or None when polcore (OpenLobby) is not importable."""
+    try:
+        import fmodb
+        return fmodb
+    except ImportError:
+        return None
 
-    def __init__(self, path=None, autosave=True):
-        self.path = path or STATE_PATH
+
+def read_state():
+    """(data, updated_at) as stored, or (None, None) when nothing is on file
+    or the database cannot be read. Never writes."""
+    fdb = _fmodb()
+    if fdb is None:
+        return None, None
+    try:
+        fdb.ready()
+        row = fdb.db.query_one("SELECT data, updated_at FROM fmo_war WHERE id = 1")
+    except fdb.ERRORS:
+        return None, None
+    if not row:
+        return None, None
+    try:
+        d = json.loads(row["data"])
+    except ValueError:
+        return None, float(row["updated_at"])
+    return (d if isinstance(d, dict) else None), float(row["updated_at"])
+
+
+def write_state(data, now=None):
+    """Store the whole document. False when the database cannot be written."""
+    fdb = _fmodb()
+    if fdb is None:
+        return False
+    try:
+        fdb.ready()
+        fdb.db.upsert("fmo_war", {"id": 1,
+                                  "data": json.dumps(data, sort_keys=True, indent=1),
+                                  "updated_at": float(_now() if now is None else now)},
+                      key="id")
+        return True
+    except fdb.ERRORS:
+        return False
+
+
+def import_legacy(path=None):
+    """Fill an EMPTY fmo_war from the old fmowar.json, once. Returns True when
+    it imported. The file is left as it was."""
+    path = path or LEGACY_PATH
+    if not path or not os.path.exists(path):
+        return False
+    fdb = _fmodb()
+    if fdb is None:
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(d, dict):
+        return False
+    try:
+        fdb.ready()
+        with fdb.db.transaction(lock="fmo_war") as conn:
+            if fdb.db.query_one("SELECT 1 AS x FROM fmo_war WHERE id = 1", conn=conn):
+                return False
+            fdb.db.execute("INSERT INTO fmo_war (id, data, updated_at)"
+                           " VALUES (1, %s, %s)",
+                           (json.dumps(d, sort_keys=True, indent=1),
+                            os.path.getmtime(path)), conn=conn)
+        return True
+    except fdb.ERRORS + (OSError,):
+        return False
+
+
+class War:
+    """The state: {"sectors": {tile: {...}}, "phases": {n: {...}}}.
+
+    War() reads the stored state and writes every change back (autosave).
+    War(autosave=False) only reads: the board uses it. load=False starts
+    empty and in memory, for the tests that build a war by hand."""
+
+    def __init__(self, autosave=True, load=True):
         self.autosave = autosave
         self.data = {"sectors": {}, "phases": {}, "log": []}
-        self.load()
+        self.present = False            # was there a stored state
+        self.updated_at = None          # when it was last written (epoch s)
+        if load:
+            self.load()
 
     # ---- persistence ---------------------------------------------------
     def load(self):
-        try:
-            with open(self.path, encoding="utf-8") as fh:
-                d = json.load(fh)
-            if isinstance(d, dict):
-                self.data.update(d)
-        except (OSError, ValueError):
-            pass
+        d, at = read_state()
+        if at is None and self.autosave and import_legacy():
+            d, at = read_state()
+        if at is not None:
+            self.present, self.updated_at = True, at
+        if isinstance(d, dict):
+            self.data.update(d)
         return self
 
     def save(self):
         if not self.autosave:
             return False
-        tmp = self.path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.data, fh, sort_keys=True, indent=1)
-            os.replace(tmp, self.path)
+        if write_state(self.data):
+            self.present = True
             return True
-        except OSError:
-            return False
+        return False
 
     # ---- sectors ---------------------------------------------------------
     def sector(self, tile):
@@ -385,7 +469,7 @@ def selftest():
           and phase_at(_ts(2027, 1, 5), "2026-09-05")[2] == _ts(2027, 3, 1, 12))
 
     # control model, in memory
-    w = War(path=os.devnull, autosave=False)
+    w = War(autosave=False, load=False)
     w.data = {"sectors": {}, "phases": {}, "log": []}
     mid = _ts(2026, 10, 1)                  # inside phase 1
     s, what = w.settle(69118, OCU, won=True, now=mid)
@@ -422,7 +506,7 @@ def selftest():
     check("summary reads", "phase" in w.summary())
 
     # seeding by zone kind, the city score, and a judgement with its penalty
-    w4 = War(path=os.devnull, autosave=False)
+    w4 = War(autosave=False, load=False)
     w4.data = {"sectors": {}, "phases": {}, "log": []}
     fake = {100: {60126: 0, 61125: 0}, 300: {64122: 0}, 200: {69118: 0},
             400: {69118: 0}, 505: {85102: 0, 87101: 0}, 509: {94099: 0, 94101: 0},
@@ -455,16 +539,56 @@ def selftest():
           len(CITIES) == 19 and sum(p for _n, p, _w in CITIES.values()) == 66
           and FORTRESS[OCU] not in CITIES and FORTRESS[USN] not in CITIES)
 
-    # persistence round trip
-    import tempfile
-    d = tempfile.mkdtemp()
-    p = os.path.join(d, "w.json")
-    w2 = War(path=p)
-    w2.settle(70117, USN, won=True, pvp=True, now=mid)
-    w2.settle(70117, USN, won=True, now=mid)
-    w3 = War(path=p)
-    check("state survives a reload from disk",
-          w3.sector(70117)["nation"] == USN and w3.sector(70117)["control"] == RATE_STEP)
+    # persistence round trip, in a throwaway database
+    fdb = _fmodb()
+    if fdb is None:
+        print("  SKIP persistence (polcore is not importable)")
+    else:
+        import tempfile
+        with fdb.test_database() as url:
+            if url is None:
+                print("  SKIP persistence (no test database)")
+            else:
+                global LEGACY_PATH
+                legacy_was, LEGACY_PATH = LEGACY_PATH, os.path.join(
+                    tempfile.mkdtemp(), "fmowar.json")
+                try:
+                    check("nothing on file: an empty war, not present",
+                          War(autosave=False).present is False
+                          and read_state() == (None, None))
+                    w2 = War()
+                    w2.settle(70117, USN, won=True, pvp=True, now=mid)
+                    w2.settle(70117, USN, won=True, now=mid)
+                    w3 = War()
+                    check("state survives a reload from the database",
+                          w3.present and w3.sector(70117)["nation"] == USN
+                          and w3.sector(70117)["control"] == RATE_STEP)
+                    at = read_state()[1]
+                    War(autosave=False).sector(1234)
+                    check("a read-only War never writes",
+                          read_state()[1] == at and "1234" not in read_state()[0]["sectors"])
+                    # the old file fills an EMPTY table once, and only a writer
+                    # imports it
+                    fdb.db.execute("DELETE FROM fmo_war")
+                    with open(LEGACY_PATH, "w", encoding="utf-8") as fh:
+                        json.dump({"sectors": {"85102": {
+                            "nation": OCU, "control": 40, "counter": {"1": 0, "2": 0},
+                            "wins": {"1": 0, "2": 0}, "supply": {"1": 0, "2": 0},
+                            "bg_max": 0, "bg_min": 0, "npc": 0, "terrain": 0,
+                            "deadlock": False, "updated": 0}},
+                            "phases": {}, "log": []}, fh)
+                    check("a reader does not import the old file",
+                          War(autosave=False).present is False)
+                    w4 = War()
+                    check("a writer imports it into an empty table",
+                          w4.present and w4.sector(85102)["control"] == 40
+                          and read_state()[0]["sectors"]["85102"]["nation"] == OCU)
+                    w4.settle(85102, USN, won=True, pvp=True, now=mid)
+                    check("and never again: the table wins over the file",
+                          import_legacy() is False
+                          and War().sector(85102)["counter"]["2"] == 2)
+                finally:
+                    LEGACY_PATH = legacy_was
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -472,7 +596,7 @@ def selftest():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--show", action="store_true", help="print the state file's summary")
+    ap.add_argument("--show", action="store_true", help="print the stored state's summary")
     a = ap.parse_args()
     if a.show:
         print(War().summary())

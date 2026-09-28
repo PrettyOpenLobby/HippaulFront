@@ -6,8 +6,10 @@ profile the Viewer shows for a Front Mission Content ID (prof_004.pfb),
 built from the pilot database (fmostore.py) the game writes.
 
 Loaded with POL_TITLES=fmotitle in the core's login and authsess services;
-see docker-compose.title.yml. FMO_DB names the database (the compose override
-points it at the shared data volume).
+see docker-compose.title.yml. The pilots are in the stack's PostgreSQL
+database (POL_DATABASE_URL, which those services already have), in the game's
+own fmo_ tables; the first read applies CrystalFront's migrations if the game
+service has not yet (fmodb.py).
 """
 import struct
 

@@ -46,6 +46,15 @@ except ImportError:                                  # pragma: no cover
     fmostore = None
 
 try:
+    # The stack's PostgreSQL database (fmodb.py, over OpenLobby's polcore): the
+    # player database, the war state and the sector-win ledger live there.
+    # Optional like the rest: without polcore the ledger is memory only and
+    # the character store is the JSON file, and both say so in the log.
+    import fmodb
+except ImportError:                                  # pragma: no cover
+    fmodb = None
+
+try:
     # KEY: THE WAR STATE (stage 17): per-sector control, the phase clock and the
     # binding onto the 216-byte sector record the war map and City Control
     # fetch through the second server's kind-7 job. Optional like the rest.

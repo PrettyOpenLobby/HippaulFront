@@ -1,7 +1,7 @@
 """run(): the listeners, the startup log and the background threads."""
 import socket
 import threading
-from .deps import fmoworld
+from .deps import fmodb, fmoworld
 from .wirelog import log
 from . import wirelog
 
@@ -42,6 +42,24 @@ def run():
         log(f"WARNING: character store OFF (FMO_CHAR_STORE empty): every character "
             f"the client creates is acknowledged and DISCARDED, and 0x012F "
             f"serves {charlist.LIST_COUNT} synthetic entr(y/ies)")
+    # THE DATABASE: apply CrystalFront's migrations (the fmo_* tables) before
+    # the first login, then let the character store make its first use (the
+    # one-shot JSON import, and the log line saying where the pilots are) and
+    # load the sector-win ledger a restart must not lose.
+    if fmodb is None:
+        log("WARNING: DATABASE OFF: polcore (OpenLobby) is not importable -- the "
+            "pilots stay in the JSON character store and the sector-win ledger "
+            "is memory only")
+    else:
+        try:
+            fmodb.ready()
+            log("database: CrystalFront's migrations applied (the fmo_* tables)")
+        except fmodb.ERRORS as e:
+            log(f"WARNING: database unusable at start ({e!r}) -- every store "
+                f"call retries it; until it answers, pilots read as empty and "
+                f"writes are refused (logged)")
+        charstore.use_db()
+        sectorwins._sw_ensure_loaded()
     log(f"listening on {wirelog.PORT} -- FMO world door [build {room.BUILD}] "
         + (f"TCP + UDP world channel (hid={udpconfig.UDP_HID}, "
            f"endpoint {addressing.BATTLE_HOST}:{addressing.BATTLE_PORT}, key {room._udp_key_hint()})"
@@ -259,6 +277,6 @@ def run():
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
     addressing, charlist, charstore, devtool, identity, lobapi, move, popself, popsweep, resume,
-    room, sortie, sortiepush, status, tcpserver, udpconfig, worldchannel, zonecontrol,
-    zoneentry,
+    room, sectorwins, sortie, sortiepush, status, tcpserver, udpconfig, worldchannel,
+    zonecontrol, zoneentry,
 )

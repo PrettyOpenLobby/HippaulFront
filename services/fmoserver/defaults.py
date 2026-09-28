@@ -13,7 +13,7 @@ import sys
 RELEASE_DEFAULTS = {
     # the service
     "FMO_PORT": "61300", "FMO_HOLD": "900", "FMO_UDP": "1", "FMO_UDP_HID": "2",
-    "FMO_CHAR_STORE": "/data/fmo_characters.json", "FMO_DB": "/data/fmo.db",
+    "FMO_CHAR_STORE": "/data/fmo_characters.json", "FMO_DB": "1",
     # the lobby: the opening cutscene's map, the zone table, arrival points
     "FMO_MAPNO": "102", "FMO_MAPKIND": "200", "FMO_0153_F18": "0",
     "FMO_0153_PILOTPOS": "2.00,3.00,35.00,0",
