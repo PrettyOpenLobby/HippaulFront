@@ -1,7 +1,6 @@
 """Session: one client's TCP connection, its cipher and the on_packet dispatcher for every lobby
 message."""
 import os
-import sqlite3
 import struct
 import time
 from .deps import contentauth, fmomsn, fmostore
@@ -79,7 +78,7 @@ class Session(
         #: emitted only when something CHANGES -- otherwise the one line worth
         #: reading is buried under 140 copies of itself.
         self.squadron_seen = None
-        #: {POL group id: class} for this member, read once from accounts.db.
+        #: {POL group id: class} for this member, read once from the account database.
         #: See the pol_groups property -- it is the squadron table's litter
         #: filter, not a convenience.
         self._pol_groups = None
@@ -262,7 +261,7 @@ class Session(
     @property
     def pol_groups(self):
         """{POL group id: class} for the groups this member is a CONFIRMED
-        member of, from accounts.db `group_member`. Cached per session.
+        member of (accounts.member_groups). Cached per session.
 
         KEY: This is what tells a real group id in the `0x01AC` table apart from
         the stack litter next to it -- see `reply_01ad`. `group_member` is
@@ -277,29 +276,23 @@ class Session(
             return self._pol_groups
         self._pol_groups = {}
         acct = self.account or ""
-        if not identity.ACCOUNTS_DB or not acct.startswith("member:"):
+        if not identity.MEMBER_LOOKUP or not acct.startswith("member:"):
             return self._pol_groups
         try:
             mid = int(acct.split(":", 1)[1])
         except ValueError:
             return self._pol_groups
         try:
-            db = sqlite3.connect(identity.ACCOUNTS_DB, timeout=2)
+            acc, db = identity.accounts_conn()
             try:
-                rows = db.execute(
-                    "SELECT g.group_id, g.class, ("
-                    "  SELECT MIN(created_at) FROM group_member"
-                    "   WHERE group_id = g.group_id) FROM group_member g"
-                    " JOIN handle h ON h.id = g.member_handle"
-                    " WHERE h.member_id = ? AND g.pending = 0",
-                    (mid,)).fetchall()
+                # [(group_id, class, formed_at)]
+                rows = acc.member_groups(db, mid)
             finally:
                 db.close()
         except Exception as e:
-            log(f"{self.peer}   WARNING: POL group lookup for {acct} failed ({e!r}; "
-                f"accounts.db at {identity.ACCOUNTS_DB}) -- NO slot of the squadron "
-                f"table can be vouched for, so none is annotated. "
-                f"FMO_SQUADRON_GROUPS overrides this by hand.")
+            log(f"{self.peer}   WARNING: POL group lookup for {acct} failed ({e!r}) "
+                f"-- NO slot of the squadron table can be vouched for, so none "
+                f"is annotated. FMO_SQUADRON_GROUPS overrides this by hand.")
             return self._pol_groups
         # The group's own formation time = the EARLIEST group_member row for
         # it, i.e. the owner's -- there is no `group` table, only members.
@@ -344,8 +337,8 @@ class Session(
                 f"side), not at this reply.")
         else:
             hit = [i for i, g in enumerate(ids) if g and g in groups]
-            log(f"{self.peer}      this member's POL groups (accounts.db "
-                f"group_member): {sorted(groups) or 'NONE'} -> slot(s) {hit} "
+            log(f"{self.peer}      this member's POL groups (accounts."
+                f"member_groups): {sorted(groups) or 'NONE'} -> slot(s) {hit} "
                 f"carry a real one; the rest is the seeder's stack litter "
                 f"(0x611BA320 scatters 8 dwords of a 32-byte local that "
                 f"[0x613AE380]+0x648 only partly wrote).")
