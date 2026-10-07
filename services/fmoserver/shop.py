@@ -26,19 +26,78 @@ from . import inventory
 #:
 #: 0x0168 = ACQUIRE PART. Built at 0x611788F6 (24B payload: u16 id, u8 kind,
 #:   u32 -- copied from the pending-transaction object at lobby+0x73fa).
-#:   Machine at lobby+0x73f6; its poll arm 0x611787C2 wants reply id 0x016B:
-#:     +0x28 u32   gate -- zero takes the failure arm at 0x6117884C
-#:     +0x2C 24B   an ITEM RECORD, copied into the transaction and APPENDED to
-#:                 the client's inventory via 0x61177B30 ("[Debug] acquired %s")
-#:     the client then re-reads id (+0x34 = record+0x08) and kind (+0x36 =
-#:     record+0x0A) out of it.
+#:   Machine at lobby+0x73f6; its poll arm 0x611787C2 takes the RX packet
+#:   pointer [conn+0x7580] in edi, so every offset below is PACKET-relative
+#:   (the 0x14-byte header, packet.HDR, first: payload offset = packet - 0x14).
+#:   KEY: CORRECTED 2026-10-07 (static). Until today we wrote the gate at
+#:   PAYLOAD+0x28 and the record at payload+0x2C, i.e. packet+0x3C/+0x40, so
+#:   the client read a zero gate at packet+0x28 and took the failure arm on
+#:   every buy: it debited itself but never appended the item (the item only
+#:   appeared after a relog, from our stored list). The reply 0x016B:
+#:     packet+0x20 = payload+0x0C  u8  FLAG KIND  -- nonzero: 0x611A39F0(
+#:     packet+0x21 = payload+0x0D  u8  FLAG INDEX    lobby+0x8C8, kind, index, 1)
+#:                                    sets one owned-flag bit (kind 1 = the
+#:                                    area-unlock bitmap). Read on BOTH arms.
+#:                                    Zero for an item buy: nothing to set.
+#:     packet+0x28 = payload+0x14  u32 GATE -- zero takes the failure arm at
+#:                                    0x6117884C (no item); nonzero copies the
+#:                                    record into the transaction and APPENDS
+#:                                    it via 0x61177B30 ("[Debug] acquired %s"),
+#:                                    then prints c0080020 with the item name
+#:     packet+0x2C = payload+0x18  24B the ITEM RECORD; the client re-reads id
+#:                                    (packet+0x34 = record+0x08) and kind
+#:                                    (packet+0x36 = record+0x0A) out of it.
+#:   MONEY: 0x6117886D subtracts [pending+4] (the price the client put in the
+#:   0x0168 at +0x04) from lobby+0x88C on BOTH arms of a matched 0x016B. Any
+#:   OTHER reply id goes to 0x61178896 instead (word [packet+8] -> lobby+0x7D5F,
+#:   a numbered [FM...] code, state 3) and moves no money: that is the refusal.
+#:   It is the same layout as the MINT push below with one record (count at
+#:   +0x08, total at +0x14 = the gate, records from +0x18), which is why the
+#:   mint was right from the start: it never used these constants.
 #:   The record needs a UNIQUE 64-bit serial -- the client finds items by
 #:   serial (0x61177BE0) and a duplicate is "one item seen twice".
 MSG_SETUP_SAVE = 0x0167
 MSG_ACQUIRE = 0x0168
 MSG_ACQUIRE_REPLY = 0x016B
-ACQ_GATE, ACQ_RECORD = 0x28, 0x2C
-REPLY_016B_LEN = ACQ_RECORD + inventory.INV_ENTRY_LEN    # 0x44 -- covers every read
+ACQ_FLAG_KIND, ACQ_FLAG_INDEX = 0x0C, 0x0D
+ACQ_GATE, ACQ_RECORD = 0x14, 0x18
+REPLY_016B_LEN = ACQ_RECORD + inventory.INV_ENTRY_LEN    # 0x30 -- covers every read
+#: The refusal: a reply that is not 0x016B (message 2, as 0x017E's refusal).
+ACQ_REFUSE_MSG = 2
+#: FMO_ACQUIRE_KINDS: the item kinds an 0x0168 may buy, comma-separated, or
+#: 'all'. Default 0x13 (consumables and passes). A wanzer PART buy is refused
+#: (no debit, no item) because parts kill the client on undress
+#: (0x611A559D, live 2026-09-11) -- the shop should not list them anyway
+#: (FMO_PARTS_STOCK), this is the second lock.
+ACQUIRE_KINDS_RAW = os.environ.get("FMO_ACQUIRE_KINDS", "0x13").strip() or "0x13"
+
+
+def parse_acquire_kinds(spec):
+    """'0x13,0x11' -> frozenset of kinds; 'all' -> None (every kind)."""
+    spec = (spec or "").strip().lower()
+    if spec == "all":
+        return None
+    return frozenset(int(k, 0) for k in spec.split(",") if k.strip())
+
+
+ACQUIRE_KINDS = parse_acquire_kinds(ACQUIRE_KINDS_RAW)
+
+
+def acquire_allowed(kind, kinds=...):
+    """True when an 0x0168 for item `kind` may be sold."""
+    kinds = ACQUIRE_KINDS if kinds is ... else kinds
+    return kinds is None or int(kind) in kinds
+
+
+def acquire_reply_payload(serial, item_id, kind):
+    """The 0x016B REPLY body that makes the client append one item: gate 1 at
+    +0x14, the 24-byte record at +0x18, flag kind/index (+0x0C/+0x0D) zero."""
+    b = bytearray(REPLY_016B_LEN)
+    struct.pack_into("<I", b, ACQ_GATE, 1)
+    b[ACQ_RECORD:ACQ_RECORD + inventory.INV_ENTRY_LEN] = inventory.item_record(
+        serial, item_id, kind)
+    return bytes(b)
+
 
 #: KEY: 0x016B HAS A SECOND SHAPE: the unsolicited MINT push (static 2026-09-12).
 #: The same id reaches a different consumer depending on the sequence -- the

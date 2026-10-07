@@ -3043,6 +3043,94 @@ def _paint_shop_pins():
     return ok
 
 
+def _shop_acquire_pins():
+    """THE ITEM SHOP BUY (0x0168 -> 0x016B reply, static 2026-10-07), no client.
+    The poll arm 0x611787C2 reads the RX PACKET: gate dword packet+0x28, record
+    packet+0x2C (id +0x34, kind +0x36), flag kind/index bytes packet+0x20/+0x21.
+    (1) the offsets, packet-relative; (2) a consumable buy reads gate 1 and the
+    item through those offsets, debits the wallet once, keeps the item; (3) the
+    twin: the pre-fix layout (gate at payload+0x28) reads a ZERO gate, the
+    failure arm; (4) a wanzer part is refused with message 2, no debit, no
+    item; (5) the mint push bytes are unchanged and read as the same record."""
+    import tempfile as _tf
+    ok = True
+    fails = []
+    H = packet.HDR
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    def _client(pk):
+        # what 0x611787C2..0x61178865 reads off the packet
+        return (struct.unpack_from("<H", pk, 6)[0], struct.unpack_from("<I", pk, 0x28)[0],
+                pk[0x2C:0x44], struct.unpack_from("<H", pk, 0x34)[0], pk[0x36],
+                pk[0x20], pk[0x21])
+
+    def _buy(char, iid, kind, price):
+        _s = session.Session("selftest-item-shop")
+        _s._roster = [char]
+        _s.playing_char = lambda: char
+        _s.commit = lambda what: None
+        return _s.on_packet(packet.parse(packet.build(
+            shop.MSG_ACQUIRE, struct.pack("<HBBI", iid, kind, 0, price) + bytes(16), 0x168)))
+
+    _was = (charstore.CHAR_STORE, shop.ACQUIRE_KINDS)
+    with _tf.TemporaryDirectory() as _td:
+        try:
+            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+            shop.ACQUIRE_KINDS = shop.parse_acquire_kinds("0x13")
+            # (1)
+            ok &= _c(1, H == 0x14 and shop.ACQ_GATE + H == 0x28
+                     and shop.ACQ_RECORD + H == 0x2C
+                     and shop.ACQ_RECORD + inventory.ITEM_ID + H == 0x34
+                     and shop.ACQ_RECORD + inventory.ITEM_KIND + H == 0x36
+                     and shop.ACQ_FLAG_KIND + H == 0x20 and shop.ACQ_FLAG_INDEX + H == 0x21
+                     and shop.REPLY_016B_LEN == 0x30
+                     and shop.parse_acquire_kinds("all") is None)
+            # (2) Repair I is kind 0x13 id 41 at 10 H$ (prod 2026-09-11 23:59:50Z)
+            rich = {"id": 41, "first": "Shop", "last": "Per", "money": 1000}
+            o = _buy(rich, 41, 0x13, 10)
+            got = _client(o[0]) if len(o) == 1 and len(o[0]) >= 0x44 else None
+            its = inventory.stored_items(rich)
+            ok &= _c(2, got is not None and got[0] == shop.MSG_ACQUIRE_REPLY
+                     and got[1] == 1 and got[3] == 41 and got[4] == 0x13
+                     and got[5] == 0 and got[6] == 0
+                     and struct.unpack_from("<Q", got[2], 0)[0] == its[0]["serial"]
+                     and rich["money"] == 990 and len(its) == 1
+                     and its[0]["id"] == 41 and its[0]["kind"] == 0x13)
+            # (3) the twin: yesterday's builder put the gate at payload+0x28
+            old = bytearray(0x44)
+            struct.pack_into("<I", old, 0x28, 1)
+            old[0x2C:0x44] = inventory.item_record(7, 41, 0x13)
+            ok &= _c(3, _client(packet.build(shop.MSG_ACQUIRE_REPLY, bytes(old), 2))[1] == 0)
+            # (4) a wanzer part (body kind 0x11, Arco id 1): refused, nothing moves
+            o4 = _buy(rich, 1, 0x11, 10)
+            ok &= _c(4, [struct.unpack_from("<H", x, 6)[0] for x in o4] == [shop.ACQ_REFUSE_MSG]
+                     and rich["money"] == 990 and len(inventory.stored_items(rich)) == 1)
+            # (5) the mint push, byte for byte, and its reading as a reply
+            rec = inventory.item_record(0x6AA583C900010001, 26, 0x13)
+            mp = shop.item_mint_payload([rec])
+            want = (bytes(8) + struct.pack("<I", 1) + bytes(8) + struct.pack("<I", 1)
+                    + bytes.fromhex("01000100c983a56a1a00130000000000000000000000000000"[:48]))
+            ar = shop.acquire_reply_payload(0x6AA583C900010001, 26, 0x13)
+            ok &= _c(5, mp == want and len(mp) == 0x30
+                     and ar[:8] + ar[0x0C:] == mp[:8] + mp[0x0C:]
+                     and _client(packet.build(shop.MSG_ACQUIRE_REPLY, mp, 2))[1:5]
+                     == (1, rec, 26, 0x13))
+        except Exception as e:
+            print(f"  item shop: EXC {e!r}")
+            ok = False
+        finally:
+            flat_globals()["CHAR_STORE"] = _was[0]
+            shop.ACQUIRE_KINDS = _was[1]
+    print(f"  item shop (0x0168 -> 0x016B): gate packet+0x28, record +0x2C, "
+          f"consumable bought once and kept, pre-fix layout reads gate 0, part "
+          f"refused, mint bytes unchanged: {'OK' if ok else 'FAIL at ' + str(fails)}")
+    return ok
+
+
 def _change_room_pins():
     """CHANGE ROOM maps and casts (move.ROOM_MAPS, roomcast.py, 2026-10-06):
     Room = 121, Briefing 122 / 123 by nation, Room B / C = 124, Hangar 141;
@@ -13806,6 +13894,7 @@ def _selftest_run(test_db):
     ok &= _btlreview_token_pins()   # field A = character wire id (Battle Review folder)
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
     ok &= _war_phase_pins()         # a whole war phase offline: judge, reset, reward, restart (fmowar)
+    ok &= _shop_acquire_pins()      # item shop buy 0x0168 -> 0x016B: gate at packet+0x28 (shop.py)
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1

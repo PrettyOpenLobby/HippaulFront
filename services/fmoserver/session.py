@@ -913,13 +913,16 @@ class Session(
             part_id = struct.unpack_from("<H", pl, 0)[0] if len(pl) >= 2 else 0
             kind = pl[2] if len(pl) >= 3 else 0
             extra = struct.unpack_from("<I", pl, 4)[0] if len(pl) >= 8 else 0
+            if not shop.acquire_allowed(kind):
+                # a non-0x016B reply: 0x61178896, a numbered refusal, and the
+                # debit at 0x6117886D is never reached -- no money, no item
+                log(f"{self.peer}   0x0168 = ACQUIRE: id {part_id} kind 0x{kind:02X} "
+                    f"price {extra} REFUSED (FMO_ACQUIRE_KINDS={shop.ACQUIRE_KINDS_RAW}): "
+                    f"-> message {shop.ACQ_REFUSE_MSG}, nothing debited or granted")
+                return [packet.build(shop.ACQ_REFUSE_MSG, b"", self.reply_seq(), p["conn"])]
             lo, hi = shop.mint_serial()
-            body = bytearray(shop.REPLY_016B_LEN)
-            # +0x28 zero takes the failure arm at 0x6117884C; 1 = take the item.
-            struct.pack_into("<I", body, shop.ACQ_GATE, 1)
-            struct.pack_into("<II", body, shop.ACQ_RECORD + inventory.ITEM_SERIAL_LO, lo, hi)
-            struct.pack_into("<H", body, shop.ACQ_RECORD + inventory.ITEM_ID, part_id)
-            body[shop.ACQ_RECORD + inventory.ITEM_KIND] = kind
+            # gate 1 at payload+0x14 (packet+0x28), record at payload+0x18
+            body = shop.acquire_reply_payload(lo | (hi << 32), part_id, kind)
             # KEY: +0x04 IS THE PRICE: the builder 0x611788F6 copies it from the
             # pending transaction's +4, and the 0x016B match arm (0x6117886D)
             # subtracts that same [pending+4] from lobby+0x88C. The client is
@@ -952,7 +955,7 @@ class Session(
                 log(f"{self.peer}   WARNING: no pilot in the store: the item lives only "
                     f"in the client's list and is gone at relog, and the price "
                     f"the client debits is not banked")
-            log(f"{self.peer}   -> 0x016B, {shop.REPLY_016B_LEN}B: gate 1, item "
+            log(f"{self.peer}   -> 0x016B, {shop.REPLY_016B_LEN}B: gate 1 at +0x{shop.ACQ_GATE:02X}, item "
                 f"record serial {hi:08x}:{lo:08x} -- the client appends it to "
                 f"its inventory (0x61177B30) and re-reads id/kind from the "
                 f"record. WARNING: No stock and no legality check on (id, kind); the "
