@@ -197,6 +197,103 @@ def hangar_rank_at_battle_end(char):
                     if hangar_capacity(was) != (w, cap) else "")), changed
 
 
+#: KEY: ANOTHER PILOT'S HANGAR NEEDS THE OWNER'S FRIENDSHIP (2026-10-07).
+#: Playing Manual p.46: "Besides your own hangar, you can enter another
+#: player's hangar if that player (a friend (フレンド)) has given you
+#: permission to enter", and "Other Player's Hangar" asks for the owner's
+#: names and password. So three things: the owner is inside, the visitor is
+#: on the owner's friend list, the password matches. FMO's Friend List is
+#: PlayOnline's own (manual p.52), so "a friend" is a row in OpenLobby's
+#: `friend` table: one of the owner member's handles holds an ACTIVE
+#: KIND_FRIEND (0x0800) row whose peer handle belongs to the visitor's member.
+#: A pending or invited request is not a friend yet.
+#:
+#: THE REFUSAL TEXT. 0x016D's reply is read by the Move controller's state 4
+#: (0x61190B50): 0x0153 is the grant, message 1 goes quietly back to the
+#: lobby (0x61174400), and ANY other id opens the failure box 0x6116CF50 with
+#: 15:3 "The move failed." and the u16 at header +0x08 as the code. The code
+#: picks its line from the table at 0x613955F0 (7-byte rows: s16 code, u8
+#: error flag, u32 message id; walked by 0x6116CE10, read from the unpacked
+#: image 2026-10-07):
+#:     -14058  2:54 "There is no player with that name."
+#:     -14059  2:55 "The hangar password is incorrect."
+#:     -14060  2:56 "The player with that name is not in a hangar right now."
+#: No row carries a friend message (40:10 "The target is not a friend." is
+#: the friend window's own text, not in that table), so SE's server had no
+#: separate friend refusal to show. Ours answers a non-friend with 2:56, the
+#: same as an owner who is not inside, and checks friendship BEFORE the
+#: password, so a stranger can neither probe the password nor learn whether
+#: the owner is in. FMO_HANGAR_FRIEND_CODE picks another code (-14059 = say
+#: "wrong password" instead).
+#:
+#: FMO_HANGAR_FRIEND=0 drops the friend check (password and presence only,
+#: the behaviour before 2026-10-07). FMO_HANGAR_REFUSE_TEXT=0 answers every
+#: refusal with the old silent message 1 instead of the failure box.
+HANGAR_FRIEND = (os.environ.get("FMO_HANGAR_FRIEND", "").strip() or "1") != "0"
+HANGAR_REFUSE_TEXT = (os.environ.get("FMO_HANGAR_REFUSE_TEXT", "").strip() or "1") != "0"
+CODE_NO_PLAYER = -14058          # 2:54
+CODE_WRONG_PASSWORD = -14059     # 2:55
+CODE_NOT_IN_HANGAR = -14060      # 2:56
+HANGAR_FRIEND_CODE = _env_int("FMO_HANGAR_FRIEND_CODE", str(CODE_NOT_IN_HANGAR))
+#: accounts.KIND_FRIEND: another person (0x1400 is the handle itself, 1 a group)
+POL_KIND_FRIEND = 0x0800
+#: Does any handle of member %s (the owner) hold an active friend row naming
+#: a handle of member %s (the visitor)?
+HANGAR_FRIEND_SQL = ("SELECT 1 FROM friend f"
+                     " JOIN handle o ON o.id = f.handle_id"
+                     " JOIN handle v ON v.id = f.peer_handle"
+                     " WHERE o.member_id = %s AND v.member_id = %s"
+                     " AND f.status = 'active' AND f.kind = %s LIMIT 1")
+
+
+def member_id_of(account):
+    """The POL member id in an account key `member:<id>`, else None. Pure."""
+    a = str(account or "")
+    if a.startswith("member:") and a[7:].isdigit():
+        return int(a[7:])
+    return None
+
+
+def owner_has_friend(owner_account, visitor_account, connect=None):
+    """(answer, why): True when the owner's POL friend list holds the visitor,
+    False when it does not, None when it cannot be told (a key that is no
+    POL member, or no account database). The same member is its own friend.
+    `connect` returns a DB connection (a test); the default is OpenLobby's."""
+    o, v = member_id_of(owner_account), member_id_of(visitor_account)
+    if o is None or v is None:
+        return None, f"no POL member behind {owner_account!r} / {visitor_account!r}"
+    if o == v:
+        return True, f"member {o} visiting its own other pilot"
+    try:
+        db = connect() if connect is not None else identity.accounts_conn()[1]
+        try:
+            row = db.execute(HANGAR_FRIEND_SQL, (o, v, POL_KIND_FRIEND)).fetchone()
+        finally:
+            db.close()
+    except Exception as e:
+        return None, f"friend lookup failed ({e!r})"
+    if row is not None:
+        return True, f"member {v} is on member {o}'s POL friend list"
+    return False, f"member {v} is NOT on member {o}'s POL friend list (active rows only)"
+
+
+def hangar_visit_verdict(owner_host, owner_place, friend, password_ok, who=""):
+    """None when a visitor may enter another pilot's hangar, else (code, why).
+    `friend` is owner_has_friend's answer (None = unknown: let the password
+    decide, and say so in the log). The order is presence, friendship,
+    password. Pure."""
+    if owner_host is None:
+        return CODE_NOT_IN_HANGAR, f"{who} is not in any lobby (2:56)"
+    if not owner_place or owner_place[1] != 5:
+        return CODE_NOT_IN_HANGAR, f"{who} is not in their hangar (2:56)"
+    if HANGAR_FRIEND and friend is False:
+        return HANGAR_FRIEND_CODE, (f"the visitor is not on {who}'s friend list "
+                                    f"(FMO_HANGAR_FRIEND; code {HANGAR_FRIEND_CODE})")
+    if not password_ok:
+        return CODE_WRONG_PASSWORD, f"wrong password for {who}'s hangar (2:55)"
+    return None
+
+
 def hangar_owner_password(host):
     """The stored hangar password of the character `host` is playing, or None."""
     n1, n2, _src = popnames.pop_names_for(host)

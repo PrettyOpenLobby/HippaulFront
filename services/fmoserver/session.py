@@ -1380,17 +1380,24 @@ class Session(
                 else:
                     _oh = popnames.online_players().get((_na.strip().lower(), _nb.strip().lower()))
                     _op = move.WORLD_PLACES.get(_oh) if _oh else None
-                    if _oh is None:
-                        _hangar_refused = f"{_na} {_nb} is not in any lobby (2:56)"
-                    elif not _op or _op[1] != 5:
-                        _hangar_refused = (f"{_na} {_nb} is in {move.place_name(_op)}, not "
-                                           f"their hangar (2:56)")
-                    elif (hangar.hangar_owner_password(_oh) or "") != _pw:
-                        _hangar_refused = f"wrong password for {_na} {_nb}'s hangar (2:55)"
-                    else:
+                    # Manual p.46: owner inside, visitor on the owner's POL
+                    # friend list, password (hangar.hangar_visit_verdict)
+                    _fr, _fr_why = None, "not asked"
+                    if _oh is not None and _op and _op[1] == 5 and hangar.HANGAR_FRIEND:
+                        _fr, _fr_why = hangar.owner_has_friend(identity.account_for(_oh),
+                                                               self.account)
+                        if _fr is None:
+                            log(f"{self.peer}   WARNING: HANGAR FRIEND CHECK could not "
+                                f"run ({_fr_why}) -- the password alone decides")
+                    _pw_ok = (_oh is not None and _op and _op[1] == 5
+                              and (hangar.hangar_owner_password(_oh) or "") == _pw)
+                    _hangar_refused = hangar.hangar_visit_verdict(
+                        _oh, _op, _fr, _pw_ok, f"{_na} {_nb}")
+                    if _hangar_refused is None:
                         _place = _op
                         log(f"{self.peer}   VERIFIED: HANGAR: Another Player's Hangar -> "
-                            f"{move.place_name(_place)} ({_na} {_nb}, password matched)")
+                            f"{move.place_name(_place)} ({_na} {_nb}, password matched; "
+                            f"friend: {_fr_why})")
                 if _place is not None:
                     mn, _pm_why = move.place_map(0, 5, mn)
                     kind, honoured = 5, True
@@ -1419,9 +1426,17 @@ class Session(
                     log(f"{self.peer}   -> hangar map MapNo {mn} ({_pm_why}); grant "
                         f"+0x18 = {kind} ({'the owner id' if kind != 5 else 'Hangar'})")
                 elif _hangar_refused:
-                    log(f"{self.peer}   WARNING: HANGAR REFUSED: {_hangar_refused} -- "
+                    _hcode, _hwhy = _hangar_refused
+                    if hangar.HANGAR_REFUSE_TEXT:
+                        log(f"{self.peer}   WARNING: HANGAR REFUSED: {_hwhy} -> 0x"
+                            f"{charselect.MSG_FAIL:04X} code {_hcode}: the Move "
+                            f"controller's failure box (0x61190C37) shows 15:3 'The "
+                            f"move failed.' with the code's line from 0x613955F0")
+                        return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(),
+                                             _hcode & 0xFFFF)]
+                    log(f"{self.peer}   WARNING: HANGAR REFUSED: {_hwhy} -- "
                         f"answering message 1, the client's own 'no' (0x61174400, "
-                        f"back to the lobby)")
+                        f"back to the lobby; FMO_HANGAR_REFUSE_TEXT=0)")
                     return [packet.build(handshake.MSG_SESSION_START, b"", p["seq"], p["conn"])]
             if move.PLACES and move.MOVE_MAPNO is None and _place is None:
                 # KEY: THE PLACE REGISTRY: the pick is (kind, instance) in the

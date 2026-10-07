@@ -2371,6 +2371,204 @@ def _coliseum_spectate_pins():
     return ok
 
 
+def _hangar_friend_mg_end_pins():
+    """ANOTHER PILOT'S HANGAR NEEDS THE OWNER'S POL FRIENDSHIP (manual p.46)
+    and refusals carry the client's own 2:54..2:56 codes; A MISSION GROUP ENDS
+    WITH ITS MISSION (SE 28:0/28:1). 2026-10-07. Every knob is restored."""
+    import sqlite3
+    ok = True
+
+    # --- 1. the codes are the image's rows (0x613955F0) and fit the u16 at +0x08
+    _codes_ok = ((hangar.CODE_NO_PLAYER, hangar.CODE_WRONG_PASSWORD, hangar.CODE_NOT_IN_HANGAR)
+                 == (-14058, -14059, -14060)
+                 and all(struct.unpack("<h", struct.pack("<H", c & 0xFFFF))[0] == c
+                         for c in (-14058, -14059, -14060)))
+    print(f"  hangar visit: refusal codes -14058/-14059/-14060 = 2:54/2:55/2:56 "
+          f"(table 0x613955F0), round-trip the u16 at header +0x08: "
+          f"{'OK' if _codes_ok else 'FAIL'}")
+    ok &= _codes_ok
+
+    # --- 2. the verdict: presence, then friendship, then password
+    _sv = (hangar.HANGAR_FRIEND, hangar.HANGAR_FRIEND_CODE)
+    _hp = (0, 5, 7)
+    try:
+        hangar.HANGAR_FRIEND, hangar.HANGAR_FRIEND_CODE = True, hangar.CODE_NOT_IN_HANGAR
+        _v = hangar.hangar_visit_verdict
+        _ver_ok = (_v(None, None, None, True, "A B")[0] == -14060
+                   and _v("h", (200, 1, 1), True, True, "A B")[0] == -14060
+                   and _v("h", _hp, False, False, "A B")[0] == -14060     # friend before password
+                   and _v("h", _hp, False, True, "A B")[0] == -14060
+                   and _v("h", _hp, True, False, "A B")[0] == -14059
+                   and _v("h", _hp, True, True, "A B") is None
+                   and _v("h", _hp, None, True, "A B") is None            # unknown: password decides
+                   and _v("h", _hp, None, False, "A B")[0] == -14059)
+        hangar.HANGAR_FRIEND_CODE = hangar.CODE_WRONG_PASSWORD
+        _ver_ok &= _v("h", _hp, False, True, "A B")[0] == -14059
+        hangar.HANGAR_FRIEND = False
+        _ver_ok &= (_v("h", _hp, False, True, "A B") is None
+                    and _v("h", _hp, False, False, "A B")[0] == -14059)
+    finally:
+        hangar.HANGAR_FRIEND, hangar.HANGAR_FRIEND_CODE = _sv
+    print(f"  hangar visit: owner absent / elsewhere = 2:56, not a friend = "
+          f"FMO_HANGAR_FRIEND_CODE (checked BEFORE the password), wrong password = "
+          f"2:55, friend unknown lets the password decide, FMO_HANGAR_FRIEND=0 drops "
+          f"the friend rule: {'OK' if _ver_ok else 'FAIL'}")
+    ok &= _ver_ok
+
+    # --- 3. the friend lookup against OpenLobby's friend/handle tables
+    class _Db:
+        def __init__(self, c):
+            self.c = c
+
+        def execute(self, sql, args=()):
+            return self.c.execute(sql.replace("%s", "?"), args)
+
+        def close(self):
+            pass
+    _c = sqlite3.connect(":memory:")
+    _c.executescript(
+        "CREATE TABLE handle (id INTEGER PRIMARY KEY, member_id INTEGER);"
+        "CREATE TABLE friend (id INTEGER PRIMARY KEY, handle_id INTEGER, peer_handle INTEGER,"
+        " peer_name TEXT, kind INTEGER, status TEXT);"
+        "INSERT INTO handle VALUES (10, 1), (11, 1), (20, 2), (30, 3), (40, 4), (50, 5);"
+        # owner 1's SECOND handle holds visitor 2 (active); 3 is only pending;
+        # 4 lists owner 1 but not the reverse; 5 is a group row (kind 1)
+        "INSERT INTO friend VALUES (1, 11, 20, 'V', 2048, 'active'),"
+        " (2, 10, 30, 'P', 2048, 'pending'), (3, 40, 10, 'O', 2048, 'active'),"
+        " (4, 10, 50, 'G', 1, 'active');")
+    _cn = lambda: _Db(_c)
+
+    def _boom():
+        raise OSError("no database")
+    _f = hangar.owner_has_friend
+    _fr_ok = (_f("member:1", "member:2", _cn)[0] is True
+              and _f("member:1", "member:3", _cn)[0] is False
+              and _f("member:1", "member:4", _cn)[0] is False
+              and _f("member:1", "member:5", _cn)[0] is False
+              and _f("member:1", "member:1", _boom)[0] is True
+              and _f("addr:1.2.3.4", "member:2", _cn)[0] is None
+              and _f("member:1", "member:2", _boom)[0] is None
+              and hangar.member_id_of("member:12") == 12 and hangar.member_id_of("member:x") is None)
+    _c.close()
+    print(f"  hangar visit: friend = an ACTIVE 0x0800 row on any of the owner "
+          f"member's handles naming a handle of the visitor's member (pending, "
+          f"one-way the other way, group rows are not); own member yes; no member "
+          f"or no DB = unknown: {'OK' if _fr_ok else 'FAIL'}")
+    ok &= _fr_ok
+
+    # --- 4. the 0x016D arm answers a refusal with message 2 + the code
+    _svm = (popnames.online_players, hangar.owner_has_friend, hangar.hangar_owner_password,
+            identity.account_for, hangar.HANGAR_FRIEND, hangar.HANGAR_REFUSE_TEXT,
+            hangar.HANGAR_FRIEND_CODE, move.WORLD_PLACES.get("198.51.100.91"))
+    _arm_ok = True
+    if move.PLACES and move.HANGAR and move.MOVE_MAPNO is None and move.ANSWER_MOVE:
+        try:
+            hangar.HANGAR_FRIEND, hangar.HANGAR_REFUSE_TEXT = True, True
+            hangar.HANGAR_FRIEND_CODE = hangar.CODE_NOT_IN_HANGAR
+            popnames.online_players = lambda: {("own", "er"): "198.51.100.91"}
+            hangar.hangar_owner_password = lambda h: "1234"
+            identity.account_for = lambda ip: "member:1" if ip == "198.51.100.91" else "member:2"
+            move.WORLD_PLACES["198.51.100.91"] = (0, 5, 7)
+            _q = bytearray(move.MOVE_REQ_LEN)
+
+            def _ask(pw, friend):
+                hangar.owner_has_friend = lambda o, v, connect=None: (friend, "pin")
+                _q[move.M16D_NUMBER:move.M16D_NUMBER + 16] = pw.encode().ljust(16, b"\0")
+                _q[move.M16D_NAME_A:move.M16D_NAME_A + 3] = b"Own"
+                _q[move.M16D_NAME_B:move.M16D_NAME_B + 2] = b"Er"
+                _s = session.Session("198.51.100.92:0")
+                _s._account = "member:2"
+                return [packet.parse(o) for o in _s.on_packet(packet.parse(packet.build(
+                    move.MSG_MOVE_REQ, bytes(_q), seq=0x66, conn_id=1)))]
+            _a = _ask("1234", False)
+            _b = _ask("9999", True)
+            hangar.HANGAR_REFUSE_TEXT = False
+            _c1 = _ask("9999", True)
+            _arm_ok = (len(_a) == 1 and _a[0]["msg"] == charselect.MSG_FAIL
+                       and _a[0]["conn"] == (-14060 & 0xFFFF) and _a[0]["seq"] == 0x66
+                       and len(_b) == 1 and _b[0]["msg"] == charselect.MSG_FAIL
+                       and _b[0]["conn"] == (-14059 & 0xFFFF)
+                       and len(_c1) == 1 and _c1[0]["msg"] == handshake.MSG_SESSION_START)
+        except Exception as _x:
+            import traceback
+            traceback.print_exc()
+            print(f"    (raised {_x!r})")
+            _arm_ok = False
+        finally:
+            (popnames.online_players, hangar.owner_has_friend, hangar.hangar_owner_password,
+             identity.account_for, hangar.HANGAR_FRIEND, hangar.HANGAR_REFUSE_TEXT,
+             hangar.HANGAR_FRIEND_CODE) = _svm[:7]
+            if _svm[7] is None:
+                move.WORLD_PLACES.pop("198.51.100.91", None)
+            else:
+                move.WORLD_PLACES["198.51.100.91"] = _svm[7]
+        print(f"  hangar visit: the 0x016D arm answers a non-friend with message 2 "
+              f"code 0xC914 (2:56) and a friend with the wrong password 0xC915 "
+              f"(2:55) on the request's seq; FMO_HANGAR_REFUSE_TEXT=0 = the old "
+              f"message 1: {'OK' if _arm_ok else 'FAIL'}")
+    else:
+        print("  hangar visit: 0x016D arm pin skipped (FMO_PLACES / FMO_HANGAR off "
+              "or FMO_MOVE_MAPNO set)")
+    ok &= _arm_ok
+
+    # --- 5. a mission group ends with its mission
+    _iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    _now = time.time()
+    L, M = "mge:lead", "mge:mem"
+    _o = lambda did, **k: dict({"id": did, "key": did, "derived": did, "name": "Hold",
+                                "status": "ordered", "cat": 1, "at": _iso(_now - 60),
+                                "limit": 1800}, **k)
+    _acc = lambda did, **k: dict({"id": did, "name": "Hold", "cat": 1,
+                                  "at": _iso(_now - 30)}, **k)
+    _src = lambda st: {"id": 77, "key": 77, "name": "Sector", "cat": 2,
+                       "at": _iso(_now - 100), "status": st}
+    _sv_reg = (dict(missionbook.ORDERS), dict(missionbook.ORDER_TAKEN),
+               dict(missionbook.ORDER_TAKER_NAME), list(missionbook._orders_loaded))
+    _sv_ids = dict(missiongroups.MG_IDS)
+
+    def _groups(ros):
+        missionbook.ORDERS.clear()
+        missionbook.ORDER_TAKEN.clear()
+        missionbook.ORDER_TAKER_NAME.clear()
+        return missiongroups.mission_groups(_now, ros)
+    _end_ok = False
+    try:
+        missiongroups.MG_IDS.clear()
+        # taken, the taker reported: nobody is in a group any more
+        _g1 = _groups([(L, [{"id": 1, "missions": [_o(0xFE01)]}]),
+                       (M, [{"id": 1, "missions": [_acc(0xFE01, status="complete")]}])])
+        # taken, still open: leader + member
+        _g2 = _groups([(L, [{"id": 1, "missions": [_o(0xFE01)]}]),
+                       (M, [{"id": 1, "missions": [_acc(0xFE01)]}])])
+        # the issuer's own source accept ended: its open order leads nothing
+        _g3 = _groups([(L, [{"id": 1, "missions": [
+            _src("complete"), _o(0xFE02, from_key=77, from_at=_iso(_now - 100))]}])])
+        _g4 = _groups([(L, [{"id": 1, "missions": [
+            _src("open"), _o(0xFE02, from_key=77, from_at=_iso(_now - 100))]}])])
+        gid = missiongroups.MG_IDS.get(L)
+        _end_ok = (_g1 == {} and _g2 == {gid: (L, [M])} and _g3 == {}
+                   and _g4 == {gid: (L, [])})
+    except Exception as _x:
+        import traceback
+        traceback.print_exc()
+        print(f"    (raised {_x!r})")
+    finally:
+        missionbook.ORDERS.clear()
+        missionbook.ORDERS.update(_sv_reg[0])
+        missionbook.ORDER_TAKEN.clear()
+        missionbook.ORDER_TAKEN.update(_sv_reg[1])
+        missionbook.ORDER_TAKER_NAME.clear()
+        missionbook.ORDER_TAKER_NAME.update(_sv_reg[2])
+        missionbook._orders_loaded[:] = _sv_reg[3]
+        missiongroups.MG_IDS.clear()
+        missiongroups.MG_IDS.update(_sv_ids)
+    print(f"  mission group: a taken order whose taker reported leads nothing (28:0 "
+          f"'the mission group is disbanded'), an open take is leader + member, an "
+          f"order whose source accept ended leads nothing: {'OK' if _end_ok else 'FAIL'}")
+    ok &= _end_ok
+    return ok
+
+
 def _mission_group_fee_pins():
     """MISSION GROUPS AND THE BATTLE FEE RATES (2026-10-01; Playing Manual
     pp.61-62): the issuer of a derived mission leads a mission group and its
@@ -13880,6 +14078,7 @@ def _selftest_run(test_db):
     ok &= _char_lifecycle_arm_pins()  # creation through the arm: start money once, delete lock
     ok &= _manual_social_pins()     # tells, chat routing, targeting, battle group ops (pp.40-54)
     ok &= _mission_group_fee_pins()  # mission groups (p.61) and the Battle Fee rates (p.62)
+    ok &= _hangar_friend_mg_end_pins()  # hangar visits need friendship (p.46); groups end (28:0)
     ok &= _coliseum_pins()          # the Coliseum desks (coliseum.py)
     ok &= _coliseum_match_pins()    # arena matches: pairing, judging, streak, bracket
     ok &= _coliseum_spectate_pins()  # Coliseum spectators: 0x01C0/0x01C1, receive-only

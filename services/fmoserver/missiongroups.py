@@ -93,27 +93,67 @@ def mission_gid(issuer):
     return gid
 
 
+def _source_alive(acct, e, now=None, rosters=None, cache=None):
+    """False when the issuer's own accept that order `e` was derived from
+    (its from_key / from_at) has ended; True while it is active or when it
+    cannot be found (an order stored before from_key, or no roster)."""
+    key = e.get("from_key")
+    if key is None:
+        return True
+    cache = {} if cache is None else cache
+    ck = (acct, key, e.get("from_at"))
+    if ck in cache:
+        return cache[ck]
+    if rosters is not None:
+        pool = [r for a, r in rosters if a == acct]
+    else:
+        live = missionbook._live_roster(acct)
+        pool = [live if live is not None else charstore.load_roster(acct)]
+    got = True
+    for roster in pool:
+        for c in roster or ():
+            for m in missionbook.accepted_missions(c):
+                if m.get("derived") or missionbook.mission_key(m) != key:
+                    continue
+                if e.get("from_at") is not None and m.get("at") != e.get("from_at"):
+                    continue
+                got = missionbook.mission_status(m, now) in missionboard.MISSION_ACTIVE
+    cache[ck] = got
+    return got
+
+
 def mission_groups(now=None, rosters=None):
     """{GroupID: (leader, [members])} from the ORDERS: the issuer of an order
-    still ordered (open, unexpired) or taken leads a group, and each taker
-    whose own accept is still active (open / met) is in it. One group per
-    issuer, however many orders. `rosters` is for a test."""
+    still ordered (open, unexpired) leads a group, and so does the issuer of
+    a TAKEN order while its taker's accept is still active (open / met); that
+    taker is a member. One group per issuer, however many orders.
+    `rosters` is for a test.
+
+    KEY: A GROUP ENDS WITH ITS MISSION (SE 28:0 / 28:1, the report dialog:
+    "If the mission ends, the mission group is disbanded as well"). Until
+    2026-10-07 a taken order kept its issuer a leader forever (an order's
+    status stays "taken" after the taker reports), and an order outlived the
+    issuer's own sector / area accept it was derived from. Now a taken order
+    whose taker reported, failed or expired counts for nobody, and every
+    order dies with its source accept."""
     out = {}
+    src = {}
     for did, (acct, e) in list(missionbook.order_registry(rosters).items()):
         st = missionbook.order_status(e, now, rosters)
         if st not in ("ordered", "taken") or not acct:
             continue
+        if not _source_alive(acct, e, now, rosters, src):
+            continue
+        taker = None
+        if st == "taken":
+            taker = missionbook.order_taker(did, rosters)
+            a = missionbook._order_taker_accept(did, rosters) if taker else None
+            if a is None or missionbook.mission_status(a, now) not in missionboard.MISSION_ACTIVE:
+                continue
         gid = mission_gid(acct)
         members = out.setdefault(gid, (acct, []))[1]
-        if st != "taken":
-            continue
-        taker = missionbook.order_taker(did, rosters)
-        if not taker or taker == acct or taker in members:
-            continue
-        a = missionbook._order_taker_accept(did, rosters)
-        if a is not None and missionbook.mission_status(a, now) not in missionboard.MISSION_ACTIVE:
-            continue
-        members.append(taker)
+        if taker and taker != acct and taker not in members:
+            members.append(taker)
     return out
 
 
@@ -303,6 +343,6 @@ def mission_leader_byte(chan):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    addressing, battlegroups, groupchannel, grouplogin, missionboard, missionbook, room,
-    worldchannel,
+    addressing, battlegroups, charstore, groupchannel, grouplogin, missionboard, missionbook,
+    room, worldchannel,
 )
