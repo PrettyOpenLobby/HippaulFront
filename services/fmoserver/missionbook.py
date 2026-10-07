@@ -158,9 +158,14 @@ def mission_status(m, now=None, limit=None, ledger=None, rosters=None):
                 # Playing Manual p.60: only wins in the missions THIS accept
                 # ordered count (FMO_SECTOR_OWN_WINS)
                 got = sector_order_wins(m, at, until, rosters)
+            elif _nation(m) is None:
+                # KEY: only the HOLDER'S nation's wins count (Playing Manual
+                # p.60). An accept with no nation on record would otherwise
+                # read the ledger's nation-0 key, i.e. wins nobody owns.
+                got = 0
             else:
                 got = sectorwins.sector_wins_between(m.get("zone"), m.get("sector"),
-                                                     m.get("nation"), at, until, ledger)
+                                                     _nation(m), at, until, ledger)
             if got >= int(m["needed"]):
                 return "met"
         # an AREA accept (category 3) with a picked target: met while the
@@ -178,6 +183,15 @@ def mission_status(m, now=None, limit=None, ledger=None, rosters=None):
         if lim and at is not None and _now > at + lim:
             return "expired"
     return st
+
+
+def _nation(x):
+    """A record's nation as 1 or 2, else None (unknown is never a nation)."""
+    try:
+        n = int((x or {}).get("nation") or 0)
+    except (TypeError, ValueError):
+        return None
+    return n if n in (1, 2) else None
 
 
 def mission_report_text(state, result):
@@ -542,6 +556,11 @@ def mission_accept_verdict(req, char):
     if _pen is not None:
         return _pen
     _iss = (req or {}).get("issuer")
+    if (_iss and (req or {}).get("nation") and _nation(char)
+            and _nation(char) != req["nation"]):
+        # an ORDER is its issuer's nation's; 0 = 27:4 "The operation failed."
+        return 0, (f"{req['name']!r} is a nation {req['nation']} order and this "
+                   f"pilot is nation {_nation(char)}")
     if (_iss and char and _iss[1] is not None and _iss[1] == char.get("id")
             and _iss[2] == "%s.%s" % (char.get("first") or "", char.get("last") or "")):
         return -5, f"{req['name']!r} is this pilot's own order (27:5)"
@@ -783,8 +802,9 @@ def _live_roster(acct):
     return None
 
 
-#: {derived id: unix time it was won, or None = settled without a win}: a
-#: met / complete / failed / expired take never changes, so it is cached.
+#: {derived id: (unix time it was won or None = settled without a win, the
+#: taker's nation or None)}: a met / complete / failed / expired take never
+#: changes, so it is cached.
 ORDER_WON = {}
 
 
@@ -795,6 +815,7 @@ def sector_order_wins(m, since, until, rosters=None):
     where stored, its from_at is the accept's own stamp. A win = the taker's
     accept of the order reached met / complete, stamped by its `settled`."""
     key, at = mission_key(m), m.get("at")
+    own = _nation(m)
     n = 0
     for did, (_acct, e) in list(order_registry(rosters).items()):
         if e.get("from_key") != key or int(e.get("cat") or 0) != 1:
@@ -804,15 +825,20 @@ def sector_order_wins(m, since, until, rosters=None):
         if e.get("from_at") is not None and e.get("from_at") != at:
             continue
         if rosters is None and did in ORDER_WON:
-            t = ORDER_WON[did]
+            t, tn = ORDER_WON[did]
         else:
             a = _order_taker_accept(did, rosters)
             st = (a or {}).get("status") or "open"
-            t = None
+            t, tn = None, _nation(a)
             if st in ("met", "complete"):
                 t = _mission_epoch(a, "settled") or _mission_epoch(a, "reported")
             if rosters is None and a is not None and st != "open":
-                ORDER_WON[did] = t
+                ORDER_WON[did] = (t, tn)
+        # KEY: ONLY THE HOLDER'S NATION'S WINS (Playing Manual p.60). An order
+        # taken by a pilot of the other nation (the list once showed every
+        # nation's orders) is not this sector's progress, whatever it won.
+        if own is not None and tn is not None and tn != own:
+            continue
         if t is not None and int(since) <= t <= int(until):
             n += 1
     return n
@@ -960,19 +986,26 @@ def order_requirements(now=None):
                     "reward_mp": int(e.get("reward_mp") or 0),
                     "reward_hs": int(e.get("reward_hs") or 0),
                     "share_mp": 0, "sector": int(e.get("sector") or 0),
+                    "nation": _nation(e),
                     "issuer": (acct, e.get("issuer_id"), e.get("issuer"))}
     return out
 
 
-def order_list_records(category, zone=None, now=None):
-    """The 536-B All Mission List rows of the open orders in `category`."""
+def order_list_records(category, zone=None, now=None, nation=None):
+    """The 536-B All Mission List rows of the open orders in `category`.
+    `nation` (1/2, the asking pilot's) leaves out the other nation's orders:
+    a derived mission is its issuer's nation's (guide/mission: the Sector /
+    Area taker orders for his own side)."""
     if not missionboard.ORDER:
         return []
+    nation = nation if nation in (1, 2) else None
     out = []
     for did, req in sorted(order_requirements(now).items()):
         if req["cat"] != category:
             continue
         if zone is not None and req.get("zone") and int(req["zone"]) != int(zone):
+            continue
+        if nation is not None and req.get("nation") not in (None, nation):
             continue
         out.append(fmomsn.mission_record(req["name"], category, fields={
             fmomsn.MISSION_REWARD_MP: req["reward_mp"],

@@ -706,6 +706,194 @@ SECTORS_CAPTURE = bytes.fromhex(
     " a6c1d335 a7c1d335 a8c1d335 a9c1d335".replace(" ", ""))
 
 
+# --------------------------------------------------------------------------- #
+# THE 2005 PS2 BUILD (client ps2jp_050324_1531): SAME FRAMES, OTHER OP NUMBERS
+# --------------------------------------------------------------------------- #
+#: KEY: The console module (P2U midas, flat image at 0x00280000) carries the
+#: same key and the same framing: "903094117gekisen" at 0x00570940 feeds the
+#: schedule in the connection ctor (0x004D031C), and its HELLO verifies with
+#: parse() unchanged. What differs is every op number and three record sizes.
+#: Read statically 2026-10-07 from midas.en.swap.bin:
+#:
+#:   client -> server (frame built in the job ctor, op at job+0x54):
+#:     HELLO op 1 (0x004D0D9C: total 0x28, op 1, body u8 2 / u32 1; PC op 4)
+#:     kind 0 op 2 (0x004D07D4)      kind 1 op 4 (0x004D0740, groups)
+#:     kind 2 op 6 (0x004D0700)      kind 3 op 8 (0x004D06A0, mission list)
+#:     kind 5 op 0x1A (0x004D0620)   kind 6 op 0x1C (0x004D05D0)
+#:     kind 7 op 0x1F (0x004D04E0, sector / city ids). No kind-4 ctor found.
+#:
+#:   server -> client: ONE handler (0x004D1430), `op - 0x0B`, 0x17 arms
+#:   (table 0x00570990); the GO arm switches on the job kind (table 0x00570970):
+#:     0x0B GO               0x0C 76-B list (0x004D0370)  0x0D STATUS (+0x0C code)
+#:     0x0F groups page (BYTE count, stride 0x130, cb [job+0x384]); 0x10 END (close)
+#:     0x12 kind-2 page (stride 8, cb 0x38C);       0x13 END (close)
+#:     0x15 mission page (stride 0x1F8, cb 0x390); 0x16 END (close, cb(NULL))
+#:     0x17 kind-4 page (stride 0x4C, cb 0x394);    0x18 END (close)
+#:     0x19 template page (stride 0x1F8, cb 0x398); 0x1B END (close)
+#:     0x1D / 0x20 sector pages (stride 0x88, converted by 0x004D1B10 into the
+#:          PC's 216-B layout, cb 0x39C); 0x1E / 0x21 END (cb(NULL), close)
+#:
+#: WARNING: PC AND PS2 OPS COLLIDE. PS2 op 4 is the group list (PC: HELLO),
+#: PS2 op 6 is kind 2 (PC: the kind-0 op that killed a client when answered
+#: 0x1B), PS2 op 8 is the mission list (PC: kind 2). A connection's dialect is
+#: therefore fixed by its FIRST frame (op 1 = PS2, op 4 = PC) and never guessed
+#: per op.
+PS2_OP_HELLO = 0x01
+PS2_OP_GO = 0x0B
+PS2_OP_STATUS = 0x0D
+PS2_OP_GROUPS, PS2_OP_GROUPS_END = 0x0F, 0x10
+PS2_OP_K2_END = 0x13
+PS2_OP_PAGE, PS2_OP_PAGE_END = 0x15, 0x16
+PS2_OP_TPL_END = 0x1B
+PS2_OP_K6_END = 0x1E
+PS2_OP_SECTOR_PAGE, PS2_OP_SECTOR_END = 0x20, 0x21
+
+#: {PS2 client op: job kind}. Kind 0 (op 2) is the war map's mode-0 job, the
+#: PS2 twin of the PC op 6 whose 0x1B END killed a client: left unanswered.
+PS2_JOB_KIND = {0x02: 0, 0x04: 1, 0x06: 2, 0x08: 3, 0x1A: 5, 0x1C: 6, 0x1F: 7}
+
+#: 0x0F's walker `addiu s2, s2, 0x130` (0x004D171C) and the board callback's
+#: own 0x130-byte copy (0x003778EC). PC's is 0x134: the PS2 row has no
+#: platoon-bonus dword (+0x130) and its comparator (0x00377960, 8 columns)
+#: reads a dword at +0x100, so the creator name ends at +0x0FF.
+PS2_GROUP_RECORD_LEN = 0x130
+PS2_G_EXTRA = 0x100        #: an 8th column the PC row does not have; served 0
+#: 0x15's walker `addiu s3, s3, 0x1F8` (0x004D1804); the callback 0x004FB730
+#: copies 0x1F8 bytes. PC's record is 0x218.
+PS2_RECORD_LEN = 0x1F8
+#: The PS2 row renderer (0x004FA1B8) and comparator (0x004FB990, table
+#: 0x005729C0) draw six cells: Type = +0x1C8 byte 2, Name +0x04, a "%u" at
+#: +0x1E4, +0x1D0 / 60 as "%u min", +0x1E0 through the rank table (100-B
+#: entries off [0x005E9C08]+0x10), and a "%u" at +0x1DC.
+#: Bound here: the id, the name, the Fee (+0x1DC: same offset, same last
+#: column, same "%u" as the PC's verified Fee), the Rank (+0x1E0: the only
+#: cell indexed into the rank table) and the time limit (+0x1D0: the only
+#: cell drawn as minutes). The "%u" at +0x1E4 is NOT bound (it sits where the
+#: PC's reward MP column sits, but nothing proves it) and is served 0.
+PS2_M_TIME = 0x1D0
+PS2_M_FEE = 0x1DC
+PS2_M_RANK = 0x1E0
+#: 0x1D/0x20's walker `addiu s3, s3, 0x88` (0x004D1974 / 0x004D1A0C).
+PS2_SECTOR_RECORD_LEN = 0x88
+
+#: The converter 0x004D1B10, read store by store: (PS2 wire offset, PC
+#: 216-B offset, width). Every PS2 field is a DWORD; `sh` / `sb` keep its low
+#: 2 / 1 byte(s). The two 0x20-byte runs are memcpy's.
+PS2_SECTOR_MAP = (
+    (0x00, 0xD0, 4), (0x48, 0x00, 2), (0x4C, 0x02, 2), (0x50, 0x05, 1),
+    (0x58, 0xCD, 1), (0x5C, 0xCE, 1), (0x60, 0x31, 1), (0x64, 0x32, 1),
+    (0x68, 0x55, 1), (0x6C, 0x56, 1), (0x70, 0xD5, 1), (0x74, 0xD6, 1),
+    (0x78, 0x28, 1), (0x7C, 0x29, 1), (0x80, 0x2C, 1), (0x84, 0x2D, 1),
+)
+PS2_SECTOR_RUNS = ((0x04, 0x07, 0x20), (0x24, 0x34, 0x20))
+
+#: A real PS2 HELLO, prod logs/captures/fmo-20261006T062302Z.bin (from
+#: 203.0.113.37, 2026-10-06T06:23:02Z). One of the 14 that went unanswered.
+PS2_HELLO_CAPTURE = bytes.fromhex(
+    "280000006deedb2722252bdec1f0b8b40022f9e0e2a33d795351d2789ad8b445"
+    "17f6a70901000000")
+
+
+def _ps2_page(op, count_fmt, records):
+    body = struct.pack("<I" + count_fmt, 0, len(records))
+    if count_fmt == "B":
+        body += b"\0\0\0"       # a byte count read with lbu, high bytes zero
+    return build(op, body + b"".join(records))
+
+
+def ps2_per_page(rec_len):
+    """How many `rec_len` records fit under the 4,096-byte receive buffer
+    (PS2: conn+0x1060..conn+0x2060, read loop 0x004CFB14 unbounded, as PC)."""
+    return (CLIENT_RX - HDR - PAYLOAD_HDR - 8) // rec_len
+
+
+def ps2_group_record(pc_rec):
+    """A PC 308-B board row cut to the PS2's 304: the name clipped to end
+    before +0x100, the unknown +0x100 column zero, the bonus dropped."""
+    r = bytearray(bytes(pc_rec)[:PS2_GROUP_RECORD_LEN].ljust(PS2_GROUP_RECORD_LEN, b"\0"))
+    r[PS2_G_EXTRA - 1] = 0
+    r[PS2_G_EXTRA:PS2_G_EXTRA + 4] = b"\0\0\0\0"
+    return bytes(r)
+
+
+def ps2_group_page(records):
+    """op 0x0F: BYTE count at payload+0x0C (lbu, 0x004D16E8), rows from +0x10."""
+    if len(records) > 0xFF:
+        raise ValueError("%d rows: op 0x0F's count is a byte" % len(records))
+    return _ps2_page(PS2_OP_GROUPS, "B", records)
+
+
+def ps2_mission_record(pc_rec, time_limit=0):
+    """A PC 536-B mission row as the PS2's 504-B one. Only the bound fields
+    move (see PS2_M_*); everything else is zero, the state the PC client
+    survived where `mark` killed it."""
+    pc = bytes(pc_rec)
+    r = bytearray(PS2_RECORD_LEN)
+    r[0x00:0x04] = pc[MISSION_ID:MISSION_ID + 4]
+    nm = pc[0x04:0x45].split(b"\0", 1)[0][:0x40]
+    r[0x04:0x04 + len(nm) + 1] = nm + b"\0"
+    struct.pack_into("<I", r, PS2_M_FEE, struct.unpack_from("<I", pc, MISSION_FEE)[0])
+    struct.pack_into("<I", r, PS2_M_RANK, struct.unpack_from("<I", pc, MISSION_RANK)[0])
+    struct.pack_into("<I", r, PS2_M_TIME, int(time_limit or 0) & 0xFFFFFFFF)
+    return bytes(r)
+
+
+def ps2_page(records):
+    """op 0x15: u32 count at payload+0x0C (0x004D17D4), 504-B rows from +0x10."""
+    return _ps2_page(PS2_OP_PAGE, "I", records)
+
+
+def ps2_sector_record(pc_rec):
+    """The PC's 216-B sector record as the PS2 wire's 136 B: the exact
+    inverse of 0x004D1B10, so ps2_sector_to_pc() of the result gives back
+    every byte the console keeps."""
+    pc = bytes(pc_rec).ljust(SECTOR_RECORD_LEN, b"\0")
+    r = bytearray(PS2_SECTOR_RECORD_LEN)
+    for w, p, n in PS2_SECTOR_MAP:
+        struct.pack_into("<I", r, w, int.from_bytes(pc[p:p + n], "little"))
+    for w, p, n in PS2_SECTOR_RUNS:
+        r[w:w + n] = pc[p:p + n]
+    return bytes(r)
+
+
+def ps2_sector_to_pc(wire):
+    """0x004D1B10 itself: a PS2 wire record -> the 216-B layout (unmapped
+    bytes zero). Here so the selftest can prove the inverse."""
+    w = bytes(wire).ljust(PS2_SECTOR_RECORD_LEN, b"\0")
+    r = bytearray(SECTOR_RECORD_LEN)
+    for o, p, n in PS2_SECTOR_MAP:
+        r[p:p + n] = (struct.unpack_from("<I", w, o)[0] & ((1 << (8 * n)) - 1)).to_bytes(n, "little")
+    for o, p, n in PS2_SECTOR_RUNS:
+        r[p:p + n] = w[o:o + n]
+    return bytes(r)
+
+
+def ps2_sector_page(records):
+    """op 0x20: u32 count at payload+0x0C (0x004D19CC), 136-B rows."""
+    return _ps2_page(PS2_OP_SECTOR_PAGE, "I", records)
+
+
+class PS2ListQuery(object):
+    """The PS2 kind-3 body (op 8, 0x004D06A0): {u32 uninitialised, submode
+    (2 when the caller's first arg is non-zero, else 1), max rows (100), the
+    caller's byte at [obj+0x60C], the dword at [globals+0x19C]}. The two
+    caller values are the same pair the PS2 group query passes, i.e. the
+    nation and the MapKind (names by analogy with PC kind 1, not proved).
+    WARNING: THERE IS NO CATEGORY. The PS2 query cannot ask for Battle Map /
+    Sector / Area, and the PS2 view filters nothing on +0x1C8, so the PS2 list
+    is one list."""
+
+    __slots__ = ("submode", "max_rows", "nation", "mapkind")
+
+    def __init__(self, body):
+        f = struct.unpack_from("<5I", bytes(body).ljust(20, b"\0"), 0)
+        self.submode, self.max_rows, self.nation, self.mapkind = f[1], f[2], f[3], f[4]
+
+    def __str__(self):
+        return ("PS2 submode=%d max=%d nation=%d MapKind=%d (no category)"
+                % (self.submode, self.max_rows, self.nation, self.mapkind))
+
+
 def selftest():
     ok = True
 
@@ -884,6 +1072,48 @@ def selftest():
     check("seven sector slots fit the client's receive buffer",
           max_sectors_per_page() == 7
           and len(sector_page([sector_record(i) for i in range(7)])) <= CLIENT_RX)
+
+    # THE PS2 DIALECT (0x004D1430): a real console HELLO verifies with the
+    # same key and MD5, carries op 1 and the PC hello's body; the three PS2
+    # record shapes and pages stay inside the 4,096-byte buffer.
+    _p2 = parse(PS2_HELLO_CAPTURE)
+    check("PS2 capture: verifies, op 1, body byte 2 / u32 1 (0x004D0D9C)",
+          _p2 is not None and _p2[0] == PS2_OP_HELLO and _p2[1][0] == 2
+          and struct.unpack_from("<I", _p2[1], 4)[0] == 1)
+    _pcs = sector_record(903_069_118, mark="byte")
+    _ws = ps2_sector_record(_pcs)
+    _back = ps2_sector_to_pc(_ws)
+    _kept = [p + i for _w, p, n in PS2_SECTOR_MAP + PS2_SECTOR_RUNS for i in range(n)]
+    check("PS2 sector: 136 B, 0x004D1B10 of it gives back every mapped byte "
+          "and the id at +0xD0",
+          len(_ws) == PS2_SECTOR_RECORD_LEN
+          and all(_back[o] == _pcs[o] for o in _kept)
+          and struct.unpack_from("<I", _back, SECTOR_ID_OFF)[0] == 903_069_118
+          and struct.unpack_from("<I", _ws, 0)[0] == 903_069_118)
+    _pm = ps2_mission_record(mission_record(
+        "Sector Sweep", 2, fields={MISSION_FEE: 30, MISSION_RANK: 10,
+                                   MISSION_REWARD_MP: 80}, mid=11), 1800)
+    check("PS2 mission: 504 B, id, name, Fee +0x1DC, Rank +0x1E0, time "
+          "+0x1D0, the unbound +0x1E4 zero",
+          len(_pm) == PS2_RECORD_LEN and _pm[:4] == struct.pack("<I", 11)
+          and _pm[4:17] == b"Sector Sweep\0"
+          and struct.unpack_from("<III", _pm, PS2_M_FEE) == (30, 10, 0)
+          and struct.unpack_from("<I", _pm, PS2_M_TIME)[0] == 1800
+          and struct.unpack_from("<I", _pm, 0x1C8)[0] == 0)
+    _pg2 = ps2_group_record(group_record(5, name="N" * 90, bonus=7))
+    check("PS2 group: 304 B, name ends before +0x100, +0x100 zero, no bonus",
+          len(_pg2) == PS2_GROUP_RECORD_LEN and _pg2[PS2_G_EXTRA - 1] == 0
+          and _pg2[PS2_G_EXTRA:PS2_G_EXTRA + 4] == bytes(4))
+    for _nm, _f in (("groups", lambda: ps2_group_page([_pg2] * ps2_per_page(PS2_GROUP_RECORD_LEN))),
+                    ("missions", lambda: ps2_page([_pm] * ps2_per_page(PS2_RECORD_LEN))),
+                    ("sectors", lambda: ps2_sector_page([_ws] * ps2_per_page(PS2_SECTOR_RECORD_LEN)))):
+        _fr = _f()
+        _r = parse(_fr)
+        check("a full PS2 %s page fits the buffer and round-trips" % _nm,
+              len(_fr) <= CLIENT_RX and _r is not None)
+    _pq = PS2ListQuery(struct.pack("<5I", 0, 2, 100, 1, 200))
+    check("the PS2 kind-3 body decodes (no category)",
+          (_pq.submode, _pq.max_rows, _pq.nation, _pq.mapkind) == (2, 100, 1, 200))
 
     check("looks_like_frame accepts the capture",
           looks_like_frame(HELLO_CAPTURE) == 40)

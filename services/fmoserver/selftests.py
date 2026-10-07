@@ -13895,6 +13895,7 @@ def _selftest_run(test_db):
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
     ok &= _war_phase_pins()         # a whole war phase offline: judge, reset, reward, restart (fmowar)
     ok &= _shop_acquire_pins()      # item shop buy 0x0168 -> 0x016B: gate at packet+0x28 (shop.py)
+    ok &= _community_ps2_pins()     # PS2 community dialect (op 1 HELLO) + mission nation rules
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -14127,6 +14128,165 @@ def _group_persist_pins():
             cur.update(v)
         (bg.GROUP_PERSIST, gc.GROUP_RULES, gc.GROUP_STANDBY_S, gc.GROUP_LATE_JOIN_S,
          bg.read_groups_doc) = _sv[2:]
+    return ok
+
+
+def _community_ps2_pins():
+    """THE PS2 COMMUNITY DIALECT + THE MISSION NATION RULES (2026-10-07), no
+    client. P1 the first op fixes the dialect: a real PS2 HELLO (op 1) gets the
+    PS2 GO 0x0B, the PC capture still gets 0x12; P2 PS2 op 8 is the MISSION
+    LIST (504-B rows of every category on op 0x15, then 0x16) while PC op 8 is
+    still kind 2; P3 PS2 groups / sectors / undecoded kinds get their own END
+    ops, kind 0 (op 2) stays silent, FMO_MSN_PS2=0 silences the dialect;
+    P4 an order is hidden from, refused to and not counted for the other
+    nation, and a sector accept counts only its own nation's ledger wins.
+    Returns ok."""
+    ok = True
+    _sv = (community.MSN_ROWS, community.MSN_FIELDS, community.MSN_END_OPS,
+           community.MSN_PS2, community.GROUP_BOARD, warstate.WAR,
+           sectorwins.MSN_ZONES)
+    _ops = lambda r: [o for o, _f in r]
+    try:
+        from . import defaults
+        _rd = defaults.RELEASE_DEFAULTS
+        community.MSN_ROWS = [r for r in _rd["FMO_MSN_ROWS"].split("|") if r]
+        community.MSN_FIELDS = _rd["FMO_MSN_FIELDS"]
+        community.MSN_END_OPS = frozenset()
+        community.MSN_PS2 = True
+        community.GROUP_BOARD = True
+        sectorwins.MSN_ZONES = ""
+        # P1
+        _p2op, _p2b = fmomsn.parse(fmomsn.PS2_HELLO_CAPTURE)
+        _pcop, _pcb = fmomsn.parse(fmomsn.HELLO_CAPTURE)
+        _d2, _dp = community.msn_dialect(_p2op), community.msn_dialect(_pcop)
+        _h2 = community.msn_reply("selftest-ps2", _p2op, _p2b, dialect=_d2)
+        _hp = community.msn_reply("selftest", _pcop, _pcb, dialect=_dp)
+        _p1 = (_d2 == "ps2" and _dp == "pc" and _ops(_h2) == [fmomsn.PS2_OP_GO]
+               and fmomsn.parse(_h2[0][1])[0] == 0x0B
+               and _ops(_hp) == [fmomsn.OP_GO])
+        print(f"  PS2 community P1: op 1 -> dialect ps2 -> GO 0x0B; the PC hello "
+              f"still -> 0x12: {'OK' if _p1 else 'FAIL'}")
+        ok &= _p1
+        # P2
+        _q = struct.pack("<5I", 0, 2, 100, 1, 0)
+        _m2 = community.msn_reply("selftest-ps2", 0x08, _q, dialect="ps2")
+        _recs = []
+        for _o, _f in _m2:
+            if _o == fmomsn.PS2_OP_PAGE:
+                _b = fmomsn.parse(_f)[1]
+                _n = struct.unpack_from("<I", _b, 4)[0]
+                _recs += [_b[8 + i * fmomsn.PS2_RECORD_LEN:8 + (i + 1) * fmomsn.PS2_RECORD_LEN]
+                          for i in range(_n)]
+        _by_id = {struct.unpack_from("<I", r, 0)[0]: r for r in community.msn_rows(None)}
+        _u = lambda r, off: struct.unpack_from("<I", r, off)[0]
+        _ids = sorted(_u(r, 0) for r in _recs)
+        _bound = bool(_recs) and all(
+            _u(r, fmomsn.PS2_M_FEE) == _u(_by_id[_u(r, 0)], fmomsn.MISSION_FEE)
+            and _u(r, fmomsn.PS2_M_RANK) == _u(_by_id[_u(r, 0)], fmomsn.MISSION_RANK)
+            and _u(r, 0x1E4) == 0 and len(r) == fmomsn.PS2_RECORD_LEN for r in _recs)
+        _pc8 = community.msn_reply("selftest", 0x08, bytes(88), dialect="pc")
+        _p2 = (_ops(_m2)[-1] == fmomsn.PS2_OP_PAGE_END
+               and [7, 11, 13, 17, 19] == [i for i in _ids if i in (7, 11, 13, 17, 19)]
+               and _bound and _pc8 == [])
+        print(f"  PS2 community P2: PS2 op 8 = the mission list, the 5 release rows "
+              f"(3 categories) as 504-B op 0x15 rows with Fee +0x1DC / Rank +0x1E0, "
+              f"then 0x16; PC op 8 is still kind 2 (silent without END_OPS): "
+              f"{'OK' if _p2 else 'FAIL'}")
+        ok &= _p2
+        # P3
+        warstate.WAR = "1"
+        _g = community.msn_reply("selftest-ps2", 0x04, bytes(40), dialect="ps2")
+        _s = community.msn_reply("selftest-ps2", 0x1F, fmomsn.SECTORS_CAPTURE, dialect="ps2")
+        _srec = [fmomsn.parse(f)[1] for o, f in _s if o == fmomsn.PS2_OP_SECTOR_PAGE]
+        _sid = struct.unpack_from("<I", _srec[0], 8)[0] if _srec else None
+        _p3 = (_ops(_g)[-1] == fmomsn.PS2_OP_GROUPS_END
+               and all(o == fmomsn.PS2_OP_GROUPS for o in _ops(_g)[:-1])
+               and _ops(_s)[-1] == fmomsn.PS2_OP_SECTOR_END
+               and _sid in (None, 903_069_118)
+               and _ops(community.msn_reply("s", 0x06, bytes(20), dialect="ps2")) == [0x13]
+               and _ops(community.msn_reply("s", 0x1A, bytes(20), dialect="ps2")) == [0x1B]
+               and _ops(community.msn_reply("s", 0x1C, bytes(20), dialect="ps2")) == [0x1E]
+               and community.msn_reply("s", 0x02, bytes(112), dialect="ps2") == [])
+        community.MSN_PS2 = False
+        _p3 = _p3 and community.msn_reply("s", 0x01, _p2b, dialect="ps2") == []
+        print(f"  PS2 community P3: groups 0x0F..0x10, sectors 0x20 (first id "
+              f"{_sid}) ..0x21, kinds 2/5/6 -> 0x13/0x1B/0x1E, kind 0 silent, "
+              f"FMO_MSN_PS2=0 silent: {'OK' if _p3 else 'FAIL'}")
+        ok &= _p3
+    except Exception as _x:
+        print(f"  PS2 community pins raised {_x!r}: FAIL")
+        ok = False
+    finally:
+        (community.MSN_ROWS, community.MSN_FIELDS, community.MSN_END_OPS,
+         community.MSN_PS2, community.GROUP_BOARD, warstate.WAR,
+         sectorwins.MSN_ZONES) = _sv
+    # P4 -- the nation rules
+    _reg = (dict(missionbook.ORDERS), list(missionbook._orders_loaded),
+            missionboard.ORDER, dict(missionbook.ORDER_WON))
+    _iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    _T0 = 1_800_000_000
+    try:
+        missionboard.ORDER = True
+        missionbook.ORDERS.clear()
+        missionbook._orders_loaded.append(True)
+        _now = time.time()
+        _e1 = {"id": 0xFD01, "key": 0xFD01, "derived": 0xFD01, "name": "N1", "cat": 1,
+               "status": "ordered", "at": _iso(_now), "limit": 1800, "nation": 1}
+        _e2 = dict(_e1, id=0xFD02, key=0xFD02, derived=0xFD02, name="N2", nation=2)
+        missionbook.ORDERS.update({0xFD01: ("p4:a", _e1), 0xFD02: ("p4:b", _e2)})
+        _l1 = [r[4:6] for r in missionbook.order_list_records(1, nation=1)]
+        _la = missionbook.order_list_records(1)
+        _req = missionbook.order_requirements()[0xFD02]
+        _v = missionbook.mission_accept_verdict(_req, {"id": 9, "nation": 1})
+        # the sector accept of nation 1 ordered a battle map; taken by a
+        # nation-2 pilot who won, it does not count, by a nation-1 pilot it does
+        _sk = 11 + (1 << 16)
+        _sm = {"id": 11, "key": _sk, "name": "S", "cat": 2, "needed": 1,
+               "at": _iso(_T0), "zone": 200, "sector": 71122, "nation": 1}
+        _o = {"id": 0xFD03, "key": 0xFD03, "derived": 0xFD03, "name": "S",
+              "status": "ordered", "cat": 1, "at": _iso(_T0 + 10), "limit": 1800,
+              "from_key": _sk, "from_at": _iso(_T0)}
+        _tk = {"id": 0xFD03, "cat": 1, "at": _iso(_T0 + 20), "nation": 2,
+               "status": "met", "settled": _iso(_T0 + 40)}
+        _ros = [("p4:s", [{"id": 3, "missions": [_sm, _o]}]),
+                ("p4:t", [{"id": 4, "missions": [_tk]}])]
+        missionbook.ORDERS.clear()
+        _w_enemy = missionbook.sector_order_wins(_sm, _T0, _T0 + 100, _ros)
+        _tk["nation"] = 1
+        missionbook.ORDERS.clear()
+        _w_own = missionbook.sector_order_wins(_sm, _T0, _T0 + 100, _ros)
+        # the plain ledger path: no nation on the accept counts nobody's wins,
+        # nation 1 does not count nation 2's
+        _sv_own = missionboard.SECTOR_OWN_WINS
+        missionboard.SECTOR_OWN_WINS = False
+        try:
+            _led = {(200, 71122, 0): [_T0 + 30], (200, 71122, 2): [_T0 + 30]}
+            _st0 = missionbook.mission_status(dict(_sm, nation=None), now=_T0 + 100,
+                                              limit=1800, ledger=_led, rosters=[])
+            _st1 = missionbook.mission_status(dict(_sm), now=_T0 + 100, limit=1800,
+                                              ledger=_led, rosters=[])
+            _led[(200, 71122, 1)] = [_T0 + 30]
+            _st2 = missionbook.mission_status(dict(_sm), now=_T0 + 100, limit=1800,
+                                              ledger=_led, rosters=[])
+        finally:
+            missionboard.SECTOR_OWN_WINS = _sv_own
+        _p4 = (_l1 == [b"N1"] and len(_la) == 2 and _v[0] == 0
+               and _w_enemy == 0 and _w_own == 1
+               and _st0 == "open" and _st1 == "open" and _st2 == "met")
+    except Exception as _x:
+        print(f"    (raised {_x!r})")
+        _p4 = False
+    finally:
+        missionbook.ORDERS.clear()
+        missionbook.ORDERS.update(_reg[0])
+        missionbook._orders_loaded[:] = _reg[1]
+        missionboard.ORDER = _reg[2]
+        missionbook.ORDER_WON.clear()
+        missionbook.ORDER_WON.update(_reg[3])
+    print(f"  missions P4: the other nation's order is off the list and refused "
+          f"0 (27:4), its win is not this sector's progress; a sector accept counts "
+          f"only its own nation's ledger wins: {'OK' if _p4 else 'FAIL'}")
+    ok &= _p4
     return ok
 
 

@@ -2,6 +2,7 @@
 Board."""
 import os
 import socket
+import struct
 import time
 from .deps import fmomsn
 from .knobs import _env_int
@@ -80,7 +81,7 @@ MSN_PROBE_ROWS = _env_int("FMO_MSN_PROBE_ROWS", "1")
 #: WHY THIS IS NOT THE 09-06 KILL. That crash was op **6**, the war map's
 #: mode-0 KIND-0 job, whose callback does not tolerate a NULL record. It does
 #: NOT generalise: each job kind passes its OWN completion callback, and the
-#: kind-2 (op 8, the SECTOR MISSION LIST) job is created at 0x611C5596 with
+#: kind-2 (op 8) job is created at 0x611C5596 with
 #: callback **0x6123CAD0**, which opens with
 #:     mov edi,[esp+0xC] ; test edi,edi ; je 0x6123CAF5
 #: -- i.e. it BRANCHES ON A NULL RECORD and takes a finalise path
@@ -88,7 +89,14 @@ MSN_PROBE_ROWS = _env_int("FMO_MSN_PROBE_ROWS", "1")
 #: refresh the view). Handing THAT callback a NULL is how a list ENDS, not a
 #: fault. So 0x1B is safe for op 8 and fatal for op 6, and a blanket
 #: FMO_MSN_UNKNOWN=end cannot tell them apart -- hence per-op.
-#: WARNING: STATIC. No client has been answered on op 8. Empty by default.
+#: CORRECTED 2026-10-07: op 8 is NOT the sector mission list. The Sector
+#: Mission list is op 9 category 2 (live 2026-09-12). Op 8's job asks for
+#: ids 505/509/513 (the three Frontline MapKinds) and its callback hands each
+#: record to vtable 0x613485D0 slot 6 = 0x6123CB40, the "War Status" class
+#: (the string after the vtable), which copies 32-byte entries (bytes +0..+3,
+#: +6, +8..+0xB, dwords +0xC..+0x1C) into a 2,000-entry table. So the honest
+#: answer while that record is undecoded is this END, never 536-B mission rows.
+#: Prod sets 0x08 here; PC clients took that END and closed cleanly (10-06, 10-07).
 MSN_END_OPS = frozenset(
     int(x, 0) for x in os.environ.get("FMO_MSN_END_OPS", "").replace(" ", "")
     .split(",") if x)
@@ -160,10 +168,13 @@ def msn_row_table():
     return [msn_row_spec(spec, i) for i, spec in enumerate(MSN_ROWS)]
 
 
-def msn_rows(category, mapkind=None):
+def msn_rows(category, mapkind=None, nation=None):
     """The rows we serve, as 536-byte records. `mapkind` = the query's own
     zone: a row FMO_MSN_ZONES puts in another zone is left out (SE's list is
-    per area); rows with no zone, or a query with no real zone, pass."""
+    per area); rows with no zone, or a query with no real zone, pass.
+    `category` None = EVERY row (the PS2 query has no category, see
+    fmomsn.PS2ListQuery). `nation` (1/2) = the asking pilot's: an open ORDER
+    issued by the other nation is left out (missionbook.order_list_records)."""
     fields = _msn_fields()
     zones = sectorwins._row_int_map(sectorwins.MSN_ZONES, "FMO_MSN_ZONES")
     _zq = int(mapkind) if mapkind and zoneentry.in_mapkind_band(int(mapkind)) else None
@@ -177,15 +188,16 @@ def msn_rows(category, mapkind=None):
     # so a row nobody has classified does not silently vanish from every list.
     out = []
     for i, (mid, cat, name) in enumerate(msn_row_table()):
-        if cat is not None and cat != category:
+        if cat is not None and category is not None and cat != category:
             continue
         if _zq is not None and zones.get(i) is not None and zones[i] != _zq:
             continue
-        out.append(fmomsn.mission_record(name, category if cat is None else cat,
+        out.append(fmomsn.mission_record(name, (category or 0) if cat is None else cat,
                                          mark=MSN_MARK, fields=fields.get(i),
                                          mid=mid))
     # the open ORDERS (derived missions other pilots issued) are rows too
-    out += missionbook.order_list_records(category, _zq)
+    for _c in ((category,) if category is not None else (1, 2, 3)):
+        out += missionbook.order_list_records(_c, _zq, nation=nation)
     return out
 
 
@@ -193,10 +205,13 @@ def serve_mission_client(conn, peer, first):
     """One community-server connection, for its whole life.
 
     The client's own conversation, and nothing more: op 4 -> 0x12, op 9 ->
-    pages of 0x1D -> 0x1B. Any other op gets 0x1B, which is the arm that ends
-    a job and pops the next one -- so an op we have not decoded ends cleanly
-    instead of parking the queue."""
+    pages of 0x1D -> 0x1B (msn_reply). An op whose reply is not earned gets
+    silence. The 2005 PS2 build opens with op 1 instead and the whole
+    connection is then answered in its numbering (msn_reply_ps2)."""
     buf = bytearray(first)
+    # "pc" or "ps2", fixed by the FIRST frame's op and never re-guessed:
+    # the two builds' op numbers collide (fmomsn's PS2 block).
+    dialect = None
     deadline = time.monotonic() + wirelog.HOLD
     log(f"{peer} KEY: COMMUNITY/MISSION SERVER connection (fmomsn) -- this is "
         f"the second server the 0x0322 endpoint at payload+0x28 points at. "
@@ -220,10 +235,17 @@ def serve_mission_client(conn, peer, first):
                     f"a transient:\n" + hexdump(frame[:64]))
                 return
             op, body = got
-            log(f"{peer} <- community op 0x{op:02X}, {len(body)}B body")
+            if dialect is None:
+                dialect = msn_dialect(op)
+                if dialect == "ps2":
+                    log(f"{peer} KEY: PS2 DIALECT: the first frame is op 0x01, the "
+                        f"2005 console build's HELLO (PC sends op 4). Every op on "
+                        f"this connection is read with the PS2 numbering.")
+            log(f"{peer} <- community op 0x{op:02X}, {len(body)}B body"
+                + (" (PS2)" if dialect == "ps2" else ""))
             if body:
                 log(hexdump(body))
-            for out in msn_reply(peer, op, body):
+            for out in msn_reply(peer, op, body, dialect=dialect):
                 log(f"{peer} -> community op 0x{out[0]:02X}, {len(out[1])}B")
                 conn.sendall(out[1])
         conn.settimeout(min(15, max(0.1, deadline - time.monotonic())))
@@ -320,8 +342,23 @@ def group_board_rows():
     return rows
 
 
-def msn_reply(peer, op, body):
+#: FMO_MSN_PS2: answer the 2005 PS2 build's community connection (op 1 HELLO
+#: and its own job ops). 1 (default) = yes; 0 = the old silence for that
+#: dialect only, the PC is untouched either way.
+MSN_PS2 = (os.environ.get("FMO_MSN_PS2", "").strip() or "1") != "0"
+
+
+def msn_dialect(first_op):
+    """The dialect a connection speaks, from its FIRST op: the PS2 HELLO is
+    op 1 (0x004D0D9C), the PC's op 4 (0x611AEC40). Anything else is read as
+    PC, which is what every connection was before the PS2 was decoded."""
+    return "ps2" if first_op == fmomsn.PS2_OP_HELLO else "pc"
+
+
+def msn_reply(peer, op, body, dialect="pc"):
     """(op, frame) pairs for one request. Empty list = deliberate silence."""
+    if dialect == "ps2" and MSN_ON:
+        return msn_reply_ps2(peer, op, body)
     if not MSN_ON:
         log(f"{peer}   FMO_MSN=0: identified but NOT answered. The client will "
             f"hold this connection until its own timeout and its list job will "
@@ -359,7 +396,8 @@ def msn_reply(peer, op, body):
         return out
     if op == fmomsn.OP_LIST:
         q = fmomsn.ListQuery(body)
-        rows = msn_rows(q.category, q.mapkind)
+        rows = msn_rows(q.category, q.mapkind,
+                        q.nation if q.nation in (1, 2) else None)
         log(f"{peer}   op 9 = THE MISSION-LIST QUERY: {q}. Serving "
             f"{len(rows)} row(s)"
             + (f" for zone {q.mapkind} (FMO_MSN_ZONES={sectorwins.MSN_ZONES!r} leaves "
@@ -426,7 +464,8 @@ def msn_reply(peer, op, body):
     _known = {
         0x07: "kind 1 (0x611AF380/0x611AF400, 0xDD B) -- the WAR MAP "
               "(0x6118EAFE/0x6118EB40) and a lobby window",
-        0x08: "kind 2 (0x611AF4D0, 0x78 B) -- the mission module (0x611C5596)",
+        0x08: "kind 2 (0x611AF4D0, 0x78 B) -- the WAR STATUS feed for MapKinds "
+              "505/509/513 (callback 0x6123CAD0 -> 0x6123CB40, 32-B entries)",
         0x0E: "kind 5 (0x611AF670, 0x348 B) -- the mission module, a count at "
               "payload+0x08 and that many u32 ids",
         0x10: "kind 7 (0x611AF6F0, 0x1B8 B) -- KEY: CITY CONTROL (0x610E83A3, "
@@ -493,6 +532,76 @@ def msn_reply(peer, op, body):
     log(f"{peer}   WARNING: FMO_MSN_UNKNOWN=end: answering 0x1B, which is what KILLED "
         f"the client on 2026-09-06. This is the reproduce switch.")
     return [(fmomsn.OP_END, fmomsn.build(fmomsn.OP_END))]
+
+
+def _ps2_pages(page_op, page_fn, rec_len, recs, end_op):
+    """[(op, frame)]: `recs` in as many pages as the 4 KB buffer needs, then
+    the kind's own END."""
+    per = fmomsn.ps2_per_page(rec_len)
+    out = [(page_op, page_fn(recs[i:i + per])) for i in range(0, len(recs), per)]
+    return out + [(end_op, fmomsn.build(end_op))]
+
+
+def msn_reply_ps2(peer, op, body):
+    """The PS2 dialect (fmomsn's PS2 block): the same jobs as the PC under
+    other op numbers, answered with the console's own page and END ops.
+    Statically read from midas.en.swap.bin 2026-10-07; NOT YET SEEN LIVE."""
+    if not MSN_PS2:
+        log(f"{peer}   PS2 community op 0x{op:02X}: FMO_MSN_PS2=0, not answered "
+            f"(the pre-2026-10-07 silence).")
+        return []
+    kind = fmomsn.PS2_JOB_KIND.get(op)
+    if op == fmomsn.PS2_OP_HELLO:
+        log(f"{peer}   PS2 op 1 = the connection HELLO (0x004D0D9C). Answering "
+            f"0x0B, the PS2 GO (arm 0x004D1470 sends the queued job's frame).")
+        return [(fmomsn.PS2_OP_GO, fmomsn.build(fmomsn.PS2_OP_GO))]
+    if kind == 1 and GROUP_BOARD:
+        rows = [fmomsn.ps2_group_record(r) for r in group_board_rows()]
+        log(f"{peer}   PS2 op 4 = KIND 1, THE SCRAMBLE BOARD'S GROUP LIST. "
+            f"{len(rows)} row(s) of {fmomsn.PS2_GROUP_RECORD_LEN} B as op 0x0F "
+            f"pages, then 0x10 END (closes the connection; no NULL callback).")
+        return _ps2_pages(fmomsn.PS2_OP_GROUPS, fmomsn.ps2_group_page, fmomsn.PS2_GROUP_RECORD_LEN,
+                          rows, fmomsn.PS2_OP_GROUPS_END)
+    if kind == 3:
+        q = fmomsn.PS2ListQuery(body)
+        pc = msn_rows(None, q.mapkind, q.nation if q.nation in (1, 2) else None)
+        rows = [fmomsn.ps2_mission_record(
+                    r, missionbook.mission_deadline(
+                        struct.unpack_from("<I", r, fmomsn.MISSION_DISTRIBUTION)[0] >> 24))
+                for r in pc][:max(0, q.max_rows) or 100]
+        log(f"{peer}   PS2 op 8 = KIND 3, THE MISSION LIST: {q}. {len(rows)} "
+            f"row(s) of {fmomsn.PS2_RECORD_LEN} B (every category: the PS2 "
+            f"query carries none) as op 0x15 pages, then 0x16 END (callback "
+            f"0x004FB730 tests the NULL at 0x004FB754).")
+        return _ps2_pages(fmomsn.PS2_OP_PAGE, fmomsn.ps2_page, fmomsn.PS2_RECORD_LEN, rows,
+                          fmomsn.PS2_OP_PAGE_END)
+    if kind == 7 and warstate.WAR != "0":
+        q = fmomsn.SectorQuery(body)
+        recs, how = warstate.war_sector_records(q)
+        recs = [fmomsn.ps2_sector_record(r) for r in recs] if warstate.WAR != "end" else []
+        log(f"{peer}   PS2 op 0x1F = KIND 7, THE SECTOR / CITY STATE QUERY: {q}. "
+            f"{how}. {len(recs)} x {fmomsn.PS2_SECTOR_RECORD_LEN} B (the inverse "
+            f"of 0x004D1B10) as op 0x20 pages, then 0x21 END (callback "
+            f"0x00533B10 tests the NULL at 0x00533B3C).")
+        return _ps2_pages(fmomsn.PS2_OP_SECTOR_PAGE, fmomsn.ps2_sector_page, fmomsn.PS2_SECTOR_RECORD_LEN,
+                          recs, fmomsn.PS2_OP_SECTOR_END)
+    _ends = {2: (fmomsn.PS2_OP_K2_END, "kind 2 (the War Status feed on the PC, "
+                 "0x6123CB40); its END 0x13 only closes, no callback runs"),
+             5: (fmomsn.PS2_OP_TPL_END, "kind 5 (order templates); its END 0x1B "
+                 "only closes, no callback runs"),
+             6: (fmomsn.PS2_OP_K6_END, "kind 6 (one MapKind's sectors); its END "
+                 "0x1E hands callback 0x003B0EF0 a NULL, which it tests at "
+                 "0x003B0F00")}
+    if kind in _ends:
+        end, why = _ends[kind]
+        log(f"{peer}   PS2 op 0x{op:02X} = {why}. Records not decoded, so the "
+            f"truthful EMPTY answer: op 0x{end:02X}. body {body[:32].hex(' ')}")
+        return [(end, fmomsn.build(end))]
+    log(f"{peer}   WARNING: PS2 community op 0x{op:02X} "
+        + (f"= kind {kind}" if kind is not None else "= not a PS2 job op")
+        + f": NOT ANSWERED. Kind 0 is the war map's mode-0 job, the twin of the "
+        f"PC op 6 whose 0x1B END killed a client. body {body[:48].hex(' ')}")
+    return []
 
 
 # Called at run time only; imported last so that import cycles resolve.
