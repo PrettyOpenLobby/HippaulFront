@@ -35,6 +35,9 @@ def war_state():
         return None
     if _WAR_STATE is None:
         _WAR_STATE = fmowar.War()
+        if fmowar.RESTART and _WAR_STATE.data.get("restarted_at") and not _WAR_STATE.data.get("sectors"):
+            log(f"war state: RESTARTED by FMO_WAR_RESTART: phase 1 from "
+                f"{_WAR_STATE.phase1()}, the judged phases archived under 'wars'")
         # the opening map: every sector SE's table knows, by its zone kind
         # (FMO_WAR_SEED); a tile already on file is left alone
         if fmosectors is not None:
@@ -71,9 +74,14 @@ def _war_tick(st):
             log(f"war state: PHASE {pn} JUDGED -- O.C.U. {rec['ocu']} pts vs "
                 f"U.S.N. {rec['usn']} pts -> "
                 f"{ {1: 'O.C.U. wins', 2: 'U.S.N. wins'}.get(rec['winner'], 'a TIE, both rewarded') }"
-                + (f"; Deadlock penalty on nation {rec['penalty']['nation']}'s "
-                   f"fortress tile {rec['penalty']['tile']}" if rec.get("penalty") else "")
-                + " (SE's phase page; the reward table is not served yet)")
+                + (f"; nation {rec['penalty']['nation']}'s fortress tile "
+                   f"{rec['penalty']['tile']} opens the next phase in Deadlock"
+                   if rec.get("penalty") else "")
+                + "; victory reward: " + (", ".join(
+                    f"nation {nat} wins the {r['name']} series" for nat, r in
+                    sorted((rec.get("reward") or {}).items())) or "none")
+                + f", on sale from {rec.get('reward_from')} where FMO_PARTS_STOCK sells "
+                f"wanzer parts, else OWED (SE's phase page)")
         for pn, rec in getattr(st, "resets_now", ()):
             log(f"war state: PHASE {pn} STARTED -- the frontline is RESET to its "
                 f"opening state ({rec['sectors']} sector(s); guide/phase, news7740)"

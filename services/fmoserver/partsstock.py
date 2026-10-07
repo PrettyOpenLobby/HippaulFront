@@ -189,6 +189,9 @@ VICTORY_PARTS = _env_int("FMO_VICTORY_PARTS", 1) != 0
 VICTORY_SERIES = {1: (181, 182, 183, 184),     # O.C.U. win: Igel / Grille
                   2: (176, 177, 178, 179)}     # U.S.N. win: Tiran I..IV
 VICTORY_KINDS = (0x11, 0x21, 0x31)             # body, arms, legs: the series
+#: The wanzer PART kinds (low nibble 1): a stock with none of them sells no
+#: parts, and the victory reward is then owed, not served (victory_stock).
+WANZER_PART_KINDS = (0x11, 0x21, 0x31, 0x41)
 
 
 def victory_unlocked(phases):
@@ -234,10 +237,24 @@ def victory_stock(nation=None):
         # unset = no push at all (the empty shop); a block holding ONLY the
         # reward series would be a different shop, not a reward
         return None, "FMO_PARTS_STOCK unset"
+    if not any(k in PARTS_STOCK for k in WANZER_PART_KINDS):
+        # the reward is a wanzer series, and buying/undressing a PART kills
+        # the client (0x611A559D, SE's own `and byte [node],0x0F`): a shop
+        # that sells no parts must not start selling them as a reward. The
+        # war state keeps the award (fmowar phases[n]["reward"]) as OWED.
+        return PARTS_STOCK, ("victory series OWED, not served: FMO_PARTS_STOCK "
+                             "sells no wanzer parts")
     war = warstate.war_state() if warstate.WAR != "0" else None
     phases = (war.data.get("phases") if war is not None else None) or {}
-    unl = victory_unlocked(phases)
+    # phases judged since rewards were recorded carry their own series
+    # (fmowar: SE's per-phase table, on sale from the next phase's start);
+    # an older record without one keeps the phase-00 series below
+    legacy = {k: r for k, r in phases.items() if not (isinstance(r, dict) and "reward" in r)}
+    unl = victory_unlocked(legacy)
     got = parts_stock_for(PARTS_STOCK, nation, unl)
+    fw = warstate.fmowar
+    if fw is not None and len(legacy) < len(phases):
+        got = fw.reward_stock(got, nation, phases)
     return got, (f"victory series unlocked for nation(s) {sorted(unl) or 'none'} "
                  f"after {len(phases)} judged phase(s); served for nation {nation}")
 

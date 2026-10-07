@@ -122,6 +122,68 @@ FACILITY_CAP = _env_int("FMO_WAR_FACILITY_CAP", 60)
 #: state, once. 0 = the old rule (the frontline carries over; only the
 #: loser's fortress changes).
 PHASE_RESET = _env_int("FMO_WAR_PHASE_RESET", 1) != 0
+#: FMO_WAR_RESTART -- START THE WAR AGAIN on a chosen date (YYYY-MM-DD, UTC),
+#: without touching the database by hand. When the stored state was not
+#: already restarted to this date, the fmo service (a writer) archives the
+#: judged phases under data["wars"], drops every sector so seeding rebuilds
+#: the opening map, and makes this date phase 1's start. Each date runs
+#: once: leaving the knob set is harmless, and a new date restarts again.
+#: Empty (default) = never. The same thing by hand, with the service stopped:
+#: `python fmowar.py --restart YYYY-MM-DD`.
+RESTART = os.environ.get("FMO_WAR_RESTART", "").strip()
+
+#: KEY: THE VICTORY REWARD SERIES (guide/phase: 「勝利すると、それまで購入できな
+#: かった相手陣営のヴァンツァー1シリーズが、ハンガーから購入できるようになります」,
+#: sold for good in later phases; a tie rewards both sides). key -> (SE's
+#: name, ids). The ids are the same in the body (0x11), arms (0x21) and legs
+#: (0x31) master tables, read out of the client's Data\AG\F21\D97.DAT
+#: (2026-10-07). SE's "Tiran/カローク" (phase 01, U.S.N.) names a カローク
+#: we cannot find in the tables by any spelling, so that series is Tiran
+#: alone; the trailing-space "Arpeggio " row 561 is left out.
+SERIES = {
+    "arpeggio-orgel": ("Arpeggio/Orgel", (191, 192, 193, 194)),
+    "tiran": ("Tiran", (176, 177, 178, 179, 180)),
+    "pabotte": ("Pabotte", (186, 187, 188, 189, 190)),
+    "vyzov": ("Vyzov", (286, 287, 288, 289, 290)),
+    "stork-varsa": ("Stork/Varsa", (121, 122, 123, 124, 125)),
+    "igel-grille": ("Igel/Grille", (181, 182, 183, 184)),
+}
+SERIES_KINDS = (0x11, 0x21, 0x31)          #: body, arms, legs: one series
+#: SE's table as run (topics 2006-05-19 and 2006-07-10): phase -> {winner:
+#: series}. Phases 01-02 gave the winner one ENEMY series; from phase 03 the
+#: series was a player vote among three per side (P03 Vyzov for both, P04
+#: O.C.U. Vyzov / U.S.N. Stork/Varsa). The vote is not built: a phase with no
+#: row here (and none in FMO_WAR_REWARDS) keeps the 01-02 rule, taking the
+#: first series of REWARD_ORDER the winner does not hold yet.
+REWARD_TABLE = {1: {OCU: "arpeggio-orgel", USN: "tiran"},
+                2: {OCU: "arpeggio-orgel", USN: "pabotte"}}
+#: The 01-02 rule's queue per winner, SE's own later picks first, then
+#: the phase-00 provisional series (topics060306). Ours, as an order.
+REWARD_ORDER = {OCU: ("arpeggio-orgel", "vyzov", "igel-grille"),
+                USN: ("tiran", "pabotte", "stork-varsa", "vyzov")}
+
+
+def parse_rewards(spec):
+    """FMO_WAR_REWARDS `phase:nation=series,...` (e.g. `3:1=vyzov,3:2=vyzov`)
+    -> {phase: {nation: series}}, laid over REWARD_TABLE; '0' = no reward at
+    all (None). This is the knob a player vote's result goes into."""
+    spec = (spec or "").replace(" ", "")
+    if spec == "0":
+        return None
+    out = {p: dict(row) for p, row in REWARD_TABLE.items()}
+    for tok in spec.split(","):
+        if not tok:
+            continue
+        where, _, series = tok.partition("=")
+        ph, _, nat = where.partition(":")
+        if not ph.isdigit() or nat not in ("1", "2") or series not in SERIES:
+            raise ValueError("FMO_WAR_REWARDS entry %r: want phase:nation=series with "
+                             "nation 1 or 2 and series one of %s" % (tok, sorted(SERIES)))
+        out.setdefault(int(ph), {})[int(nat)] = series
+    return out
+
+
+REWARDS = parse_rewards(os.environ.get("FMO_WAR_REWARDS", ""))
 
 
 #: KEY: THE ECONOMIC CITIES -- SE's phase page (guide/phase.html, audit §A2) lists
@@ -238,6 +300,100 @@ def phase_at(now=None, first=None):
         if now < nxt:
             return n, start, judge, nxt, now >= judge
         y, m, start, n = jy, jm, nxt, n + 1
+
+
+def _parse_date(s):
+    """'YYYY-MM-DD' -> the same string, or ValueError."""
+    datetime.date(*(int(x) for x in str(s).split("-")[:3]))
+    return "-".join("%02d" % int(x) if i else "%04d" % int(x)
+                    for i, x in enumerate(str(s).split("-")[:3]))
+
+
+def reward_for(pn, nation, held, table=None):
+    """The series key nation `nation` wins with phase `pn`, or None. The
+    table's row first (FMO_WAR_REWARDS over REWARD_TABLE); when there is no
+    row, or the nation already holds that series, SE's 01-02 rule: the first
+    series of REWARD_ORDER it does not hold yet. `held` = series keys this
+    nation has won before. Pure."""
+    table = REWARDS if table is None else table
+    if table is None:
+        return None
+    want = (table.get(int(pn)) or {}).get(int(nation))
+    if want and want not in held:
+        return want
+    for key in REWARD_ORDER.get(int(nation), ()):
+        if key not in held:
+            return key
+    return None
+
+
+def rewards_held(phases, nation, upto=None):
+    """Series keys `nation` has been awarded by the judged `phases` (only
+    phases before `upto` when given)."""
+    out = []
+    for k, rec in sorted((phases or {}).items(), key=lambda kv: int(kv[0])):
+        if upto is not None and int(k) >= int(upto):
+            continue
+        r = ((rec or {}).get("reward") or {}).get(str(int(nation)))
+        if isinstance(r, dict) and r.get("series"):
+            out.append(r["series"])
+    return out
+
+
+def reward_unlocked(phases, now=None):
+    """{nation: {kind: set(ids)}} of every victory series ON SALE at `now`:
+    awarded by a judged phase whose `reward_from` (the next phase's start,
+    SE: 「フェイズ02開始以降、ハンガーのショップから」) has passed. Phase
+    records without a "reward" (judged before rewards were recorded) give
+    nothing here. Pure."""
+    now = _now() if now is None else float(now)
+    out = {}
+    for rec in (phases or {}).values():
+        if not isinstance(rec, dict) or now < float(rec.get("reward_from") or 0):
+            continue
+        for nat, r in (rec.get("reward") or {}).items():
+            if not isinstance(r, dict):
+                continue
+            for kind in r.get("kinds") or SERIES_KINDS:
+                out.setdefault(int(nat), {}).setdefault(int(kind), set()).update(
+                    int(i) for i in r.get("parts") or ())
+    return out
+
+
+def reward_candidates(nation):
+    """{kind: set(ids)} every series the reward rules could ever give
+    `nation`: what its shop must NOT sell before it is won."""
+    keys = set(REWARD_ORDER.get(int(nation), ()))
+    for row in (REWARDS or {}).values():
+        if row.get(int(nation)):
+            keys.add(row[int(nation)])
+    ids = set()
+    for k in keys:
+        ids.update(SERIES[k][1])
+    return {kind: set(ids) for kind in SERIES_KINDS}
+
+
+def reward_stock(stock, nation, phases, now=None):
+    """The 0x016A stock {kind: frozenset(ids)} with the recorded victory
+    series applied for a pilot of `nation`: every series it has ON SALE
+    added, every other series the rules could give it removed (SE: the
+    enemy series 「それまで購入できなかった」). `nation` None (no pilot to ask)
+    adds every nation's series and removes nothing. None when empty. Pure."""
+    out = {k: set(v) for k, v in (stock or {}).items()}
+    on_sale = reward_unlocked(phases, now)
+    if nation in NATIONS:
+        mine = on_sale.get(int(nation), {})
+        for kind, ids in reward_candidates(nation).items():
+            if kind in out:
+                out[kind] -= ids - mine.get(kind, set())
+        adds = [mine]
+    else:
+        adds = list(on_sale.values())
+    for got in adds:
+        for kind, ids in got.items():
+            out.setdefault(kind, set()).update(ids)
+    out = {k: frozenset(v) for k, v in out.items() if v}
+    return out or None
 
 
 def parse_binding(spec):
@@ -382,7 +538,53 @@ class War:
             self.present, self.updated_at = True, at
         if isinstance(d, dict):
             self.data.update(d)
+        if self.autosave and RESTART and self.data.get("restarted_to") != RESTART:
+            self.restart(RESTART)
+        self.adopt_phase1()
         return self
+
+    # ---- the phase clock this war runs on --------------------------------
+    def phase1(self):
+        """Phase 1's start date for THIS war: the stored one (set by the
+        first writer, or by a restart), else FMO_WAR_PHASE1."""
+        return str(self.data.get("phase1") or PHASE1_START)
+
+    def adopt_phase1(self):
+        """Make the stored start the process's clock, so phase_at() callers
+        without a War (defection, the board) agree with the judged phases.
+        A state with no start yet takes FMO_WAR_PHASE1 (saved with the next
+        write). A knob that disagrees with a stored start is NOT a restart:
+        the stored start wins, and FMO_WAR_RESTART is the way to move it."""
+        global PHASE1_START
+        self.data.setdefault("phase1", PHASE1_START)
+        PHASE1_START = self.phase1()
+        return PHASE1_START
+
+    def phase_at(self, now=None):
+        return phase_at(now, self.phase1())
+
+    def restart(self, date, now=None):
+        """Start the war again with phase 1 on `date` (YYYY-MM-DD, UTC). The
+        judged phases, resets and start move to data["wars"] (kept, never
+        read by the rules); every sector is dropped so the opening map is
+        seeded again (seed_from_sectors, which warstate.war_state runs right
+        after loading); the restart moment fails running area missions the
+        way a phase reset does (frontline_reset_at). Returns the archive."""
+        date = _parse_date(date)
+        now = int(_now() if now is None else now)
+        old = {"phase1": self.data.get("phase1"), "phases": self.data.get("phases") or {},
+               "resets": self.data.get("resets") or {},
+               "sectors": len(self.data.get("sectors") or {}), "ended_at": now}
+        self.data.setdefault("wars", []).append(old)
+        self.data["sectors"], self.data["phases"], self.data["resets"] = {}, {}, {}
+        self.data["phase1"], self.data["restarted_to"] = date, date
+        self.data["restarted_at"] = now
+        self.data.setdefault("log", []).append(
+            "%d: war restarted, phase 1 from %s (was %s, %d judged phase(s) archived)"
+            % (now, date, old["phase1"], len(old["phases"])))
+        self.adopt_phase1()
+        self.save()
+        return old
 
     def save(self):
         if not self.autosave:
@@ -418,7 +620,7 @@ class War:
         n = int(nation)
         if n not in NATIONS:
             return s, "no change (no nation)"
-        _, _, _, _, ceasefire = phase_at(now)
+        _, _, _, _, ceasefire = self.phase_at(now)
         if won:
             s["wins"][str(n)] = s["wins"].get(str(n), 0) + 1
             mover, weight = n, (2 if pvp else 1)
@@ -526,34 +728,43 @@ class War:
         return {t for t in out
                 if (self.data["sectors"].get(str(t)) or {}).get("seeded", "kind 5") == "kind 5"}
 
-    def reset_frontline(self, pn, at):
+    def reset_frontline(self, pn, at, frontline=True):
         """SE: the frontline goes back to its opening state when phase `pn`
-        starts; the previous phase's loser's fortress starts Deadlock. Returns
-        the record kept under data["resets"][pn]."""
+        starts, and the previous phase's loser's fortress starts Deadlock
+        (「次のフェイズの開始時に」). `frontline` False (FMO_WAR_PHASE_RESET=0)
+        applies the penalty alone. Returns the record kept under
+        data["resets"][pn]."""
         prev = self.data["phases"].get(str(pn - 1)) or {}
         pen = prev.get("penalty") or {}
         n = 0
-        for tile in sorted(self.frontline_tiles()):
+        tiles = self.frontline_tiles() if frontline else set()
+        if pen:
+            tiles.add(int(pen.get("tile") or 0))
+        for tile in sorted(tiles):
             if str(tile) not in self.data["sectors"] and tile not in FORTRESS.values():
                 continue                         # never touched: already its opening
             s = self.sector(tile)
             nation, control = self.opening(tile, 5)
             if pen and int(pen.get("tile") or 0) == tile:
                 nation, control = 0, 0           # the loser's fortress: Deadlock
+            elif not frontline:
+                continue
             s["nation"], s["control"] = nation, control
             s["deadlock"] = nation == 0
             s["counter"] = {"1": 0, "2": 0}
             s["reset"] = int(pn)
             s["updated"] = int(at)
             n += 1
-        return {"at": int(at), "sectors": n, "penalty": pen or None}
+        return {"at": int(at), "sectors": n, "penalty": pen or None,
+                "frontline": bool(frontline)}
 
     def frontline_reset_at(self):
         """When the frontline was last reset (the start of that phase, epoch
         s), or 0. SE (news7740): area missions running at the reset fail, so
         an area accept older than this is failed; the mission book reads it."""
-        return max([int(r.get("at") or 0) for r in (self.data.get("resets") or {}).values()]
-                   or [0])
+        return max([int(r.get("at") or 0) for r in (self.data.get("resets") or {}).values()
+                    if r.get("frontline", True)]
+                   + [int(self.data.get("restarted_at") or 0)])
 
     # ---- the phase --------------------------------------------------------
     def score(self):
@@ -565,47 +776,63 @@ class War:
                 pts[s["nation"]] += p
         return pts
 
+    def judge(self, pn, now, start_next):
+        """The record for phase `pn`, judged on the map as it stands. SE
+        (guide/phase): the side holding more economic-city ranks wins; a tie
+        rewards both and penalises nobody; the loser's Freedom City fortress
+        is named for the Deadlock penalty, applied when the next phase starts
+        (reset_frontline). Each winner (both on a tie) is awarded one series
+        (reward_for), on sale from the next phase's start."""
+        pts = self.score()
+        if pts[OCU] > pts[USN]:
+            winners, loser = (OCU,), USN
+        elif pts[USN] > pts[OCU]:
+            winners, loser = (USN,), OCU
+        else:
+            winners, loser = (OCU, USN), 0
+        rec = {"ocu": pts[OCU], "usn": pts[USN],
+               "winner": winners[0] if len(winners) == 1 else 0,
+               "judged_at": int(now), "war": self.phase1(), "penalty": None,
+               "reward": {}, "reward_from": int(start_next)}
+        if loser in FORTRESS:
+            rec["penalty"] = {"nation": loser, "tile": FORTRESS[loser]}
+        for nat in winners:
+            key = reward_for(pn, nat, rewards_held(self.data["phases"], nat, upto=pn))
+            if key:
+                rec["reward"][str(nat)] = {"series": key, "name": SERIES[key][0],
+                                           "parts": list(SERIES[key][1]),
+                                           "kinds": list(SERIES_KINDS)}
+        return rec
+
     def tick(self, now=None):
         """Judge every phase whose judgement time has passed and is not yet
-        on file. SE (phase page): the side with more economic-city points
-        wins; a tie rewards both and penalises nobody; the loser's Freedom
-        City fortress opens the next phase in Deadlock. Returns the phases
-        judged now, oldest first."""
+        on file (once: a phase on file is never judged again), then start
+        the current phase if that has not run: the frontline reset and the
+        loser's fortress Deadlock. Returns the phases judged now, oldest
+        first; self.resets_now holds the phase start run now."""
         now = _now() if now is None else float(now)
         judged = []
-        n, start, judge, nxt, cease = phase_at(now)
+        n, start, judge, nxt, cease = self.phase_at(now)
         # phases before the current one, and the current one once judged
         for pn in range(1, n + (1 if cease else 0)):
             key = str(pn)
             if key in self.data["phases"]:
                 continue
-            pts = self.score()
-            if pts[OCU] > pts[USN]:
-                winner, loser = OCU, USN
-            elif pts[USN] > pts[OCU]:
-                winner, loser = USN, OCU
-            else:
-                winner, loser = 0, 0
-            rec = {"ocu": pts[OCU], "usn": pts[USN], "winner": winner,
-                   "judged_at": int(now), "penalty": None}
-            if loser in FORTRESS:
-                f = self.sector(FORTRESS[loser])
-                f["nation"], f["control"], f["deadlock"] = 0, 0, True
-                f["updated"] = int(now)
-                rec["penalty"] = {"nation": loser, "tile": FORTRESS[loser]}
+            rec = self.judge(pn, now, self._start_of(pn + 1))
             self.data["phases"][key] = rec
             judged.append((pn, rec))
         # SE: the frontline resets when a NEW phase starts (guide/phase,
         # news7740), after the judgement above has named the loser. Phase 1
         # is the war's opening, never a reset. Phases skipped while the
-        # server was down collapse into one reset at the current phase's
-        # start, and each is recorded so none runs twice.
+        # server was down collapse into one start at the current phase's
+        # start, and each is recorded so none runs twice. The Deadlock
+        # penalty runs here even with FMO_WAR_PHASE_RESET=0.
         self.resets_now = []
-        if PHASE_RESET and n >= 2:
+        if n >= 2:
             done = self.data.setdefault("resets", {})
             todo = [pn for pn in range(2, n + 1) if str(pn) not in done]
             if todo:
-                rec = self.reset_frontline(n, start)
+                rec = self.reset_frontline(n, start, frontline=PHASE_RESET)
                 for pn in todo:
                     done[str(pn)] = rec if pn == n else {"at": int(start), "sectors": 0,
                                                          "superseded_by": n}
@@ -613,6 +840,14 @@ class War:
         if judged or self.resets_now:
             self.save()
         return judged
+
+    def _start_of(self, pn):
+        """Epoch s at which phase `pn` (>= 1) starts on this war's clock."""
+        y, m, d = (int(x) for x in self.phase1().split("-")[:3])
+        t = _ts(y, m, d)
+        for _ in range(int(pn) - 1):
+            t = phase_at(t, self.phase1())[3]
+        return t
 
     # ---- the record ------------------------------------------------------
     def record_fields(self, tile, binding):
@@ -637,7 +872,7 @@ class War:
         for s in self.data["sectors"].values():
             if s["nation"] in held and not s.get("deadlock"):
                 held[s["nation"]] += 1
-        n, start, judge, nxt, cease = phase_at(now)
+        n, start, judge, nxt, cease = self.phase_at(now)
         pts = self.score()
         last = self.data["phases"].get(str(n - 1)) if n > 1 else None
         return ("phase %d%s, %d sector(s) on file, O.C.U. holds %d, U.S.N. %d; "
@@ -743,14 +978,18 @@ def selftest():
     check("score counts held cities' points", w4.score() == {OCU: 7, USN: 4})
     check("nothing is judged inside phase 1", w4.tick(now=mid) == [])
     j = w4.tick(now=_ts(2026, 11, 2))
-    check("at judgement O.C.U. wins 7:4, the U.S.N. fortress (509 sector 66) goes Deadlock",
+    check("at judgement O.C.U. wins 7:4 and the U.S.N. fortress (509 sector 66) is named "
+          "for the penalty, still held through the ceasefire (SE: at the next phase start)",
           len(j) == 1 and j[0][0] == 1 and j[0][1]["winner"] == OCU
           and j[0][1]["penalty"] == {"nation": USN, "tile": FORTRESS[USN]}
-          and w4.sector(FORTRESS[USN])["deadlock"] and w4.sector(FORTRESS[USN])["nation"] == 0)
+          and str(FORTRESS[USN]) not in w4.data["sectors"])
     check("a judgement is recorded once", w4.tick(now=_ts(2026, 11, 3)) == []
           and "1" in w4.data["phases"])
     check("summary carries the score and the last result",
           "7 pts" in w4.summary(now=_ts(2026, 11, 3)) and "went to O.C.U." in w4.summary(now=_ts(2026, 11, 6)))
+    w4.tick(now=_ts(2026, 11, 5, 1))
+    check("phase 2's start puts the U.S.N. fortress in Deadlock",
+          w4.sector(FORTRESS[USN])["deadlock"] and w4.sector(FORTRESS[USN])["nation"] == 0)
     check("the nineteen cities and both fortresses are distinct tiles",
           len(CITIES) == 19 and sum(p for _n, p, _w in CITIES.values()) == 66
           and FORTRESS[OCU] not in CITIES and FORTRESS[USN] not in CITIES)
@@ -858,7 +1097,26 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--show", action="store_true", help="print the stored state's summary")
+    ap.add_argument("--restart", metavar="YYYY-MM-DD",
+                    help="start the war again with phase 1 on this date (UTC): archive the "
+                         "judged phases, reseed the opening map. STOP the fmo service first "
+                         "(it holds the state in memory and would write over this); with it "
+                         "running, set FMO_WAR_RESTART and recreate it instead")
     a = ap.parse_args()
+    if a.restart:
+        w = War(autosave=True)
+        old = w.restart(a.restart)
+        try:
+            import fmosectors
+            seeded = w.seed_from_sectors(fmosectors.SECTORS, force=True)
+        except ImportError:
+            seeded = 0
+        w.data["restarted_to"] = _parse_date(a.restart)
+        ok = w.save()
+        print("%s: phase 1 from %s, %d judged phase(s) archived, %d sector(s) seeded; %s"
+              % ("restarted" if ok else "NOT WRITTEN (database?)", w.phase1(),
+                 len(old["phases"]), seeded, w.summary()))
+        sys.exit(0 if ok else 1)
     if a.show:
         print(War().summary())
         sys.exit(0)

@@ -3226,6 +3226,174 @@ def _btlreview_token_pins():
     return ok
 
 
+def _war_phase_pins():
+    """A WHOLE PHASE OFFLINE (fmowar, 2026-10-07): the real opening map,
+    settles across phase 1, the judgement at 12:00 on the 1st (once), the
+    ceasefire, phase 2's start (frontline reset + the loser's fortress
+    Deadlock), the victory series (owed while the shop sells no parts),
+    the ceasefire bonus, a tie, and a clean restart on a new date."""
+    import json as _json
+    if fmowar is None or fmosectors is None:
+        print("  war phase: SKIP (fmowar/fmosectors not importable)")
+        return True
+    fw, ts = fmowar, fmowar._ts
+    OCU, USN = fw.OCU, fw.USN
+    saved = (fw.PHASE1_START, fw.PHASE_RESET, fw.NEUTRAL, fw.FACILITY_CAP, fw.LOSS_WEIGHT,
+             fw.REWARDS, fw.RESTART, fw.read_state, fw.write_state,
+             partsstock.PARTS_STOCK, warstate.war_state, warstate.WAR, fmowar._now)
+    res = {}
+    try:
+        fw.PHASE1_START, fw.PHASE_RESET, fw.NEUTRAL = "2026-09-05", True, True
+        fw.FACILITY_CAP, fw.LOSS_WEIGHT, fw.REWARDS = 60, 1, fw.parse_rewards("")
+        w = fw.War(autosave=False, load=False)
+        w.data = {"sectors": {}, "phases": {}, "log": [], "phase1": "2026-09-05"}
+        w.seed_from_sectors(fmosectors.SECTORS, force=True)
+        ctl = next(int(t) for sel, rows in fmosectors.SECTORS.items()
+                   if int(sel) // 100 == 1 for t in rows)
+        mid = ts(2026, 10, 1)
+
+        def take(tile, nat, when=mid):
+            for _ in range(fw.COUNTER_CAP):
+                w.settle(tile, nat, won=True, now=when)
+        # phase 1: O.C.U. takes Maltaf + Rousseau (8), U.S.N. Peseta (4)
+        _, what0 = w.settle(85102, OCU, won=True, now=ts(2026, 9, 4))
+        take(85102, OCU), take(87101, OCU), take(112101, USN)
+        res["phase0 blocks"] = "ceasefire" in what0
+        res["score 8:4"] = w.score() == {OCU: 8, USN: 4}
+        res["no judge 11:59"] = w.tick(now=ts(2026, 11, 1, 12) - 60) == []
+        j = w.tick(now=ts(2026, 11, 1, 12))
+        rec = j[0][1] if len(j) == 1 else {}
+        res["judged at 12:00"] = (len(j) == 1 and rec["winner"] == OCU
+                                  and (rec["ocu"], rec["usn"]) == (8, 4)
+                                  and rec["penalty"] == {"nation": USN, "tile": fw.FORTRESS[USN]}
+                                  and rec["reward"]["1"]["series"] == "arpeggio-orgel"
+                                  and "2" not in rec["reward"]
+                                  and rec["reward_from"] == ts(2026, 11, 5)
+                                  and rec["war"] == "2026-09-05")
+        res["judged once"] = (w.tick(now=ts(2026, 11, 2)) == []
+                              and w.data["phases"]["1"] is rec)
+        # the ceasefire: nothing moves, the fortress is still held, no sale yet
+        _, what = w.settle(112101, OCU, won=True, now=ts(2026, 11, 3))
+        res["ceasefire blocks"] = ("ceasefire" in what and w.score() == {OCU: 8, USN: 4}
+                                   and w.sector(fw.FORTRESS[USN])["nation"] == USN
+                                   and fw.reward_unlocked(w.data["phases"], ts(2026, 11, 3)) == {})
+        # a reload (the service restarting) judges nothing again
+        w2 = fw.War(autosave=False, load=False)
+        w2.data = _json.loads(_json.dumps(w.data))
+        res["reload judges nothing"] = w2.tick(now=ts(2026, 11, 4)) == []
+        # phase 2 opens: frontline reset, U.S.N. fortress Deadlock, rear untouched
+        w.tick(now=ts(2026, 11, 5, 0) + 30)
+        res["phase 2 start"] = (w.score() == {OCU: 0, USN: 0}
+                                and w.sector(fw.FORTRESS[USN])["deadlock"]
+                                and w.sector(fw.FORTRESS[OCU])["nation"] == OCU
+                                and w.sector(ctl)["nation"] == OCU
+                                and w.sector(ctl)["control"] == 100
+                                and w.frontline_reset_at() == ts(2026, 11, 5)
+                                and len(w.resets_now) == 1)
+        w.tick(now=ts(2026, 11, 6))
+        res["start runs once"] = w.resets_now == []
+        # the reward: on sale for O.C.U. from phase 2's start, never for U.S.N.
+        on = fw.reward_unlocked(w.data["phases"], ts(2026, 11, 5))
+        res["series on sale"] = (set(on) == {OCU} and on[OCU][0x31] == {191, 192, 193, 194})
+        base = {0x11: frozenset(range(100, 300)), 0x13: frozenset({1})}
+        o, u = (fw.reward_stock(base, n, w.data["phases"], ts(2026, 11, 6)) for n in (OCU, USN))
+        res["stock per nation"] = ({191, 194} <= o[0x31] and not ({286, 181} & o[0x11])
+                                   and {191, 194} <= u[0x11] and not ({176, 186} & u[0x11])
+                                   and o[0x13] == base[0x13])
+        warstate.WAR = "1"
+        warstate.war_state = lambda: w
+        p13 = partsstock.parse_parts_stock("0x13")
+        partsstock.PARTS_STOCK = p13
+        st13, why = partsstock.victory_stock(OCU)
+        partsstock.PARTS_STOCK = partsstock.parse_parts_stock("0x11,0x13")
+        fw._now = lambda: ts(2026, 11, 6)           # the shop asks at "now"
+        st11, _ = partsstock.victory_stock(OCU)
+        fw._now = lambda: ts(2026, 11, 4)           # the ceasefire: not yet
+        st11_early, _ = partsstock.victory_stock(OCU)
+        fw._now = saved[-1]
+        res["owed unless parts sell"] = (st13 == p13 and "OWED" in why
+            and 0x31 in st11 and 191 in st11[0x31]
+            and 191 not in (st11_early or {}).get(0x11, ()))
+        # the ceasefire bonus: First Sergeant+, 8:4 = 2:1 past 6:4, scaled
+        b9, b10o = (servicerecord.ceasefire_bonus(r, OCU, rec) for r in (9, 10))
+        b10u = servicerecord.ceasefire_bonus(10, USN, rec)
+        res["ceasefire bonus"] = (b9 is None and b10o and b10u and abs(b10o[0] - 2 * b10u[0]) <= 2
+                                  and abs(servicerecord.ceasefire_share(rec, OCU) - 4 / 3) < 1e-9)
+        # phase 2 ends in a tie: both rewarded, O.C.U. takes its next series
+        take(85102, OCU, ts(2026, 12, 1)), take(112101, USN, ts(2026, 12, 1))
+        j2 = w.tick(now=ts(2027, 1, 1, 12))
+        r2 = j2[0][1] if j2 else {}
+        res["tie"] = (r2.get("winner") == 0 and r2.get("penalty") is None
+                      and r2["reward"]["1"]["series"] == "vyzov"
+                      and r2["reward"]["2"]["series"] == "pabotte")
+        w.tick(now=ts(2027, 1, 5, 1))
+        res["tie: both fortresses held"] = (w.sector(fw.FORTRESS[OCU])["nation"] == OCU
+                                            and w.sector(fw.FORTRESS[USN])["nation"] == USN)
+        # a missed judgement (server down 10-30 .. 11-06) judges on the map
+        # it left, then resets
+        w3 = fw.War(autosave=False, load=False)
+        w3.data = {"sectors": {}, "phases": {}, "log": [], "phase1": "2026-09-05"}
+        w3.seed_from_sectors(fmosectors.SECTORS, force=True)
+        for _ in range(fw.COUNTER_CAP):
+            w3.settle(112101, USN, won=True, now=mid)
+        j3 = w3.tick(now=ts(2026, 11, 6))
+        res["late tick"] = (len(j3) == 1 and j3[0][1]["winner"] == USN
+                            and w3.sector(fw.FORTRESS[OCU])["deadlock"]
+                            and w3.sector(112101)["deadlock"])
+        # the ceasefire paid list follows the war it was paid under
+        ch = {"ceasefire_paid": [1, 2], "ceasefire_war": "2026-09-05"}
+        res["paid list keeps"] = servicerecord.ceasefire_owed(ch, w.data["phases"]) == []
+        # RESTART on a chosen date, through the knob, as the service loads
+        doc = _json.loads(_json.dumps(w.data))
+        wrote = []
+        fw.read_state = lambda: (_json.loads(_json.dumps(doc)), 1.0)
+        fw.write_state = lambda data, now=None: wrote.append(_json.loads(_json.dumps(data))) or True
+        fw.RESTART = "2027-03-05"
+        wr = fw.War()
+        wr.seed_from_sectors(fmosectors.SECTORS, force=True)
+        doc = wrote[-1]
+        again = fw.War()
+        res["restart"] = (wr.phase1() == "2027-03-05" == fw.PHASE1_START
+                          and wr.data["phases"] == {} and len(wr.data["wars"]) == 1
+                          and wr.data["wars"][0]["phases"].keys() == {"1", "2"}
+                          and wr.sector(85102)["deadlock"]
+                          and wr.sector(ctl)["nation"] == OCU
+                          and wr.phase_at(ts(2027, 3, 4))[0] == 0
+                          and wr.phase_at(ts(2027, 3, 5))[0] == 1
+                          and wr.frontline_reset_at() > 0 and bool(wrote)
+                          and again.data["restarted_to"] == "2027-03-05"
+                          and again.data["phase1"] == "2027-03-05"
+                          and len(again.data["sectors"]) == len(wr.data["sectors"]))
+        fw.RESTART = ""
+        w4 = fw.War()
+        w4.data["phases"]["1"] = dict(rec, war="2027-03-05")
+        res["restart: knob left set runs once"] = len(again.data["wars"]) == 1
+        res["restart: new war pays again"] = (servicerecord.ceasefire_owed(
+            ch, w4.data["phases"]) == [(1, w4.data["phases"]["1"])])
+        # the reward knob
+        bad = False
+        try:
+            fw.parse_rewards("3:3=vyzov")
+        except ValueError:
+            bad = True
+        res["rewards knob"] = (bad and fw.parse_rewards("0") is None
+                               and fw.parse_rewards("3:1=stork-varsa")[3][OCU] == "stork-varsa"
+                               and fw.reward_for(1, OCU, [], None) == "arpeggio-orgel"
+                               and fw.reward_for(1, OCU, [], {}) == "arpeggio-orgel"
+                               and fw.reward_for(9, USN, ["tiran", "pabotte", "stork-varsa",
+                                                          "vyzov"], {}) is None)
+    finally:
+        (fw.PHASE1_START, fw.PHASE_RESET, fw.NEUTRAL, fw.FACILITY_CAP, fw.LOSS_WEIGHT,
+         fw.REWARDS, fw.RESTART, fw.read_state, fw.write_state,
+         partsstock.PARTS_STOCK, warstate.war_state, warstate.WAR, fw._now) = saved
+    bad = [k for k, v in res.items() if not v]
+    print(f"  war phase, offline: settle, judge once at 12:00 on the 1st, ceasefire, "
+          f"next-phase reset + Deadlock, victory series (owed without part sales), "
+          f"ceasefire bonus, tie, late tick, restart: "
+          + ("OK" if not bad else "FAIL " + ", ".join(bad)))
+    return not bad
+
+
 def selftest():
     """Checks that need no client: the checksum against real captured bytes.
 
@@ -13634,11 +13802,243 @@ def _selftest_run(test_db):
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
     ok &= _paint_shop_pins()        # paint shop buy 0x01A4: verdict, debit, owned bit (cosmetics.py)
     ok &= _pvp_room_pins()          # Frontline PvP rooms: waiting, start, judge, war (pvproom.py)
+    ok &= _group_persist_pins()     # battle groups across a restart, p.54 offer, 0x0131/0x0189
     ok &= _btlreview_token_pins()   # field A = character wire id (Battle Review folder)
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
+    ok &= _war_phase_pins()         # a whole war phase offline: judge, reset, reward, restart (fmowar)
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _group_persist_pins():
+    """BATTLE GROUPS ACROSS A RESTART (battlegroups.py, 2026-10-07), no
+    client: G1 GroupIDs never repeat (a disband freed one under the old
+    len+1); G2 the stored document restores members, leader, form numbers,
+    comment and sortie settings, and a restored member is re-attached; G3 an
+    idle, leaderless or colliding group is not restored; G4 SE's lifetime
+    rules (leader leaves = disband, empty = dissolved); G5 no write before
+    the stored groups were read; G6 the fmo_battle_groups round trip; G7 the
+    manual p.54 sortie offer (20 min standby, 5 min after the start); G8
+    0x0131 / 0x0189 are answered with silence. Every global is restored."""
+    import copy
+    import json as _json
+    bg, gc = battlegroups, groupchannel
+    ok = True
+    _bgn = ("BATTLE_GROUPS", "BATTLE_GROUPS_MADE", "GROUP_CREATOR_ACCOUNT", "GROUP_STATE",
+            "GROUP_SEEN", "_SEEN_WRITTEN", "_RESTORED_PEERS", "_NEXT_GID", "_PERSIST",
+            "GROUP_BATTLE", "PLATOON_CTX")
+    _gcn = ("GROUP_MEMBERS", "GROUP_OF", "GROUP_READY", "GROUP_SORTIE", "_joined_at")
+    _sv = ({n: copy.deepcopy(getattr(bg, n)) for n in _bgn},
+           {n: copy.deepcopy(getattr(gc, n)) for n in _gcn},
+           bg.GROUP_PERSIST, gc.GROUP_RULES, gc.GROUP_STANDBY_S, gc.GROUP_LATE_JOIN_S,
+           bg.read_groups_doc)
+
+    def _clear():
+        for n in _bgn:
+            v = getattr(bg, n)
+            if isinstance(v, list):
+                del v[:]
+            else:
+                v.clear()
+        for n in _gcn:
+            getattr(gc, n).clear()
+        bg._NEXT_GID[:] = [1]
+        bg._PERSIST.update({"loaded": True, "tried": None})
+
+    def _make(peer, acct, name, comment="", form=None):
+        gid = bg.next_group_id()
+        bg.BATTLE_GROUPS[peer] = {"leader": name, "comment": comment,
+                                  "total_battles": 3, "f114": "03 02", "at": 100.0}
+        bg.BATTLE_GROUPS_MADE.append((peer, gid, name, 100.0))
+        bg.GROUP_CREATOR_ACCOUNT[gid] = acct
+        bg.register_group(gid, acct, form or {"total": 3, "required": 2, "bonus": 500})
+        gc.group_join(gid, acct)
+        return gid
+
+    def _mk(lead, mem, seen):
+        return {"state": {"leader": lead}, "creator": lead, "members": mem,
+                "seen": seen, "made_at": seen}
+
+    T = 1_900_000_000.0
+    try:
+        bg.GROUP_PERSIST = False          # no database traffic but G5/G6's
+        gc.GROUP_RULES = False
+        _clear()
+        # --- G1 ids never repeat
+        g1 = _make("10.0.0.1:1", "gp:a", "A.One")
+        g2 = _make("10.0.0.2:1", "gp:b", "B.Two")
+        bg.group_disband(g1, "selftest")
+        g3 = _make("10.0.0.3:1", "gp:c", "C.Three")
+        _g1_ok = (g1, g2, g3) == (1, 2, 3)
+        print(f"  groups: GroupIDs never repeat after a disband (the old len+1 "
+              f"handed out 2 twice): {g1},{g2},{g3}: {'OK' if _g1_ok else 'FAIL'}")
+        ok &= _g1_ok
+
+        # --- G2 round trip through the document
+        _clear()
+        g = _make("10.0.0.1:1", "gp:lead", "Lead.Er", comment="vets only")
+        gc.group_join(g, "gp:m1")
+        gc.group_join(g, "gp:m2")
+        gc.GROUP_READY["gp:m1"] = (1, 2)
+        bg.group_change_leader(g, "gp:lead", "gp:m1")       # bonus cleared, m1 leads
+        bg.GROUP_STATE[g]["battles"] = 2
+        bg.GROUP_SEEN[g] = T - 3600
+        doc = bg.groups_document()
+        _clear()
+        _r, _d = bg.adopt_groups(_json.loads(_json.dumps(doc)), now=T)
+        _st = bg.group_state(g) or {}
+        _rows = community.group_board_rows()
+        _g2_ok = (_r == [g] and not _d
+                  and gc.GROUP_MEMBERS.get(g) == ["gp:lead", "gp:m1", "gp:m2"]
+                  and all(gc.GROUP_OF.get(a) == g for a in ("gp:lead", "gp:m1", "gp:m2"))
+                  and bg.group_leader(g) == "gp:m1"
+                  and bg.GROUP_CREATOR_ACCOUNT.get(g) == "gp:m1"
+                  and _st.get("total") == 3 and _st.get("required") == 2
+                  and _st.get("bonus") == 0 and _st.get("battles") == 2
+                  and gc.GROUP_READY.get("gp:m1") == (1, 2)
+                  and bg.BATTLE_GROUPS.get(f"restored:{g}", {}).get("comment") == "vets only"
+                  and len(_rows) == 1 and bg.next_group_id() == g + 1)
+        print(f"  groups: the stored document restores members, leader (after a "
+              f"Change Leader), form numbers, battles, comment, sortie settings "
+              f"and the board row; the next id follows it: "
+              f"{'OK' if _g2_ok else 'FAIL'}")
+        ok &= _g2_ok
+
+        class _S:
+            account = "gp:m2"
+            ip = "198.51.100.7"
+            peer = "198.51.100.7:1"
+        _pkt = gc.group_reattach(_S(), 0)
+        _p = packet.parse(_pkt) if _pkt else None
+        _g2b_ok = (bool(_p) and _p["msg"] == grouplogin.MSG_GROUP_ATTACH
+                   if grouplogin.GROUP_ATTACH and gc.GROUP_REATTACH else _pkt is None)
+        print(f"  groups: a restored member's first keepalive re-attaches it "
+              f"(0x{grouplogin.MSG_GROUP_ATTACH:04X}): {'OK' if _g2b_ok else 'FAIL'}")
+        ok &= _g2b_ok
+
+        # --- G3 what is not restored
+        _clear()
+        gc.GROUP_OF["gp:busy"] = 77
+        gc.GROUP_MEMBERS[77] = ["gp:busy"]
+        bg.GROUP_STATE[77] = {"total": 0, "required": 0, "bonus": 0, "battles": 0,
+                              "leader": "gp:busy"}
+        _doc3 = {"next_gid": 9, "groups": {
+            "4": _mk("gp:x", ["gp:x"], T - 25 * 3600),          # idle 25 h
+            "5": _mk("gp:y", ["gp:z"], T),                       # leader gone
+            "6": _mk("gp:busy", ["gp:busy"], T),                 # all members elsewhere
+            "77": _mk("gp:w", ["gp:w"], T),                      # id stands already
+            "8": _mk("gp:v", ["gp:v", "gp:busy"], T)}}           # kept, minus busy
+        _r3, _d3 = bg.adopt_groups(_doc3, now=T, idle_hours=24)
+        _g3_ok = (_r3 == [8] and sorted(_d3) == [4, 5, 6, 77]
+                  and gc.GROUP_MEMBERS.get(8) == ["gp:v"] and gc.GROUP_OF["gp:busy"] == 77
+                  and bg.next_group_id() == 78)
+        _r3b, _ = bg.adopt_groups({"groups": {"4": _mk("gp:x", ["gp:x"], T - 25 * 3600)}},
+                                  now=T, idle_hours=0)
+        _g3_ok &= _r3b == [4]
+        print(f"  groups: not restored: idle past FMO_GROUP_PERSIST_HOURS, leader no "
+              f"longer a member, no member left, an id already standing; a member "
+              f"already in a group stays there; 0 hours = no expiry: "
+              f"{'OK' if _g3_ok else 'FAIL'}")
+        ok &= _g3_ok
+
+        # --- G4 lifetime rules
+        _clear()
+        ga = _make("10.0.0.1:1", "gp:la", "L.A")
+        gc.group_join(ga, "gp:ma")
+        gb = _make("10.0.0.2:1", "gp:lb", "L.B")
+        gc.group_join(gb, "gp:la")        # a stale leader moves (rules off)
+        _left_ga = ga not in gc.GROUP_MEMBERS and "gp:ma" not in gc.GROUP_OF
+        gc.group_leave("gp:la")
+        gc.group_leave("gp:lb")           # the last one out
+        _g4_ok = (_left_ga and gb not in gc.GROUP_MEMBERS
+                  and not any(x[1] == gb for x in bg.BATTLE_GROUPS_MADE)
+                  and bg.groups_document()["groups"] == {})
+        print(f"  groups: a leader leaving (even by joining elsewhere) disbands its "
+              f"group, and an empty group is dissolved, not stored: "
+              f"{'OK' if _g4_ok else 'FAIL'}")
+        ok &= _g4_ok
+
+        # --- G5 no write before the stored groups were read
+        _clear()
+        bg.GROUP_PERSIST = True
+        bg._PERSIST.update({"loaded": False, "tried": None})
+        _writes = []
+        _wr = bg.write_groups_doc
+        bg.read_groups_doc = lambda: (False, None)
+        bg.write_groups_doc = lambda d, now=None: _writes.append(d) or True
+        try:
+            _s5 = bg.save_groups("selftest")
+            _g5_ok = _s5 is False and _writes == [] and not bg._PERSIST["loaded"]
+            bg._PERSIST["tried"] = None
+            bg.read_groups_doc = lambda: (True, None)
+            _s5b = bg.save_groups("selftest")
+            _g5_ok = _g5_ok and _s5b is True and len(_writes) == 1 and bg._PERSIST["loaded"]
+        finally:
+            bg.write_groups_doc = _wr
+            bg.read_groups_doc = _sv[6]
+            bg.GROUP_PERSIST = False
+        print(f"  groups: nothing is written while the stored groups could not be "
+              f"read (an empty write would erase them): {'OK' if _g5_ok else 'FAIL'}")
+        ok &= _g5_ok
+
+        # --- G6 the table (migration 2006)
+        _doc6 = {"version": 1, "next_gid": 12, "groups": {"11": _mk("gp:t", ["gp:t"], T)}}
+        if bg.write_groups_doc(_doc6):
+            _ok6, _back = bg.read_groups_doc()
+            _g6_ok = _ok6 and _back == _json.loads(_json.dumps(_doc6))
+            print(f"  groups: fmo_battle_groups round trip: {'OK' if _g6_ok else 'FAIL'}")
+            ok &= _g6_ok
+        else:
+            print("  groups: fmo_battle_groups round trip: SKIP (no test database)")
+
+        # --- G7 the sortie offer (manual p.54)
+        _clear()
+        gc.GROUP_STANDBY_S, gc.GROUP_LATE_JOIN_S = 1200, 300
+        gc.GROUP_SORTIE[5] = {"map": 418, "sector": 0, "row": b"", "at": T, "by": "gp:l"}
+
+        def _o(dt, room=None):
+            return gc.group_sortie_open(5, now=T + dt, room=room, look=False)[0]
+        _wait = {"started": None, "verdict": None}
+        _st100 = {"started": T + 100, "verdict": None}
+        _g7_ok = (_o(299) and not _o(301)                      # started at the sortie
+                  and _o(1199, _wait) and _o(1499, _wait) and not _o(1501, _wait)
+                  and _o(399, _st100) and not _o(401, _st100)
+                  and not _o(10, {"started": None, "verdict": 1})
+                  and not gc.group_sortie_open(6, now=T)[0])
+        gc.GROUP_SORTIE[5]["at"] = time.time() - 10
+        _on = gc.reply_0163(5)[gc.S163_ON_SORTIE]
+        gc.GROUP_SORTIE[5]["at"] = time.time() - 1000
+        _off = gc.reply_0163(5)[gc.S163_ON_SORTIE]
+        _g7_ok = _g7_ok and _on == 1 and _off == 0
+        print(f"  groups: a member may follow its group's sortie for 20 min while the "
+              f"battle stands by and 5 min after Battle Start (manual p.54); the "
+              f"0x0163 offer closes after that: {'OK' if _g7_ok else 'FAIL'}")
+        ok &= _g7_ok
+
+        # --- G8 the two client notices
+        s = session.Session("198.51.100.8:1")
+        _n = [s.on_packet(packet.parse(packet.build(m, b, pushes.QUEUE_SEQ)))
+              for m, b in ((0x0131, b""), (0x0189, b"\x01\x00\x00\x00"))]
+        _g8_ok = _n == [[], []] and set(lobapi.CLIENT_NOTICES) == {0x0131, 0x0189}
+        print(f"  lobby: 0x0131 and 0x0189 (client notices on the queue sequence) "
+              f"are named and answered with silence: {'OK' if _g8_ok else 'FAIL'}")
+        ok &= _g8_ok
+    finally:
+        for n, v in _sv[0].items():
+            cur = getattr(bg, n)
+            if isinstance(cur, list):
+                cur[:] = v
+            else:
+                cur.clear()
+                cur.update(v)
+        for n, v in _sv[1].items():
+            cur = getattr(gc, n)
+            cur.clear()
+            cur.update(v)
+        (bg.GROUP_PERSIST, gc.GROUP_RULES, gc.GROUP_STANDBY_S, gc.GROUP_LATE_JOIN_S,
+         bg.read_groups_doc) = _sv[2:]
+    return ok
 
 
 # Called at run time only; imported last so that import cycles resolve.

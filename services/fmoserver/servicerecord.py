@@ -187,6 +187,16 @@ def ceasefire_owed(char, phases):
     already judged (returns []), so the bonus starts with the NEXT phase."""
     judged = sorted((int(k), v) for k, v in (phases or {}).items())
     paid = char.get("ceasefire_paid")
+    # Phase numbers start again when the war is restarted (fmowar
+    # FMO_WAR_RESTART): each judged record names its war (phase 1's start),
+    # and a list paid under another war is for other phases 1, 2, ... A
+    # pilot who had a list then is owed every phase of the new war.
+    wars = {str(v.get("war")) for _n, v in judged if isinstance(v, dict) and v.get("war")}
+    war = max(wars) if wars else None
+    if war is not None:
+        if isinstance(paid, list) and char.get("ceasefire_war") not in (None, war):
+            paid = char["ceasefire_paid"] = []
+        char["ceasefire_war"] = war
     if not isinstance(paid, list):
         char["ceasefire_paid"] = [n for n, _r in judged]
         return []
