@@ -641,7 +641,8 @@ class Session(
             # The payload IS field A of our own 0x0322 coming back.
             tok = struct.unpack_from("<I", p["payload"], 0)[0] \
                 if len(p["payload"]) >= 4 else 0
-            named = charstore.account_for_token(tok) if tok else None
+            named = charstore.account_for_token(tok, ip=self.ip, consume=True)                 if tok else None
+            self.field_a = tok
             if named:
                 self._account = named
                 log(f"{self.peer}   token 0x{tok:08X} names account {named} "
@@ -664,6 +665,16 @@ class Session(
                 self.play_mark = time.monotonic()
             log(f"{self.peer}   START GAME: selected list id {sel} "
                 f"(payload {p['payload'][:8].hex()}); play-time clock armed")
+            _fa = getattr(self, "field_a", 0)
+            if sel and _fa:
+                log(f"{self.peer}   Battle Review: recorder/viewer folder "
+                    f"/btlreview/{_fa:x}/ (field A), Start Game check "
+                    f"/btlreview/{sel:x}/ (selected id) -- "
+                    + ("MATCH, a recorded review survives the relog" if _fa == sel
+                       else "MISMATCH, this session's review will not be "
+                            "offered after a relog"))
+            if sel:
+                charstore.note_played(self.account, charlist.from_wire(sel))
             if status.SERVE_START_STATUS:
                 # PLAN 1.5: the PLAYED character (Start Game just set
                 # self.playing), so a per-character stored economy reaches
@@ -1713,15 +1724,22 @@ class Session(
             payload[addressing.EP1_OFF:addressing.EP1_OFF + addressing.ENDPOINT_LEN] = ep
             payload[addressing.EP2_OFF:addressing.EP2_OFF + addressing.ENDPOINT_LEN] = ep
             if charstore.SESSION_TOKEN:
-                tok = charstore.mint_token(acct)
+                tok = charstore.mint_token(acct, ip=self.ip)
                 struct.pack_into("<I", payload, handshake.FIELD_A_OFF, tok)
-                log(f"{self.peer}   field A = session token 0x{tok:08X}. The "
-                    f"client copies it to ctx+0x7664 and sends it straight "
-                    f"back as the 0x015B payload, which correlates the GAME "
-                    f"connection to this login WITHOUT the address heuristic. "
-                    f"Its only other readers are kycli_btlreview.cpp's three "
-                    f"path builders, and 0x0130's Start Game path uses "
-                    f"lobby+0x1DC, not this. FMO_SESSION_TOKEN=0 sends 0.")
+                _kind = ("the predicted CHARACTER's wire id"
+                         if tok < 0x10000 else
+                         "a per-login counter value" + (
+                             " (the character's id is held by another login "
+                             "right now; this session's Battle Review will "
+                             "not survive a relog)" if charstore.STABLE_TOKEN
+                             else " (FMO_SESSION_TOKEN=counter)"))
+                log(f"{self.peer}   field A = session token 0x{tok:08X}, "
+                    f"{_kind}. The client sends it straight back as the "
+                    f"0x015B payload (correlates the GAME connection to this "
+                    f"login without the address heuristic) and records the "
+                    f"Battle Review to /btlreview/{tok:x}/, which the Start "
+                    f"Game check finds only if it equals the selected id. "
+                    f"FMO_SESSION_TOKEN=0 sends 0.")
             log(f"{self.peer}   -> cred-reply 0x0322: REDIRECT to "
                 f"{next_host}:{addressing.NEXT_PORT} in both endpoints"
                 f"{'' if next_host == addressing.NEXT_HOST else ' (per-client: FMO_NEXT_HOST is ' + addressing.NEXT_HOST + ')'}; key tail "

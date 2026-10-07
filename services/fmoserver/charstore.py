@@ -181,35 +181,126 @@ def name_refusal(first, last, taken):
 # file that is not there is already the normal case here -- we serve none. So a
 # token changes a filename in a module that runs only on a battle-review screen,
 # and changes it from one missing file to another.
-SESSION_TOKEN = os.environ.get("FMO_SESSION_TOKEN", "1") != "0"
+#
+# KEY: THE TOKEN IS THE CHARACTER'S OWN WIRE ID (2026-10-07). The 08-20 note
+# above missed what the Start Game path does with that file. Static reading of
+# the 2004 PC DLL (dump FrontMissionOnline.dll.mem_61000000.bin):
+#
+#   0x611610E0  the RECORDER writes /btlreview/<field A>/brdata000.dat and sets
+#               lobby+0x78 = 1 once the header is down (0x611613B3)
+#   0x61160BE0  the VIEWER (called from 0x61162033) reads /btlreview/<field A>/
+#   0x6117B279  Start Game's success arm sets lobby+0x78 from whether
+#               /btlreview/<lobby+0x1DC>/brdata000.dat has a size
+#   0x610FB460  the script predicate the Battle Review NPC asks: lobby+0x78 != 0
+#   0x61161420  resets /btlreview/<field A>/ and clears lobby+0x78; called on
+#               the final "Once deleted it cannot be restored" yes (char select,
+#               0x61044CCB, msg 17:155) and on leaving character creation
+#               (0x610C978C, after 17:126/17:127)
+#
+# lobby+0x1DC is the character id the client picked from OUR roster
+# (0x61173800 stores it, 0x0130 sends it back): charlist.to_wire(store id), so
+# 0x1001 for a first character -- the prod log shows "selected list id 4097"
+# for every pilot. With a per-login counter in field A the recorder and the
+# Start Game check name different folders, so after any relog lobby+0x78 is 0
+# and the review is gone, and after a server restart the counter starts again
+# at 0x5A000001 and one PC appends unrelated battles into one file.
+#
+# So field A = to_wire(the character this login will most likely play): the
+# one this account last started (this process), else its first character,
+# else the id a new first character gets. Then recorder == viewer == Start
+# Game reader for that character, across relogs and restarts.
+#
+# WARNING: FIELD A IS STILL THE 0x015B CORRELATOR, and 0x1001 is everybody's
+# value. Safe because the correlation only has to hold between the 0x0322 and
+# its 0x015B (about one second; 653 of 653 echoes on prod came back from the
+# minting address and never twice): a value already held by ANOTHER account
+# falls back to a unique counter value (that session's review does not
+# persist, exactly as before), an echo is consumed once, and an echo from a
+# different address than the login is refused (address fallback). Two
+# devices on ONE account may share the value; it names the same account.
+#
+# WARNING: field A is fixed at login, BEFORE the character select. A pilot who
+# picks a different character than predicted records into the predicted
+# character's folder for that session (logged at Start Game as a mismatch).
+#
+# FMO_SESSION_TOKEN: 0 = send 0 (the pre-08-20 wire); "counter" = the
+# 08-20..10-07 per-login counter; anything else (the default) = per character.
+_TOKEN_MODE = os.environ.get("FMO_SESSION_TOKEN", "").strip().lower() or "1"
+SESSION_TOKEN = _TOKEN_MODE != "0"
+STABLE_TOKEN = SESSION_TOKEN and _TOKEN_MODE != "counter"
 
+#: {token: (account key, monotonic, ip or None)} -- one entry per login, held
+#: from the 0x0322 until its 0x015B consumes it (or IDENTITY_TTL).
 _token_account = {}
 _next_token = [0x5A000000]
+#: {account key: store id} -- the character this account last started (0x0130)
+#: in this process. Lost on a restart, which falls back to the first character.
+_last_played = {}
 
 
-def mint_token(account_key):
-    """A non-zero field-A value that identifies this login. Zero stays
-    reserved for "no token", which is what we sent before today. `account_key`
-    is the RESOLVED store key (member:<id> when the POL session named one),
-    so the game connection adopts the member binding, not the raw identity."""
+def note_played(account_key, store_id):
+    """Remember the character an account just started, for its next token."""
+    if account_key and store_id:
+        with identity._store_lock:
+            _last_played[account_key] = int(store_id)
+
+
+def character_token(account_key, roster):
+    """The field-A value for this account's most likely character: its wire
+    id, which is also what the client puts in lobby+0x1DC when it is picked."""
+    ids = [int(c["id"]) for c in roster or () if c.get("id")]
     with identity._store_lock:
-        _next_token[0] = (_next_token[0] + 1) & 0x7FFFFFFF or 1
-        tok = _next_token[0]
-        _token_account[tok] = (account_key, time.monotonic())
-        # Cheap expiry: this only ever holds one entry per login.
-        for k, (_, t) in list(_token_account.items()):
-            if time.monotonic() - t > identity.IDENTITY_TTL:
-                del _token_account[k]
+        last = _last_played.get(account_key)
+    sid = last if last in ids else (ids[0] if ids else next_free_id(roster or [], None))
+    return charlist.to_wire(sid)
+
+
+def _expire_tokens(now):
+    for k, v in list(_token_account.items()):
+        if now - v[1] > identity.IDENTITY_TTL:
+            del _token_account[k]
+
+
+def mint_token(account_key, ip=None, roster=None):
+    """A non-zero field-A value for this login. Zero stays reserved for "no
+    token". `account_key` is the RESOLVED store key (member:<id> when the POL
+    session named one), so the game connection adopts the member binding.
+    Per character when STABLE_TOKEN and no other account holds that value;
+    otherwise a counter value no live login holds."""
+    want = None
+    if STABLE_TOKEN:
+        if roster is None:
+            roster = load_roster(account_key)
+        want = character_token(account_key, roster)
+    with identity._store_lock:
+        now = time.monotonic()
+        _expire_tokens(now)
+        held = _token_account.get(want) if want else None
+        if want and (held is None or held[0] == account_key):
+            tok = want
+        else:
+            while True:
+                _next_token[0] = (_next_token[0] + 1) & 0x7FFFFFFF or 1
+                tok = _next_token[0]
+                if tok not in _token_account and tok >= 0x10000:
+                    break
+        _token_account[tok] = (account_key, now, ip)
     return tok
 
 
-def account_for_token(tok):
-    """The account key a 0x015B's echoed token names, or None."""
+def account_for_token(tok, ip=None, consume=False):
+    """The account key a 0x015B's echoed token names, or None. With `ip`, an
+    echo from another address than the login is refused; `consume` releases
+    the value so the next login (any account) can hold it."""
     with identity._store_lock:
         got = _token_account.get(tok)
-        if got and time.monotonic() - got[1] <= identity.IDENTITY_TTL:
-            return got[0]
-    return None
+        if not got or time.monotonic() - got[1] > identity.IDENTITY_TTL:
+            return None
+        if ip and got[2] and ip != got[2]:
+            return None
+        if consume:
+            del _token_account[tok]
+        return got[0]
 
 
 def _default_store():
@@ -400,4 +491,4 @@ def next_free_id(roster, wanted):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import charselect, identity  # noqa: E402
+from . import charlist, charselect, identity  # noqa: E402

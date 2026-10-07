@@ -2992,6 +2992,64 @@ def _change_room_pins():
     return ok
 
 
+def _btlreview_token_pins():
+    """FIELD A = THE CHARACTER'S WIRE ID (2026-10-07, charstore.mint_token).
+    The client records the Battle Review to /btlreview/<field A>/ but the
+    Start Game check (0x6117B279) looks in /btlreview/<selected id>/, so the
+    review survives a relog only when the two are equal; field A must still
+    name ONE account between the 0x0322 and its 0x015B echo."""
+    from . import charlist as _cl, charstore as _cs
+    saved = (dict(_cs._token_account), list(_cs._next_token),
+             dict(_cs._last_played), _cs.STABLE_TOKEN)
+    one, two = [{"id": 1}], [{"id": 1}, {"id": 2}]
+    w1, w2 = _cl.to_wire(1), _cl.to_wire(2)
+
+    def restart():
+        _cs._token_account.clear()
+        _cs._next_token[:] = [0x5A000000]
+        _cs._last_played.clear()
+    ok = True
+    try:
+        _cs.STABLE_TOKEN = True
+        restart()
+        a = _cs.mint_token("member:A", ip="1.1.1.1", roster=one)
+        ok &= a == w1 and _cs.account_for_token(a, ip="1.1.1.1", consume=True) == "member:A"
+        restart()
+        ok &= _cs.mint_token("member:A", ip="1.1.1.1", roster=one) == a     # survives a restart
+        ok &= _cs.mint_token("member:A", ip="1.1.1.1", roster=one) == a     # second device, same account
+        ok &= _cs.account_for_token(a, ip="1.1.1.1") == "member:A"
+        b = _cs.mint_token("member:B", ip="2.2.2.2", roster=one)            # A still holds 0x1001
+        ok &= b != a and b >= 0x10000 and _cs.account_for_token(b) == "member:B"
+        ok &= _cs.account_for_token(a, ip="2.2.2.2") is None                # echo from the wrong box
+        ok &= _cs.account_for_token(a, ip="1.1.1.1", consume=True) == "member:A"
+        ok &= _cs.account_for_token(a, ip="1.1.1.1") is None                # consumed once
+        ok &= _cs.mint_token("member:B", ip="2.2.2.2", roster=one) == a     # free again -> B's own char
+        restart()
+        ok &= _cs.mint_token("member:C", roster=two) == w1                  # first character
+        _cs._token_account.clear()
+        _cs.note_played("member:C", 2)
+        ok &= _cs.mint_token("member:C", roster=two) == w2 and w1 != w2      # the other character
+        _cs._token_account.clear()
+        ok &= _cs.mint_token("member:D", roster=[]) == w1                   # a new first character
+        _cs._token_account.clear()
+        _cs.note_played("member:E", 9)                                     # deleted since
+        ok &= _cs.mint_token("member:E", roster=two) == w1
+        _cs.STABLE_TOKEN = False                                            # the twin: the old counter
+        restart()
+        ok &= _cs.mint_token("member:A", roster=one) == 0x5A000001 != w1
+    finally:
+        _cs._token_account.clear()
+        _cs._token_account.update(saved[0])
+        _cs._next_token[:] = saved[1]
+        _cs._last_played.clear()
+        _cs._last_played.update(saved[2])
+        _cs.STABLE_TOKEN = saved[3]
+    print(f"  btlreview token: field A = the character's wire id 0x{w1:X} across a "
+          f"restart, per character, one account per value until the 0x015B echo, "
+          f"wrong-address echo refused; counter twin differs: {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def selftest():
     """Checks that need no client: the checksum against real captured bytes.
 
@@ -13398,6 +13456,7 @@ def _selftest_run(test_db):
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
     ok &= _pvp_room_pins()          # Frontline PvP rooms: waiting, start, judge, war (pvproom.py)
+    ok &= _btlreview_token_pins()   # field A = character wire id (Battle Review folder)
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
 
     print("SELFTEST", "PASS" if ok else "FAIL")
