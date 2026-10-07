@@ -2088,6 +2088,22 @@ def _coliseum_match_pins():
     return ok
 
 
+def _coliseum_bar_pins():
+    """Change Room inside the Coliseum zones takes Room to the arena's bar
+    (map 124, the 2006-07-25 eatery); every other zone and kind is unchanged."""
+    from . import move as _mv
+    ok = True
+    if not os.environ.get("FMO_ROOM_MAPS_COLISEUM", "").strip():
+        ok &= _mv.ROOM_MAPS_COLISEUM == {1: 124}
+        ok &= _mv.place_map(600, 1)[0] == 124 and _mv.place_map(607, 1, nation=2)[0] == 124
+        ok &= _mv.place_map(600, 3)[0] == _mv.ROOM_MAPS[3]
+        ok &= _mv.place_map(200, 1)[0] == _mv.ROOM_MAPS[1]
+        ok &= _mv.place_map(608, 1)[0] == _mv.ROOM_MAPS[1]
+    print(f"  coliseum bar: Room in zones 600..607 is map 124, other zones/kinds unchanged: "
+          f"{'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def _battle_end_title_pins():
     """THE BATTLE-END TITLE AND THE EXP GAIN WINDOW (2026-10-07, static). The
     client has ONE end banner per verdict, picked only by the 0x014C won test
@@ -12940,6 +12956,7 @@ def _selftest_run(test_db):
     ok &= _coliseum_match_pins()    # arena matches: pairing, judging, streak, bracket
     ok &= _coliseum_spectate_pins()  # Coliseum spectators: 0x01C0/0x01C1, receive-only
     ok &= _battle_end_title_pins()  # 0x014C end banner + EXP Gain window flags
+    ok &= _coliseum_bar_pins()      # Coliseum Room -> the arena bar (map 124)
     ok &= _battle_spawn_pins()      # per-map battle spawn points (battlepop.BATTLE_SPAWNS)
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP

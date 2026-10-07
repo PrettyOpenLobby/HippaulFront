@@ -403,6 +403,19 @@ def parse_room_maps(spec):
 
 
 ROOM_MAPS, ROOM_MAPS_USN = parse_room_maps_nation(os.environ.get("FMO_ROOM_MAPS", ""))
+#: KEY: THE COLISEUM'S ROOM IS THE BAR (2026-10-07). Map 124 (a bar: counter,
+#: 11 stools, bottle shelves) first ships in SE's 2006-07-25 patch, the August
+#: 2006 Coliseum version-up, and SE's Phase 02 report has a player saying an
+#: eatery is opening at the arena (topics060815). No client data binds 124 to
+#: a zone or room kind, so SE's server chose it: here, Change Room inside the
+#: Coliseum zones (600..607) takes the room kinds below to the bar instead of
+#: FMO_ROOM_MAPS. Where exactly SE put it is a GUESS. '' / '0' = off.
+COLISEUM_ZONES = (600, 607)
+_ROOM_COL_SPEC = os.environ.get("FMO_ROOM_MAPS_COLISEUM", "").strip()
+ROOM_MAPS_COLISEUM = ({} if _ROOM_COL_SPEC == "0" else
+                      {k: m for k, m in parse_room_maps_nation(_ROOM_COL_SPEC or "1:124")[0].items()
+                       if k in ((1,) if not _ROOM_COL_SPEC else
+                                tuple(int(e.split(":")[0], 0) for e in _ROOM_COL_SPEC.split(",") if e))})
 #: host -> (zone, kind, instance): the place its last 0x0153 put it in.
 WORLD_PLACES = {}
 
@@ -431,6 +444,10 @@ def place_map(zone, kind, default=None, nation=None):
     room kind's map, the U.S.N. one when `nation` is 2."""
     if kind == 0:
         return areachange.zone_mapno(zone, zoneentry.MAPNO if default is None else default, "FMO_MAPNO")
+    if (zone is not None and COLISEUM_ZONES[0] <= int(zone) <= COLISEUM_ZONES[1]
+            and kind in ROOM_MAPS_COLISEUM):
+        return ROOM_MAPS_COLISEUM[kind], (f"FMO_ROOM_MAPS_COLISEUM[{kind} "
+                                          f"{PLACE_KIND_NAMES[kind]}] (the arena's bar)")
     if nation == 2:
         return ROOM_MAPS_USN[kind], f"FMO_ROOM_MAPS[{kind} {PLACE_KIND_NAMES[kind]}, U.S.N.]"
     return ROOM_MAPS[kind], (f"FMO_ROOM_MAPS[{kind} {PLACE_KIND_NAMES[kind]}"
