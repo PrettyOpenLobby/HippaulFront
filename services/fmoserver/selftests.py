@@ -12579,7 +12579,9 @@ def _selftest_run(test_db):
         # every op we have not earned a reply shape for gets SILENCE, and that
         # only the reproduce switch brings 0x1B back.
         _sv_unk = community.MSN_UNKNOWN
+        _sv_ps = community.PILOT_SEARCH     # 10-07: op 6 is served; pin its OFF path here
         try:
+            community.PILOT_SEARCH = False
             flat_globals()["MSN_ON"] = True
             flat_globals()["MSN_UNKNOWN"] = "silent"
             # WARNING: 0x07 LEFT THIS LIST 2026-09-09 -- it is the Scramble Board's
@@ -12600,6 +12602,7 @@ def _selftest_run(test_db):
                                                         fmomsn.OP6_BODY_LIVE)]
         finally:
             flat_globals()["MSN_UNKNOWN"] = _sv_unk
+            community.PILOT_SEARCH = _sv_ps
         print(f"  community: an op we have NOT decoded gets SILENCE, not the "
               f"0x1B that killed the client on 09-06: "
               f"{'OK' if _quiet else 'FAIL'}")
@@ -14220,6 +14223,8 @@ def _selftest_run(test_db):
     ok &= _shop_acquire_pins()      # item shop buy 0x0168 -> 0x016B: gate at packet+0x28 (shop.py)
     ok &= _part_fit_pins()          # part buy = fit of pending+8: real record, stock, owned (shop.py)
     ok &= _training_events_pins()   # training ranking feed (0x014C +0x110) + service medal
+    ok &= _pilot_search_pins()      # kind 0 = the war map's pilot search (PC op 6 / PS2 op 2)
+    ok &= _personnel_orders_pins()  # Personnel Officer orders + outlook (servicerecord.personnel_visit)
     ok &= _community_ps2_pins()     # PS2 community dialect (op 1 HELLO) + mission nation rules
 
     print("SELFTEST", "PASS" if ok else "FAIL")
@@ -14456,6 +14461,127 @@ def _group_persist_pins():
     return ok
 
 
+def _pilot_search_pins():
+    """KIND 0, THE WAR MAP'S PILOT SEARCH (PC op 6 / PS2 op 2, 2026-10-07), no
+    client. K1 the live 09-06 body (zone 100, nation 1) through the real
+    msn_reply lists the same-nation pilots in zone 100 (and one with no known
+    zone), as 0x14 rows then the 0x15 status, and NEVER an END (0x1B / 0x1E /
+    0x26 load [NULL+0x34C] for kind 0); K2 nobody online -> the 0x15 alone,
+    code 0; K3 the PS2 twin answers 0x0C then 0x0D; K4 a name prefix and the
+    cap ("...over N found" = the 0x15 code); K5 FMO_PILOT_SEARCH=0 is the old
+    silence. Returns ok."""
+    ok = True
+
+    class _S:
+        def __init__(self, ip, cid, first, last, nation):
+            self.ip, self._c, self._n = ip, {"id": cid, "first": first, "last": last}, nation
+
+        def playing_char(self):
+            return self._c
+
+        def grant_nation(self):
+            return self._n, "selftest"
+
+    _pilots = [_S("198.51.100.1", 1, "Abe", "Cox", 1),       # zone 100, ours
+               _S("198.51.100.2", 2, "Bo", "Enemy", 2),      # zone 100, the other side
+               _S("198.51.100.3", 3, "Cy", "Far", 1),        # zone 200
+               _S("198.51.100.4", 4, "Dee", "Lex", 1),       # no zone known
+               _S("198.51.100.5", 5, "abe", "cox", 1)]       # the same name again
+    _zones = {"198.51.100.1": 100, "198.51.100.2": 100, "198.51.100.3": 200,
+              "198.51.100.5": 100}
+    _sv = (trade.live_pilots, dict(rooms.WORLD_ZONES), community.PILOT_SEARCH,
+           community.PILOT_SEARCH_MAX, community.MSN_UNKNOWN, community.MSN_END_OPS,
+           community.MSN_ON, community.MSN_PS2)
+    _ops = lambda r: [o for o, _f in r]
+    _deadly = {fmomsn.OP_END, 0x1E, 0x26}
+
+    def _rows(reply, page_op):
+        out = []
+        for o, f in reply:
+            if o == page_op:
+                b = fmomsn.parse(f)[1]
+                out += [b[8 + i * 0x4C:8 + (i + 1) * 0x4C] for i in range(b[4])]
+        return out
+
+    def _names(recs):
+        return [(r[4:21].split(b"\0")[0], r[0x15:0x26].split(b"\0")[0]) for r in recs]
+
+    def _code(reply):
+        return struct.unpack_from("<I", fmomsn.parse(reply[-1][1])[1], 4)[0]
+
+    try:
+        rooms.WORLD_ZONES.clear()
+        rooms.WORLD_ZONES.update(_zones)
+        trade.live_pilots = lambda now=None: list(_pilots)
+        community.PILOT_SEARCH, community.PILOT_SEARCH_MAX = True, 50
+        community.MSN_UNKNOWN, community.MSN_END_OPS = "silent", frozenset()
+        community.MSN_ON, community.MSN_PS2 = True, True
+        # K1
+        _r1 = community.msn_reply("selftest", 0x06, fmomsn.OP6_BODY_LIVE)
+        _n1 = _rows(_r1, fmomsn.OP_LIST14)
+        _k1 = (_ops(_r1) == [fmomsn.OP_LIST14, fmomsn.OP_STATUS]
+               and _names(_n1) == [(b"Abe", b"Cox"), (b"Dee", b"Lex")]
+               and struct.unpack_from("<I", _n1[0], 0)[0] == charlist.to_wire(1)
+               and struct.unpack_from("<I", _n1[0], 0x38)[0] == 100
+               and struct.unpack_from("<I", _n1[1], 0x38)[0] == 0
+               and _code(_r1) == 0 and not _deadly & set(_ops(_r1)))
+        print(f"  pilot search K1: the live op-6 body -> 0x14 rows Abe.Cox (zone "
+              f"100) + Dee.Lex (no zone), not the enemy / zone-200 / duplicate, "
+              f"then 0x15 code 0, no END: {'OK' if _k1 else 'FAIL'}")
+        ok &= _k1
+        # K2
+        trade.live_pilots = lambda now=None: []
+        _r2 = community.msn_reply("selftest", 0x06, fmomsn.OP6_BODY_LIVE)
+        _k2 = _ops(_r2) == [fmomsn.OP_STATUS] and _code(_r2) == 0
+        print(f"  pilot search K2: nobody online -> the 0x15 status alone (the "
+              f"window draws 90:7 None): {'OK' if _k2 else 'FAIL'}")
+        ok &= _k2
+        trade.live_pilots = lambda now=None: list(_pilots)
+        # K3
+        _b3 = bytearray(112)
+        struct.pack_into("<I", _b3, 4, 0x88)
+        struct.pack_into("<i", _b3, 0x3C, 100)
+        struct.pack_into("<I", _b3, 0x4C, 1)
+        struct.pack_into("<i", _b3, 0x5C, 100)
+        _r3 = community.msn_reply("selftest-ps2", 0x02, bytes(_b3), dialect="ps2")
+        _k3 = (_ops(_r3) == [fmomsn.PS2_OP_PILOTS, fmomsn.PS2_OP_STATUS]
+               and _names(_rows(_r3, fmomsn.PS2_OP_PILOTS))
+               == [(b"Abe", b"Cox"), (b"Dee", b"Lex")])
+        print(f"  pilot search K3: PS2 op 2 -> 0x0C rows then 0x0D: "
+              f"{'OK' if _k3 else 'FAIL'}")
+        ok &= _k3
+        # K4
+        _b4 = bytearray(fmomsn.OP6_BODY_LIVE)
+        struct.pack_into("<I", _b4, 4, 0x80 | fmomsn.PSF_FIRST)
+        _b4[0x0C:0x0E] = b"de"
+        _r4a = community.msn_reply("selftest", 0x06, bytes(_b4))
+        community.PILOT_SEARCH_MAX = 1
+        _r4b = community.msn_reply("selftest", 0x06, fmomsn.OP6_BODY_LIVE)
+        _k4 = (_names(_rows(_r4a, fmomsn.OP_LIST14)) == [(b"Dee", b"Lex")]
+               and len(_rows(_r4b, fmomsn.OP_LIST14)) == 1 and _code(_r4b) == 1)
+        print(f"  pilot search K4: first-name prefix 'de' -> Dee.Lex only; a cap "
+              f"of 1 -> 1 row and the 0x15 code 1 ('...over 1 found'): "
+              f"{'OK' if _k4 else 'FAIL'}")
+        ok &= _k4
+        # K5
+        community.PILOT_SEARCH = False
+        _k5 = (community.msn_reply("selftest", 0x06, fmomsn.OP6_BODY_LIVE) == []
+               and community.msn_reply("s", 0x02, bytes(_b3), dialect="ps2") == [])
+        print(f"  pilot search K5: FMO_PILOT_SEARCH=0 -> silence on PC op 6 and "
+              f"PS2 op 2: {'OK' if _k5 else 'FAIL'}")
+        ok &= _k5
+    except Exception as _x:
+        print(f"  pilot search pins raised {_x!r}: FAIL")
+        ok = False
+    finally:
+        trade.live_pilots = _sv[0]
+        rooms.WORLD_ZONES.clear()
+        rooms.WORLD_ZONES.update(_sv[1])
+        (community.PILOT_SEARCH, community.PILOT_SEARCH_MAX, community.MSN_UNKNOWN,
+         community.MSN_END_OPS, community.MSN_ON, community.MSN_PS2) = _sv[2:]
+    return ok
+
+
 def _community_ps2_pins():
     """THE PS2 COMMUNITY DIALECT + THE MISSION NATION RULES (2026-10-07), no
     client. P1 the first op fixes the dialect: a real PS2 HELLO (op 1) gets the
@@ -14530,8 +14656,13 @@ def _community_ps2_pins():
                and _sid in (None, 903_069_118)
                and _ops(community.msn_reply("s", 0x06, bytes(20), dialect="ps2")) == [0x13]
                and _ops(community.msn_reply("s", 0x1A, bytes(20), dialect="ps2")) == [0x1B]
-               and _ops(community.msn_reply("s", 0x1C, bytes(20), dialect="ps2")) == [0x1E]
-               and community.msn_reply("s", 0x02, bytes(112), dialect="ps2") == [])
+               and _ops(community.msn_reply("s", 0x1C, bytes(20), dialect="ps2")) == [0x1E])
+        _sv_ps = community.PILOT_SEARCH     # 10-07: kind 0 is served; pin its OFF path
+        community.PILOT_SEARCH = False
+        try:
+            _p3 = _p3 and community.msn_reply("s", 0x02, bytes(112), dialect="ps2") == []
+        finally:
+            community.PILOT_SEARCH = _sv_ps
         community.MSN_PS2 = False
         _p3 = _p3 and community.msn_reply("s", 0x01, _p2b, dialect="ps2") == []
         print(f"  PS2 community P3: groups 0x0F..0x10, sectors 0x20 (first id "
@@ -14745,3 +14876,146 @@ def _training_events_pins():
           f"{'OK' if _c3 else 'FAIL'}, sortie/end hooks {'OK' if _c4 else 'FAIL'}; "
           f"service medal (142/447, H$10, window) {'OK' if ok else 'FAIL'}")
     return ok
+
+
+def _personnel_orders_pins():
+    """THE PERSONNEL OFFICER'S ORDERS (servicerecord.personnel_visit, static
+    2026-10-07), no client. (1) ranks.orders_pending is 0x61175510 transcribed,
+    and its twin: the old "promote at the desk" reply (+0x0D = the new rank
+    while this login's ordered rank is the old one) leaves the mission desk
+    locked; (2) 0x014A carries the pending order at +0x58E and the held rank at
+    +0x2F; (3) a Captain's review: 3 sector wins -> an ORDER (not shown this
+    session, 36:2), the next login gates the desk, the officer's next 0x0176
+    carries +0x0D = the order (36:12) and the gate clears; (4) 'full' with no
+    wins -> a demotion order (36:23), delivered as First Lieutenant at ~90% of
+    the bar (36:13); 'promote' mode keeps (36:4); a full Major slot passes
+    over (36:14); (5) a contribution step is banked at once but +0x0D stays
+    this session's rank; (6) the outlook below the review band; (7) the same
+    flow through Session.on_packet(0x0175)."""
+    import tempfile as _tf
+    fails = []
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    sr, rk = servicerecord, ranks
+    ok = True
+    # (1) the predicate, transcribed, at floor 0 (today's wire) and 21 (SE's)
+    ok &= _c(1, not rk.orders_pending(20, 0, 20) and rk.orders_pending(21, 0, 20)
+             and rk.orders_pending(19, 0, 20)
+             and not rk.orders_pending(20, 21, 19) and not rk.orders_pending(5, 21, 0)
+             and rk.orders_pending(20, 21, 21) and rk.orders_pending(21, 21, 20)
+             and not rk.orders_pending(22, 21, 22) and rk.orders_pending(22, 21, 21)
+             and rk.RANK_ORDER_FLOOR == 0)
+    _T = 1_800_000_000
+    _iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    _wins = lambda n, cat=2: [{"cat": cat, "status": "complete",
+                               "reported": _iso(_T - (i + 1) * 3600)} for i in range(n)]
+    _save = (sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS, sr.REVIEW_CAPS, sr.CEASEFIRE,
+             sr.OUTLOOK_AUTO, status.STATUS_ACKRANK, charstore.CHAR_STORE)
+    try:
+        sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS = "full", 3, 7
+        sr.REVIEW_CAPS, sr.CEASEFIRE, sr.OUTLOOK_AUTO = {21: 2}, False, True
+        status.STATUS_ACKRANK = None
+        # (2)
+        _oc = {"rank": 20, "rank_order": {"rank": 21, "kind": "promote", "why": "review"}}
+        _ob = status.reply_014a(char=_oc)
+        ok &= _c(2, _ob[status.S14A_RANK] == 20 and _ob[status.S14A_BE1A] == 21
+                 and status.rank_and_ack(_oc) == (20, 21)
+                 and status.rank_and_ack({"rank": 20}) == (20, 20))
+        # (3) promotion by review: issued, then delivered after a relog
+        _cap = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * sr.DAY,
+                "missions": _wins(3), "nation_byte": 1}
+        _v1 = sr.personnel_visit(_cap, 20, 20, now=_T, held=lambda r, n: 0)
+        _a, _cc = status.rank_and_ack(_cap)
+        _locked = rk.orders_pending(_a, 0, _cc)
+        _v2 = sr.personnel_visit(_cap, _a, _cc, now=_T + 60)
+        ok &= _c(3, _v1["verdict"] == "promote" and _v1["send_rank"] == 20
+                 and _v1["outlook"] == sr.OUTLOOK_ORDERS_SOON and _v1["issued"]["rank"] == 21
+                 and (_a, _cc) == (20, 21) and _locked
+                 and _v2["delivered"]["rank"] == 21 and _v2["send_rank"] == 21
+                 and _v2["outlook"] == sr.OUTLOOK_PROMOTED and _cap["rank"] == 21
+                 and "rank_order" not in _cap and _cap["review_at"] == _T + 60
+                 and not rk.orders_pending(_v2["send_rank"], 0, _cc))
+        # (4) demotion ('full'), keep ('promote'), passed over (cap full)
+        _dn = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * sr.DAY}
+        _d1 = sr.personnel_visit(_dn, 20, 20, now=_T)
+        _d1["issued"] = dict(_d1["issued"] or {}, held=_dn["rank"])
+        _d2 = sr.personnel_visit(_dn, 20, 19, now=_T + 60)
+        _kp = {"rank": 20, "review_at": _T - 8 * sr.DAY}
+        _k1 = sr.personnel_visit(_kp, 20, 20, now=_T, mode="promote")
+        _po = {"rank": 20, "review_at": _T - 8 * sr.DAY, "missions": _wins(4)}
+        _p1 = sr.personnel_visit(_po, 20, 20, now=_T, held=lambda r, n: 2)
+        ok &= _c(4, _d1["verdict"] == "demote" and _d1["outlook"] == sr.OUTLOOK_DEMOTION_SOON
+                 and _d1["issued"]["rank"] == 19 and _d1["issued"]["held"] == 20
+                 and _d1["send_rank"] == 20)
+        ok &= _c(4, _d2["delivered"] and _d2["send_rank"] == 19 and _dn["rank"] == 19
+                 and _d2["outlook"] == sr.OUTLOOK_DEMOTED
+                 and _dn["contribution"] == sr.review_demoted_contribution(19)
+                 and "review_at" not in _dn
+                 and _k1["verdict"] == "keep" and _k1["outlook"] == sr.OUTLOOK_NO_MESSAGE
+                 and _kp["rank"] == 20 and "rank_order" not in _kp
+                 and _p1["verdict"] == "keep" and _p1["outlook"] == sr.OUTLOOK_PASSED_OVER)
+        # (5) a contribution step: banked, shown from the next login
+        _ct = {"rank": 5, "contribution": 294400}
+        _c1 = sr.personnel_visit(_ct, 5, 5, now=_T)
+        _c2 = sr.personnel_visit(_ct, 5, 5, now=_T + 60)
+        ok &= _c(5, _c1["send_rank"] == 5 and _ct["rank"] == 20 and "rank_order" not in _ct
+                 and _c1["outlook"] == sr.OUTLOOK_ORDERS_SOON and _c2["send_rank"] == 5
+                 and status.rank_and_ack(_ct) == (20, 20) and _ct["review_at"] == _T)
+        # (6) the outlook below the band and mid-period
+        _lo, _hi = rk.rank_threshold(10) or 0, rk.rank_threshold(11) or 0
+        ok &= _c(6, sr.contribution_outlook(10, _lo - 1) == sr.OUTLOOK_UNRECOGNISED
+                 and sr.contribution_outlook(10, _lo) == sr.OUTLOOK_NO_MESSAGE
+                 and sr.contribution_outlook(10, (_lo + _hi) // 2 + 1) == sr.OUTLOOK_REGARDED
+                 and sr.personnel_visit({"rank": 20, "review_at": _T - sr.DAY,
+                                         "missions": _wins(1)}, 20, 20, now=_T)["outlook"]
+                 == sr.OUTLOOK_REGARDED
+                 and sr.personnel_visit({"rank": 20, "review_at": _T - sr.DAY}, 20, 20,
+                                        now=_T)["outlook"] == sr.OUTLOOK_UNRECOGNISED
+                 and sr.personnel_visit({"rank": 24}, 24, 24, now=_T)["outlook"]
+                 == sr.OUTLOOK_NO_MESSAGE)
+        # (7) through the handler: issue on visit 1, +0x0D unchanged; a new
+        # session (relog) delivers it
+        with _tf.TemporaryDirectory() as _td:
+            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+            _pl = {"id": 1, "first": "Pin", "last": "Orders", "rank": 20,
+                   "contribution": 300000, "review_at": int(time.time()) - 8 * sr.DAY,
+                   "missions": [{"cat": 2, "status": "complete",
+                                 "reported": _iso(int(time.time()) - 3600)}] * 3}
+
+            def _visit(sess):
+                _o = sess.on_packet(packet.parse(packet.build(sr.MSG_0175_REQ, b"", 0x175)))
+                _b = packet.parse(_o[0])["payload"][0x20:]
+                return _b[sr.S176_RANK], _b[sr.S176_OUTLOOK]
+
+            def _sess():
+                _s = session.Session("selftest-orders:1")
+                _s._roster = [_pl]
+                _s.playing_char = lambda: _pl
+                _s.commit = lambda what: None
+                _s.all_rosters = lambda: [("a", [_pl])]
+                return _s
+            _s1 = _sess()
+            _h1 = _visit(_s1)
+            _h1b = _visit(_s1)
+            _gate = status.rank_and_ack(_pl)
+            _h2 = _visit(_sess())
+            ok &= _c(7, _h1 == (20, sr.OUTLOOK_ORDERS_SOON) and _h1b == (20, sr.OUTLOOK_ORDERS_SOON)
+                     and _gate == (20, 21) and _h2 == (21, sr.OUTLOOK_PROMOTED)
+                     and _pl["rank"] == 21 and status.rank_and_ack(_pl) == (21, 21))
+    finally:
+        (sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS, sr.REVIEW_CAPS, sr.CEASEFIRE,
+         sr.OUTLOOK_AUTO, status.STATUS_ACKRANK, _cs) = _save
+        flat_globals()["CHAR_STORE"] = _cs
+    _skip = (None if rk.RANK_LADDER else
+             "SKIP (fmodata/fmo-ranks.tsv missing; build it with tools/fmodata_build.py)")
+    _hard = [n for n in fails if not (_skip and n in (4, 5, 6, 7))]
+    print(f"  personnel orders: the desk gate 0x61175510 (twin: promoting at the desk "
+          f"locks it), the order at 0x014A +0x58E, review promote/demote as ORDERS "
+          f"delivered at the next visit after a relog, keep / passed-over lines, a "
+          f"contribution step shown from the next login, through 0x0175: "
+          f"{'OK' if not fails else ('FAIL at ' + str(fails)) if _hard else _skip}")
+    return not _hard

@@ -65,6 +65,38 @@ def rank_pay(rank):
     return RANK_PAY.get(int(rank) & 0xFF, (0, 0))
 RANK_MAX_EARNABLE = 20                 # Captain: SE's contribution ceiling (above it, period review)
 
+#: KEY: THE ORDERS FLOOR, lobby+0x7E09 (static 2026-10-07). The client's
+#: "orders pending?" predicate 0x61175510 reads three bytes: A = the rank
+#: (lobby+0x8BB), C = the ORDERED rank (lobby+0xE1A, 0x014A +0x58E) and this
+#: one, B. It answers 1 (E316 refuses: "Orders have come down from Army
+#: Command. Please ask the Personnel Officer.") when A >= B and A != C, or
+#: when A < B and C >= B. The same byte caps contribution: 0x0176's arm
+#: (0x61192953) clamps both contribution fields one below the threshold of
+#: ladder row B, and the Personal Ratings screen (0x61191914) and a lobby
+#: widget (0x610CBB37) only draw the contribution gauge for a rank below B.
+#: So B is "the first rank contribution cannot reach", and every rank change
+#: at or above it is an ORDER the Personnel Officer delivers. SE's rule
+#: (contribution stops at Captain, update 050719qk2ld8:58) puts it at 21 =
+#: Major. Its only writer is message 0x019F (block +0x14, squadron.py's
+#: insignia push), which serves ZERO today, so on the wire B = 0 and EVERY
+#: rank change is an order (pending whenever A != C). servicerecord keys its
+#: delivery rule on this value; change both together.
+RANK_ORDER_FLOOR = 0                   # what 0x019F +0x14 carries today (SE: 21)
+
+
+def orders_pending(rank, floor, ordered):
+    """The client's own predicate 0x61175510: True when E316 would refuse
+    with "Please ask the Personnel Officer". rank = lobby+0x8BB, floor =
+    lobby+0x7E09, ordered = lobby+0xE1A. Pure; unsigned bytes like the
+    client's `jb`."""
+    a, b, c = int(rank) & 0xFF, int(floor) & 0xFF, int(ordered) & 0xFF
+    if a >= b:
+        if a != c:
+            return True
+    if c < b:
+        return False
+    return a != c
+
 
 def rank_name(rank):
     for r, name, _t in RANK_LADDER:

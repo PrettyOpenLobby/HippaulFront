@@ -177,7 +177,10 @@ STATUS_CONTRIB = _env_int("FMO_STATUS_CONTRIB", "0")
 #: on to its next gate. (B is served zero and nothing in our server writes it.)
 #:
 #: Default = mirror the rank = "no orders pending", the state a normal returning
-#: pilot is in. Set FMO_STATUS_ACKRANK to a number to force a specific value, or
+#: pilot is in -- UNLESS the pilot has a pending promotion/demotion order
+#: (2026-10-07, servicerecord.personnel_visit): then C is the ORDERED rank,
+#: the desk refuses as SE's did, and the Personnel Officer's 0x0176 +0x0D
+#: applies it (A := C). So C is the ordered rank, not an "acknowledged" one. Set FMO_STATUS_ACKRANK to a number to force a specific value, or
 #: to a value != FMO_RANK to deliberately reproduce the refusal.
 #: WARNING: UNPROVEN LIVE as of the commit that added it -- the oracle is `tag_senior`
 #: getting past "Please ask the Personnel Officer."
@@ -319,6 +322,41 @@ SERVE_START_STATUS = (os.environ.get("FMO_START_STATUS", "").strip() or "0") != 
 START_RANK = _env_int("FMO_RANK", "0")
 
 
+def ack_for(char, rank):
+    """(C, source): the ORDERED rank 0x014A +0x58E carries for a pilot whose
+    rank byte is `rank` -- FMO_STATUS_ACKRANK when forced, else the pending
+    order's rank (servicerecord.rank_order), else `rank` itself (no order:
+    the E316 gate open)."""
+    if STATUS_ACKRANK is not None:
+        return STATUS_ACKRANK, "FMO_STATUS_ACKRANK"
+    _o = servicerecord.rank_order(char)
+    if _o is not None and _o["rank"] != rank:
+        return _o["rank"], (f"PENDING ORDER: {_o.get('kind')} to {_o['rank']} "
+                            f"({_o.get('why')}); the desk sends the pilot to the "
+                            f"Personnel Officer")
+    return rank, "mirrors rank"
+
+
+def rank_and_ack(char):
+    """(A, C): the rank byte and the ordered-rank byte a 0x014A for this
+    pilot carries -- what the client's orders gate starts a session with."""
+    r = rank_and_source(char)[0]
+    return r, ack_for(char, r)[0]
+
+
+def rank_and_source(char, rank=None):
+    """The 0x014A rank byte and its source, as status_fields resolves it."""
+    char = char or {}
+    r, r_src = economy._econ_value("rank", rank, START_RANK, "FMO_RANK", char)
+    _cc = char.get("contribution")
+    if (ranks.RANK_FROM_CONTRIB and rank is None and isinstance(_cc, int)
+            and not isinstance(_cc, bool) and ranks.RANK_LADDER):
+        r = ranks.rank_for_contribution(_cc)
+        r_src = (f"contribution {_cc} -> rank {r} {ranks.rank_name(r)} "
+                 f"(FMO_RANK_FROM_CONTRIB; fmodata/fmo-ranks.tsv)")
+    return int(r or 0) & 0xFF, r_src
+
+
 def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
                   sex=None, nation=None, names=None, active_setup=None,
                   w7604=None, w7608=None, wfd4=None, nation_src=None,
@@ -333,13 +371,7 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
     """
     char = char or {}
     out = []
-    r, r_src = economy._econ_value("rank", rank, START_RANK, "FMO_RANK", char)
-    _cc = char.get("contribution")
-    if (ranks.RANK_FROM_CONTRIB and rank is None and isinstance(_cc, int)
-            and not isinstance(_cc, bool) and ranks.RANK_LADDER):
-        r = ranks.rank_for_contribution(_cc)
-        r_src = (f"contribution {_cc} -> rank {r} {ranks.rank_name(r)} "
-                 f"(FMO_RANK_FROM_CONTRIB; fmodata/fmo-ranks.tsv)")
+    r, r_src = rank_and_source(char, rank)
     if r:
         out.append(("rank", S14A_RANK, bytes([r & 0xFF]),
                     r_src + (f" = {ranks.rank_name(r)}" if ranks.RANK_LADDER and "->" not in r_src else "")))
@@ -347,8 +379,10 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
     # E316 refuses with "Please ask the Personnel Officer" -- see STATUS_ACKRANK.
     # Mirrors rank by default; zero needs no byte (the client already has zero,
     # and rank 0 == ack 0 already satisfies the predicate).
-    _ack = r if STATUS_ACKRANK is None else STATUS_ACKRANK
-    _ack_src = "mirrors rank" if STATUS_ACKRANK is None else "FMO_STATUS_ACKRANK"
+    # 2026-10-07: +0x58E is the ORDERED rank. A pending promotion/demotion
+    # order (servicerecord.personnel_visit) is served here, so the desk sends
+    # the pilot to the Personnel Officer, whose 0x0176 applies it.
+    _ack, _ack_src = ack_for(char, r)
     if _ack:
         out.append(("ack-rank (+0x58E -> lobby+0xE1A, the E316 orders gate)",
                     S14A_BE1A, bytes([_ack & 0xFF]), _ack_src))
@@ -647,5 +681,6 @@ def status_body(fields_list):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    charselect, classes, economy, hangar, inventory, permits, poplook, ranks, zonecontrol,
+    charselect, classes, economy, hangar, inventory, permits, poplook, ranks, servicerecord,
+    zonecontrol,
 )

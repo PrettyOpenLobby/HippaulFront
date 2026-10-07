@@ -342,6 +342,111 @@ def group_board_rows():
     return rows
 
 
+#: FMO_PILOT_SEARCH: answer KIND 0, the war map's PILOT SEARCH (PC op 6, PS2
+#: op 2; fmomsn.OP_PILOT_SEARCH), with the pilots online now. 1 (default) =
+#: op 0x14 / 0x0C pages then the 0x15 / 0x0D status that ends the search;
+#: 0 = the old silence (and FMO_MSN_UNKNOWN applies to op 6 again).
+#: KEY: DEFAULT ON BECAUSE THE KILL IS UNDERSTOOD AND NOT ON THIS PATH. The
+#: 09-06 death was the END arm loading [mgr+0x3BA]+0x34C while kind 0 has no
+#: job (0x611AEAF0 never sets it). The status arm (0x611AF210 + 0x611AED90)
+#: touches [mgr+0x3BA] only behind a NULL test, and nothing here sends 0x1B,
+#: 0x1E or 0x26 for kind 0.
+#: WARNING: NOT YET SEEN ON A SCREEN. If the client dies on the 0x15, set
+#: FMO_PILOT_SEARCH=0 (no deploy) and say so.
+PILOT_SEARCH = (os.environ.get("FMO_PILOT_SEARCH", "").strip() or "1") != "0"
+#: Rows per search; past it the window adds 90:6 "...over %d found". Ours.
+PILOT_SEARCH_MAX = _env_int("FMO_PILOT_SEARCH_MAX", "50")
+
+
+def _pilot_nation(s):
+    try:
+        n = s.grant_nation()[0]
+    except Exception:
+        return None
+    return n if n in (1, 2) else None
+
+
+def pilot_search_rows(q, pilots=None, now=None):
+    """(records, total, note) for one kind-0 query, from the game sessions
+    heard from lately (trade.live_pilots: a keepalive within FMO_TELL_ONLINE_S).
+
+    Filters, each only when the query's flag asks for it:
+      * 0x80 nation: a pilot of the other nation, or of no known nation, is
+        never listed (the window offers Send Tell and invites).
+      * 0x08 zone A[3]..B[3]: a pilot whose last granted zone
+        (rooms.zone_of) is outside is left out; one with NO known zone is kept
+        and counted in the note -- shown rather than silently dropped.
+      * 0x01 / 0x02 names: case-insensitive PREFIX match. GUESSED: SE's
+        matching rule is not in the client.
+    The record's id is the pilot's wire id (charlist.to_wire), the value the
+    client compares with its own lobby+0x1DC; +0x38 is the pilot's zone or 0
+    (0 draws no location). Sorted by name, deduplicated by name, capped at
+    FMO_PILOT_SEARCH_MAX."""
+    if pilots is None:
+        pilots = trade.live_pilots(now)
+    zr = q.zone_range()
+    want_nat = q.nation if (q.flags & fmomsn.PSF_NATION and q.nation in (1, 2)) else None
+    f1 = (q.first or "").strip().lower() if q.flags & fmomsn.PSF_FIRST else ""
+    f2 = (q.last or "").strip().lower() if q.flags & fmomsn.PSF_LAST else ""
+    rows, seen, unzoned = [], set(), 0
+    for s in pilots:
+        try:
+            c = s.playing_char()
+        except Exception:
+            c = None
+        if not c or not (c.get("first") or c.get("last")):
+            continue
+        first, last = (c.get("first") or "").strip(), (c.get("last") or "").strip()
+        key = (first.lower(), last.lower())
+        if key in seen:
+            continue
+        if want_nat is not None and _pilot_nation(s) != want_nat:
+            continue
+        if f1 and not key[0].startswith(f1):
+            continue
+        if f2 and not key[1].startswith(f2):
+            continue
+        zone = rooms.zone_of(getattr(s, "ip", None))[0]
+        if zr is not None:
+            if zone is None:
+                unzoned += 1
+            elif not zr[0] <= zone <= zr[1]:
+                continue
+        seen.add(key)
+        try:
+            pid = charlist.to_wire(int(c.get("id") or 0))
+        except (TypeError, ValueError):
+            pid = 0
+        rows.append(((first.lower(), last.lower()),
+                     fmomsn.pilot_record(pid, first, last, zone or 0)))
+    rows.sort(key=lambda r: r[0])
+    total = len(rows)
+    cap = max(0, PILOT_SEARCH_MAX)
+    note = (f"{total} pilot(s) match"
+            + (f" ({unzoned} with no known zone kept)" if unzoned else "")
+            + (f", {cap} served, the window adds '...over {total - cap} found'"
+               if total > cap else ""))
+    return [r for _k, r in rows[:cap]], total, note
+
+
+def pilot_search_reply(peer, op, body, dialect="pc"):
+    """[(op, frame)] for a kind-0 query: pages, then the status (never END)."""
+    q = fmomsn.PilotSearchQuery(body, dialect=dialect)
+    recs, total, note = pilot_search_rows(q)
+    ps2 = dialect == "ps2"
+    out = fmomsn.pilot_reply(
+        recs, total,
+        page_op=fmomsn.PS2_OP_PILOTS if ps2 else fmomsn.OP_LIST14,
+        status_op=fmomsn.PS2_OP_STATUS if ps2 else fmomsn.OP_STATUS)
+    log(f"{peer}   {'PS2' if ps2 else 'PC'} op 0x{op:02X} = KIND 0, THE PILOT SEARCH "
+        f"(the war map's mode 0, 0x611AF090): {q}. {note}. -> "
+        f"{len(out) - 1} page(s) of 76-B rows (op 0x{(0x0C if ps2 else 0x14):02X}), "
+        f"then op 0x{(0x0D if ps2 else 0x15):02X}, the status that ends the "
+        f"search WITHOUT the END arm that killed a client on 09-06 (kind 0 has "
+        f"no job, END reads [NULL+0x34C]). FMO_PILOT_SEARCH=0 restores the silence.")
+    return out
+
+
 #: FMO_MSN_PS2: answer the 2005 PS2 build's community connection (op 1 HELLO
 #: and its own job ops). 1 (default) = yes; 0 = the old silence for that
 #: dialect only, the PC is untouched either way.
@@ -370,6 +475,8 @@ def msn_reply(peer, op, body, dialect="pc"):
             f"0x12, which makes the client send its queued job: kind 3 -> "
             f"op 9, the mission-list query.")
         return [(fmomsn.OP_GO, fmomsn.build(fmomsn.OP_GO))]
+    if op == fmomsn.OP_PILOT_SEARCH and PILOT_SEARCH:
+        return pilot_search_reply(peer, op, body)
     if op == 0x07 and GROUP_BOARD:
         # KEY: THE SCRAMBLE BOARD'S GROUP LIST (static 2026-09-09). This is the
         # op behind the live report "I make a battle group and the board acts
@@ -462,6 +569,8 @@ def msn_reply(peer, op, body, dialect="pc"):
     # known even though only kind 3's records are decoded. Naming them here is
     # what makes the log readable when a screen we have never served asks.
     _known = {
+        0x06: "kind 0 (0x611AF090 & co., frame in the manager, no job) -- the "
+              "war map's PILOT SEARCH; FMO_PILOT_SEARCH=0 is why it is here",
         0x07: "kind 1 (0x611AF380/0x611AF400, 0xDD B) -- the WAR MAP "
               "(0x6118EAFE/0x6118EB40) and a lobby window",
         0x08: "kind 2 (0x611AF4D0, 0x78 B) -- the WAR STATUS feed for MapKinds "
@@ -478,9 +587,11 @@ def msn_reply(peer, op, body, dialect="pc"):
         + f". body {len(body)}B: {body[:48].hex(' ')}")
     # WARNING: LIVE 2026-09-06T17:45:57Z: ANSWERING AN UNDECODED OP WITH 0x1B KILLED
     # THE CLIENT. Talking to tag_search opens the war map in MODE 0, which
-    # immediately queues a KIND-0 job -> op 6 (116 B). This arm answered 0x1B
-    # (END), whose handler 0x611AFC14 calls the job's callback with a NULL
-    # record -- and ~1 s later pol.exe was gone. Same shape as the 0x018E
+    # immediately starts KIND 0 -> op 6 (116 B). This arm answered 0x1B
+    # (END), whose handler 0x611AFC14 loads [mgr+0x3BA]+0x34C -- and kind 0
+    # has no job there (CORRECTED 2026-10-07: not a NULL record handed to a
+    # callback; a NULL JOB dereferenced before any callback, see
+    # fmomsn.OP_PILOT_SEARCH). Op 6 is now answered above. Same shape as the 0x018E
     # death: an "honest empty answer" is only honest for a consumer that
     # tolerates empty, and this one does not.
     #
@@ -551,6 +662,8 @@ def msn_reply_ps2(peer, op, body):
             f"(the pre-2026-10-07 silence).")
         return []
     kind = fmomsn.PS2_JOB_KIND.get(op)
+    if kind == 0 and PILOT_SEARCH:
+        return pilot_search_reply(peer, op, body, dialect="ps2")
     if op == fmomsn.PS2_OP_HELLO:
         log(f"{peer}   PS2 op 1 = the connection HELLO (0x004D0D9C). Answering "
             f"0x0B, the PS2 GO (arm 0x004D1470 sends the queued job's frame).")
@@ -599,11 +712,13 @@ def msn_reply_ps2(peer, op, body):
         return [(end, fmomsn.build(end))]
     log(f"{peer}   WARNING: PS2 community op 0x{op:02X} "
         + (f"= kind {kind}" if kind is not None else "= not a PS2 job op")
-        + f": NOT ANSWERED. Kind 0 is the war map's mode-0 job, the twin of the "
-        f"PC op 6 whose 0x1B END killed a client. body {body[:48].hex(' ')}")
+        + f": NOT ANSWERED. Kind 0 is the war map's pilot search, the twin of the "
+        f"PC op 6 whose 0x1B END killed a client (FMO_PILOT_SEARCH=0 here). "
+        f"body {body[:48].hex(' ')}")
     return []
 
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import battlegroups, groupchannel, sectorwins, warstate, zoneentry  # noqa: E402
 from . import missionboard, missionbook  # noqa: E402  (orders)
+from . import charlist, rooms, trade  # noqa: E402  (the pilot search)

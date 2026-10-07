@@ -2496,19 +2496,6 @@ class Session(
             # FMO_ANSWER_0175=fail sends message 2 (graceful refusal), 0
             # stays silent (the hang, on purpose).
             _char = (self.playing_char() or {}) if charstore.CHAR_STORE else {}
-            # SE's review above Captain and the phase-end ceasefire bonus are
-            # both the Personnel Officer's (REVIEW / CEASEFIRE); the review
-            # runs first so the reply carries the rank it leaves.
-            try:
-                _rv = self.officer_review(_char) if _char else None
-                _cf = self.pay_ceasefire(_char) if _char else []
-            except Exception as _e:
-                _rv, _cf = None, []
-                log(f"{self.peer}   WARNING: review / ceasefire skipped ({_e!r})")
-            if _rv or _cf:
-                log(f"{self.peer}   PERSONNEL: review {_rv or 'not due'}; "
-                    f"ceasefire bonus {_cf or 'none owed'}")
-            _blk, _sr = servicerecord.service_record_block(_char)
             log(f"{self.peer}   0x0175 = the SERVICE RECORD / promotion request "
                 f"(mission-result machine 0x61192780, empty body). "
                 f"FMO_ANSWER_0175={servicerecord.ANSWER_0175!r}.")
@@ -2519,7 +2506,63 @@ class Session(
                 log(f"{self.peer}   -> message 2: the id != 0x176 arm shows an error "
                     f"box and the machine ends (graceful).")
                 return [packet.build(2, b"", p["seq"], p["conn"])]
-            if _sr["promoted"]:
+            # THE ORDERS (servicerecord.personnel_visit, 2026-10-07): deliver a
+            # pending promotion/demotion order, run SE's review, take a
+            # contribution step, pick the outlook line. +0x0D must keep this
+            # session's orders gate open: the client's ordered rank (lobby+0xE1A)
+            # came from this login's 0x014A and only a relog moves it, so the
+            # A/C pair is remembered per pilot from the first visit on.
+            _rv, _cf, _pv = None, [], None
+            if _char:
+                _pc = getattr(self, "_personnel_client", None)
+                if _pc is None:
+                    _pc = self._personnel_client = {}
+                _pkey = _char.get("id")
+                if _pkey not in _pc:
+                    _pc[_pkey] = list(status.rank_and_ack(_char))
+
+                def _held(r, nat, _me=_char):
+                    n = 0
+                    for _a, _ro in self.all_rosters():
+                        for _c in _ro or ():
+                            if _c is _me or not isinstance(_c, dict):
+                                continue
+                            _o = servicerecord.rank_order(_c)
+                            if ((_o["rank"] if _o else int(_c.get("rank") or 0)) == r
+                                    and zoneentry.nation_for_session(_c, None, "")[0] == nat):
+                                n += 1
+                    return n
+                try:
+                    _pv = servicerecord.personnel_visit(_char, _pc[_pkey][0], _pc[_pkey][1],
+                                                        held=_held)
+                    _pc[_pkey][0] = _pv["send_rank"]
+                    _rv = _pv["verdict"]
+                    for _n in _pv["notes"]:
+                        log(f"{self.peer}   PERSONNEL: {_n}")
+                    if _pv["changed"]:
+                        self.commit("personnel: " + ("; ".join(_pv["notes"]) or "review state"))
+                except Exception as _e:
+                    _pv = None
+                    log(f"{self.peer}   WARNING: personnel orders skipped ({_e!r}); "
+                        f"+0x0D carries the stored rank")
+                try:
+                    _cf = self.pay_ceasefire(_char)
+                except Exception as _e:
+                    _cf = []
+                    log(f"{self.peer}   WARNING: ceasefire skipped ({_e!r})")
+            if _rv or _cf:
+                log(f"{self.peer}   PERSONNEL: review {_rv or 'not due'}; "
+                    f"ceasefire bonus {_cf or 'none owed'}")
+            if _pv is not None:
+                _ol = (_pv["outlook"] if servicerecord.OUTLOOK_AUTO else servicerecord.OUTLOOK)
+                _blk, _sr = servicerecord.service_record_block(
+                    _char, send_rank=_pv["send_rank"], outlook=_ol)
+                log(f"{self.peer}   outlook +0x0F = 36:{_ol} "
+                    f"({servicerecord.OUTLOOK_TEXT.get(_ol, 'say nothing')}"
+                    f"{'' if servicerecord.OUTLOOK_AUTO else ', FMO_OUTLOOK fixed'})")
+            else:
+                _blk, _sr = servicerecord.service_record_block(_char)
+            if _sr["promoted"] and _pv is None:
                 if _char:
                     _char["rank"] = _sr["rank"]
                     try:

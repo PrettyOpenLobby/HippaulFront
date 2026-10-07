@@ -285,11 +285,10 @@ HELLO_CAPTURE = bytes.fromhex(
 #: WARNING: THE OP-6 BODY THAT PRECEDED A CLIENT DEATH, captured live
 #: 2026-09-06T17:45:57Z. Talking to `tag_search` opens the war map in MODE 0,
 #: which immediately queues a KIND-0 job -> op 6. fmo.py answered 0x1B (END)
-#: and pol.exe was gone ~1 s later. Kept as a fixture so the arm that must
-#: NOT answer it can be pinned, and so the body can be decoded offline.
-#: Readable so far: +0x04 = 0x88 (136), +0x08 = 0x14 (20), +0x40 = 100,
-#: +0x50 = 1, +0x60 = 100 -- two counts of 100 and a size, i.e. the same
-#: "cap 100" shape the op-9 list query has.
+#: and pol.exe was gone ~1 s later. DECODED 2026-10-07 (PilotSearchQuery):
+#: the pilot search from 0x611AF090, flags 0x88 = zone + nation, the name
+#: size 0x14, zone 100 in criteria A[3] (+0x40) and B[3] (+0x60), nation 1
+#: at +0x50. Why END killed it: see OP_PILOT_SEARCH.
 OP6_BODY_LIVE = bytes.fromhex(
     "00000000" "88000000" "14000000" "00000000"
     "00000000" "00000000" "00000000" "00000000"
@@ -541,6 +540,131 @@ def record14(fill=b""):
     return bytes(r)
 
 
+# --------------------------------------------------------------------------- #
+# KIND 0 (PC op 6, PS2 op 2) -- THE PILOT SEARCH, static 2026-10-07
+# --------------------------------------------------------------------------- #
+#: KEY: KIND 0 IS NOT A QUEUED JOB, AND THAT IS THE 2026-09-06 KILL. The three
+#: kind-0 builders (0x611AEE90 names, 0x611AEF60 names + criteria, 0x611AF090
+#: one zone, 0x611AF100 criteria + zone) write their frame into the MANAGER
+#: itself (mgr+0x35, total 0x94, op 6 at mgr+0x51), set [mgr+0x37D] = 0 and
+#: start the connection through 0x611AEAF0 -- the copy of the job start
+#: 0x611AEC40 that never touches [mgr+0x3BA]. So while kind 0 runs there is
+#: NO JOB: [mgr+0x3BA] is the NULL 0x611AED90 left behind. The END arm
+#: 0x611AFC14 opens with `mov eax,[esi+0x3BA] / mov ecx,[eax+0x34C]` -- a read
+#: of address 0x34C, an access violation, pol.exe gone. Not a callback that
+#: mishandles a NULL record: no callback is ever reached. 0x1E (same arm) and
+#: 0x26 (0x611AFE33, the same load) kill it the same way.
+#:
+#: WHAT KIND 0 CONSUMES (every link read): op 0x14 pages (0x611AF780: BYTE
+#: count at payload+0x0C, 76-byte records from +0x10, each linked into a
+#: 0x58-byte node on [mgr+0x3AD], [mgr+0x3A1] += count) and then op 0x15
+#: (0x611AF210: [mgr+0x3A5] = payload+0x0C, [mgr+0x3B9] = 1; then 0x611AED90
+#: closes and frees [mgr+0x3BA] behind a NULL test). The war map's search
+#: window polls (0x6109AC30): nothing until [mgr+0x3B9] is set, then one row
+#: per node, "%s.%s" from record+0x04 / record+0x15, systext 90:7 "None" for a
+#: count of 0, and a trailing 90:6 "...over %d found" row when [mgr+0x3A5] > 0.
+#: The window's own strings (90:0..7): Send Tell / Invite to friends / Invite
+#: to squadron / Command / Results / Now Loading. So the "mode 0" screen the
+#: tag_search NPC opens is a PILOT SEARCH, and 0x15 is its terminator.
+#:
+#: THE 76-BYTE RECORD (bound statically; anything not listed is served 0):
+#:   +0x00 u32  the pilot's character id. 0x6109B14A compares it with
+#:              lobby+0x1DC (the asker's own) to pick the one-item menu for
+#:              yourself or the three-item one; Invite to friends (0x610868F0)
+#:              and Invite to squadron (0x611B9F40) carry it.
+#:   +0x04 str  first name (17-byte field, as the character record)
+#:   +0x15 str  last name
+#:   +0x38 u32  % 100000 = the key 0x61083E60 looks up in the zone-name table
+#:              (file 0x144EF, entry u16 +2); the detail panel (0x6109A890)
+#:              prints the name, and draws nothing for a key it lacks.
+#: The PS2 window (0x004428B0) reads the same offsets (node+0x0C / +0x1D,
+#: 0x4C-byte copy) and its op 0x0C arm (0x004D0370) is the same walker.
+OP_PILOT_SEARCH = 0x06
+PILOT_RECORD_LEN = RECORD14_LEN
+P_ID, P_FIRST, P_LAST, P_ZONE = 0x00, 0x04, 0x15, 0x38
+P_NAME_MAX = 0x10          #: 16 characters + the NUL in the 17-byte field
+#: The query's flag bits ([mgr+0x59]), from the builders: 1 = first name,
+#: 2 = last name, 4 = A[0] > 0, 8 = zone (A[3]..B[3]), 0x10 = A[4]/B[4] not
+#: both negative, 0x20 = the criteria form, 0x40 = A[6] > 0, 0x80 = nation
+#: (always set). Live (prod, 15 of 16): 0x88 = zone + nation, A[3] = B[3] = 100.
+PSF_FIRST, PSF_LAST, PSF_ZONE, PSF_NATION = 0x01, 0x02, 0x08, 0x80
+
+
+class PilotSearchQuery(object):
+    """A kind-0 body. PC (116 B): +0x04 flags, +0x08 the name size (0x14),
+    +0x0C first name, +0x20 last name, +0x34 criteria A (8 dwords; A[7] is
+    overwritten by the nation), +0x50 nation, +0x54 criteria B. PS2 (112 B,
+    0x004D0900 / 0x004D0960): flags +0x04, names +0x0C / +0x1D, A +0x30,
+    nation +0x4C, B +0x50. A[3]..B[3] is the zone range when flag 8 is set
+    (0x611AF090 writes the same zone into both)."""
+
+    __slots__ = ("flags", "first", "last", "a", "b", "nation", "dialect")
+
+    def __init__(self, body, dialect="pc"):
+        b = bytes(body).ljust(0x74, b"\0")
+        ps2 = dialect == "ps2"
+        self.dialect = "ps2" if ps2 else "pc"
+        f_last, f_a, f_nat, f_b = ((0x1D, 0x30, 0x4C, 0x50) if ps2
+                                   else (0x20, 0x34, 0x50, 0x54))
+
+        def _s(off, n):
+            return b[off:off + n].split(b"\0", 1)[0].decode("cp932", "replace")
+
+        self.flags = struct.unpack_from("<I", b, 0x04)[0]
+        self.first = _s(0x0C, f_last - 0x0C)
+        self.last = _s(f_last, 0x14 if not ps2 else 0x11)
+        self.a = struct.unpack_from("<8i", b, f_a)
+        self.b = struct.unpack_from("<8i", b, f_b)
+        self.nation = struct.unpack_from("<I", b, f_nat)[0]
+
+    def zone_range(self):
+        """(lo, hi) when the query names a zone (flag 8), else None."""
+        if not self.flags & PSF_ZONE:
+            return None
+        lo, hi = self.a[3], self.b[3]
+        return (min(lo, hi), max(lo, hi))
+
+    def __str__(self):
+        z = self.zone_range()
+        return ("%s flags=0x%02X nation=%d%s%s%s"
+                % (self.dialect.upper(), self.flags, self.nation,
+                   " zone %d..%d" % z if z else "",
+                   " first=%r" % self.first if self.flags & PSF_FIRST else "",
+                   " last=%r" % self.last if self.flags & PSF_LAST else ""))
+
+
+def pilot_record(pid, first="", last="", zone=0):
+    """One 76-byte search result. Names are clipped to 16 bytes so the NUL
+    always lands inside the 17-byte field."""
+    r = bytearray(PILOT_RECORD_LEN)
+    struct.pack_into("<I", r, P_ID, int(pid) & 0xFFFFFFFF)
+    for off, text in ((P_FIRST, first), (P_LAST, last)):
+        s = (text or "").encode("cp932", "replace")[:P_NAME_MAX]
+        r[off:off + len(s)] = s
+    struct.pack_into("<I", r, P_ZONE, int(zone or 0) & 0xFFFFFFFF)
+    return bytes(r)
+
+
+def max_pilots_per_page():
+    """76-byte rows under the 4,096-byte receive buffer (53)."""
+    return (CLIENT_RX - HDR - PAYLOAD_HDR - 8) // PILOT_RECORD_LEN
+
+
+def pilot_reply(records, total=None, page_op=OP_LIST14, status_op=OP_STATUS):
+    """[(op, frame)] for one search: op 0x14 pages (none for no results),
+    then op 0x15 with the "...over %d found" count (0 = nothing more). The
+    PS2 passes its own 0x0C / 0x0D. Never 0x1B: see OP_PILOT_SEARCH."""
+    per = max_pilots_per_page()
+    out = []
+    for i in range(0, len(records), per):
+        chunk = records[i:i + per]
+        out.append((page_op, build(page_op, struct.pack("<II", 0, len(chunk))
+                                   + b"".join(chunk))))
+    more = max(0, int(total or 0) - len(records)) if total is not None else 0
+    out.append((status_op, build(status_op, struct.pack("<II", 0, more))))
+    return out
+
+
 def page(records):
     """op 0x1D -- one page of rows. Arm 0x611AFBA1 reads the count at
     payload+0x0C and walks 536-byte records from payload+0x10."""
@@ -748,9 +872,13 @@ PS2_OP_TPL_END = 0x1B
 PS2_OP_K6_END = 0x1E
 PS2_OP_SECTOR_PAGE, PS2_OP_SECTOR_END = 0x20, 0x21
 
-#: {PS2 client op: job kind}. Kind 0 (op 2) is the war map's mode-0 job, the
-#: PS2 twin of the PC op 6 whose 0x1B END killed a client: left unanswered.
+#: {PS2 client op: job kind}. Kind 0 (op 2) is the PILOT SEARCH (see
+#: OP_PILOT_SEARCH), the PS2 twin of the PC op 6 whose 0x1B END killed a
+#: client: answered with 0x0C pages and the 0x0D status (0x004D16A4: code at
+#: payload+0x0C into [mgr+0x3A8], [mgr+0x3BC] = 1, close; no callback).
 PS2_JOB_KIND = {0x02: 0, 0x04: 1, 0x06: 2, 0x08: 3, 0x1A: 5, 0x1C: 6, 0x1F: 7}
+PS2_OP_PILOT_SEARCH = 0x02
+PS2_OP_PILOTS = 0x0C
 
 #: 0x0F's walker `addiu s2, s2, 0x130` (0x004D171C) and the board callback's
 #: own 0x130-byte copy (0x003778EC). PC's is 0x134: the PS2 row has no
@@ -1114,6 +1242,49 @@ def selftest():
     _pq = PS2ListQuery(struct.pack("<5I", 0, 2, 100, 1, 200))
     check("the PS2 kind-3 body decodes (no category)",
           (_pq.submode, _pq.max_rows, _pq.nation, _pq.mapkind) == (2, 100, 1, 200))
+
+    # KIND 0, THE PILOT SEARCH: the live 09-06 body decodes as 0x611AF090's
+    # (zone 100 in A[3] and B[3], nation 1), a 16+ character name keeps its
+    # NUL, and the reply ends with the 0x15 / 0x0D status, never an END.
+    _k0 = PilotSearchQuery(OP6_BODY_LIVE)
+    check("the live op-6 body: flags 0x88, nation 1, zone 100..100, no names",
+          len(OP6_BODY_LIVE) == 116 and _k0.flags == 0x88 and _k0.nation == 1
+          and _k0.zone_range() == (100, 100) and _k0.first == _k0.last == "")
+    _k2 = bytearray(112)
+    struct.pack_into("<I", _k2, 4, PSF_FIRST | PSF_LAST | PSF_ZONE | PSF_NATION)
+    _k2[0x0C:0x0F], _k2[0x1D:0x20] = b"Abe", b"Cox"
+    struct.pack_into("<i", _k2, 0x3C, 200)
+    struct.pack_into("<I", _k2, 0x4C, 2)
+    struct.pack_into("<i", _k2, 0x5C, 207)
+    _k2q = PilotSearchQuery(bytes(_k2), dialect="ps2")
+    check("a PS2 kind-0 body (112 B): names +0x0C / +0x1D, zone A+0x0C at "
+          "+0x3C .. B+0x0C at +0x5C, nation +0x4C",
+          (_k2q.first, _k2q.last, _k2q.zone_range(), _k2q.nation)
+          == ("Abe", "Cox", (200, 207), 2))
+    _pr = pilot_record(0x1001, "Abcdefghijklmnopq", "Lee", 200)
+    check("pilot record: 76 B, id +0x00, names +0x04 / +0x15 NUL-terminated "
+          "inside 17 bytes, zone +0x38",
+          len(_pr) == PILOT_RECORD_LEN == 0x4C
+          and struct.unpack_from("<I", _pr, P_ID)[0] == 0x1001
+          and _pr[P_FIRST:P_FIRST + 17] == b"Abcdefghijklmnop\0"
+          and _pr[P_LAST:P_LAST + 4] == b"Lee\0"
+          and struct.unpack_from("<I", _pr, P_ZONE)[0] == 200)
+    _none = pilot_reply([])
+    _many = pilot_reply([_pr] * 60, total=75)
+    _pg = [parse(f) for _o, f in _many]
+    check("pilot reply: none -> just the 0x15 status (code 0); 60 rows -> "
+          "53 + 7 in byte-counted 0x14 pages, then 0x15 '...over 15'",
+          [o for o, _f in _none] == [OP_STATUS]
+          and parse(_none[0][1]) == (OP_STATUS, bytes(8))
+          and [o for o, _f in _many] == [OP_LIST14, OP_LIST14, OP_STATUS]
+          and [b[4] for _o, b in _pg[:2]] == [53, 7]
+          and _pg[0][1][8:8 + 0x4C] == _pr
+          and struct.unpack_from("<I", _pg[2][1], 4)[0] == 15
+          and all(len(f) <= CLIENT_RX for _o, f in _many)
+          and OP_END not in [o for o, _f in _many])
+    _p2r = pilot_reply([_pr], page_op=PS2_OP_PILOTS, status_op=PS2_OP_STATUS)
+    check("PS2 pilot reply: 0x0C page then 0x0D status",
+          [o for o, _f in _p2r] == [0x0C, 0x0D])
 
     check("looks_like_frame accepts the capture",
           looks_like_frame(HELLO_CAPTURE) == 40)

@@ -25,8 +25,14 @@ S176_RANK = 0x0D              # -> lobby+0x8BB (S14A_RANK)
 #: and the script's E315 gate (0x610FB480) answers "no orders pending".
 S176_OUTLOOK = 0x0F
 S176_RANK_NAME = S176_OUTLOOK   # the old name, kept for readers of older notes
-#: FMO_OUTLOOK: the group-36 index to serve. Default 0 = say nothing.
-OUTLOOK = _env_int("FMO_OUTLOOK", "0")
+#: FMO_OUTLOOK: empty / 'auto' (default) = the Personnel Officer picks the
+#: line from the pilot's real standing (personnel_visit, OUTLOOK_* below); a
+#: number forces that group-36 index on every visit (0 = say nothing, the
+#: pre-2026-10-07 behaviour). OUTLOOK is the fixed index service_record_block
+#: falls back to when the caller passes none.
+_OUTLOOK_RAW = os.environ.get("FMO_OUTLOOK", "").strip().lower()
+OUTLOOK_AUTO = _OUTLOOK_RAW in ("", "auto")
+OUTLOOK = 0 if OUTLOOK_AUTO else _env_int("FMO_OUTLOOK", "0")
 #: KEY: +0x10 is the NEXT PAYDAY, a time_t (static 2026-09-12). The machine
 #: holds the body at machine+0x34, and 0x61192980 passes [machine+0x44] =
 #: body+0x10 to 0x611754D0, which formats it in mode 8 of 0x611E3D00 --
@@ -45,7 +51,7 @@ def next_payday_unix(now=None):
     return (int(_now_unix(now) // DAY) + 1) * DAY
 
 
-def service_record_block(char, ladder=None, now=None):
+def service_record_block(char, ladder=None, now=None, send_rank=None, outlook=None):
     """(0x0176 body, info) for one pilot -- SE's service-record check.
 
     The rank and contribution come from the CHARACTER (the knob is only the
@@ -54,7 +60,12 @@ def service_record_block(char, ladder=None, now=None):
     above what their contribution earns (every pilot on this server today,
     seeded at FMO_RANK with contribution 0) keeps the seeded rank. Pure --
     the caller banks `info["rank"]` when `info["promoted"]`. `ladder=()`
-    disables the promotion (no table, no ladder walk)."""
+    disables the promotion (no table, no ladder walk).
+
+    `send_rank` / `outlook` are personnel_visit()'s decision (the Session
+    path): the rank byte +0x0D is then exactly that -- no ladder walk here,
+    because a +0x0D the client's ordered rank does not match locks the
+    mission desk (ranks.orders_pending) -- and +0x0F is that group-36 line."""
     char = char or {}
     ladder = ranks.RANK_LADDER if ladder is None else ladder
     rank, rank_src = economy._econ_value("rank", None, status.START_RANK, "FMO_RANK", char)
@@ -62,9 +73,14 @@ def service_record_block(char, ladder=None, now=None):
                                                "FMO_STATUS_CONTRIB", char)
     rank = int(rank or 0) & 0xFF
     contrib = int(contrib or 0)
-    earned = ranks.rank_for_contribution(contrib, ladder) if ladder else rank
-    promoted = earned > rank
-    new_rank = earned if promoted else rank
+    if send_rank is not None:
+        earned = int(send_rank) & 0xFF
+        promoted = earned > rank
+        new_rank = earned
+    else:
+        earned = ranks.rank_for_contribution(contrib, ladder) if ladder else rank
+        promoted = earned > rank
+        new_rank = earned if promoted else rank
     blk = bytearray(S176_BODY_LEN)
     struct.pack_into("<i", blk, S176_CONTRIB_SHOWN, contrib)
     struct.pack_into("<i", blk, S176_CONTRIB_STORED, contrib)
@@ -81,7 +97,7 @@ def service_record_block(char, ladder=None, now=None):
     # printed and E315 (0x610FB480, "is an orders message pending?") answers 0.
     # FMO_OUTLOOK serves a real group-36 index once there is a review state to
     # report -- 4 is "There is no message for you from the top brass."
-    blk[S176_OUTLOOK] = OUTLOOK & 0xFF
+    blk[S176_OUTLOOK] = (OUTLOOK if outlook is None else int(outlook)) & 0xFF
     # The officer's "next payday" (see S176_NEXT_PAYDAY): only when there IS
     # a salary -- with FMO_SALARY=0 no day ever pays, and 0 keeps the old line.
     struct.pack_into("<I", blk, S176_NEXT_PAYDAY,
@@ -215,13 +231,21 @@ def ceasefire_owed(char, phases):
 REVIEW = (os.environ.get("FMO_REVIEW", "").strip() or "0").lower()
 REVIEW_DAYS = _env_int("FMO_REVIEW_DAYS", "7")           #: OURS: SE says only "a set period"
 REVIEW_PROMOTE = _env_int("FMO_REVIEW_PROMOTE", "3")     #: OURS: SE's count is not published
-#: OURS: "rank:cap,..." pilots allowed per rank and nation; empty = no cap.
+#: OURS: "rank:cap,..." pilots allowed per rank and nation. SE: 「各階級にはそれぞれ
+#: 人数制限が設けられています。昇格するには、各階級の人数枠に空きがある必要があります」
+#: (update 050719qk2ld8:71) and never published a figure, so the default is
+#: ours, sized for a small server: Major 30, Lieutenant Colonel 15, Colonel 8
+#: per nation (a pending promotion order holds its slot). Empty / unset = that
+#: default; 'none' (or '0') = no cap at all.
+REVIEW_CAPS_DEFAULT = "21:30,22:15,23:8"
 REVIEW_CAPS_SPEC = os.environ.get("FMO_REVIEW_CAPS", "").strip()
 
 
 def parse_review_caps(spec):
     out = {}
-    for piece in (spec or "").split(","):
+    if (spec or "").strip().lower() in ("none", "0", "off"):
+        return out
+    for piece in (spec or REVIEW_CAPS_DEFAULT).split(","):
         if piece.strip():
             r, c = piece.split(":")
             out[int(r, 0)] = int(c, 0)
@@ -279,6 +303,251 @@ def review_demoted_contribution(new_rank, ladder=None):
     if hi is None or hi <= lo:
         return lo
     return int(lo + 0.9 * (hi - lo))
+
+
+# --------------------------------------------------------------------------- #
+# THE PERSONNEL OFFICER'S ORDERS (2026-10-07). Promotion / demotion ORDERS
+# (辞令) and the promotion OUTLOOK line, SE's flow on the client's own gate.
+# --------------------------------------------------------------------------- #
+#: KEY: HOW AN ORDER MOVES (static, fmodis 2026-10-07; nothing here is
+#: seen live yet). The client holds two rank bytes: A = the rank (lobby+0x8BB,
+#: 0x014A +0x2F and 0x0176 +0x0D) and C = the ORDERED rank (lobby+0xE1A,
+#: 0x014A +0x58E only: no other writer in the image). 0x61175510 calls an
+#: order pending when they differ (see ranks.orders_pending for the floor
+#: byte), and then the mission desk's E316 prints D64 67/68/69 "Orders have
+#: come down from Army Command / Please ask the Personnel Officer / You
+#: cannot accept a mission at this time". The Personnel Officer's 0x0176
+#: writes A (+0x0D) and nothing else of the pair -- so the officer is where
+#: an order is APPLIED: A := C clears the gate. Hence:
+#:   * an order is decided at the officer (the review, a contribution step),
+#:     stored on the pilot as `rank_order`, and NOT shown to this session:
+#:     its C came from this login's 0x014A, and a +0x0D that differs from it
+#:     would lock the desk until the next login;
+#:   * the next 0x014A serves A = the held rank, C = the order
+#:     (status.rank_and_ack), so the desk sends the pilot to the officer;
+#:   * the officer's next 0x0176 carries +0x0D = C and the server banks it.
+#: A step the gate does not cover (ranks.orders_pending false for the new
+#: rank against this session's C) is applied on the spot instead. With the
+#: floor at 0 (what the wire carries today) that never happens, so a
+#: CONTRIBUTION step is banked at once and simply shown from the next login
+#: (A = C = the new rank, no order), and only REVIEW verdicts become orders --
+#: SE's split, since SE's floor (Major) exempted contribution ranks.
+#: The pilot's record: `rank_order` = {"rank", "kind" promote|demote,
+#: "why" review|contribution, "from", "at"}; `review_last` = the last verdict.
+#:
+#: THE OUTLOOK LINE (+0x0F, systext group 36, printed to chat and parked in
+#: lobby+0x7C for the officer's E315). READ STATICALLY: which index prints
+#: which text. GUESSED: which standing SE paired with each index -- SE wrote
+#: three families of four and never said when each was used. Ours:
+#:   1  "highly regarded, expect greater efforts"  on track (kept / half way)
+#:   2  "orders are expected to come down soon"    a promotion is decided
+#:   3  "not recognised, a review is unavoidable"  heading for demotion
+#:   4  "no message from the top brass"            nothing to report
+#:  11  "... expect further results"               review held: KEPT
+#:  12  "... the top brass are most satisfied"     promotion order DELIVERED
+#:  13  "not recognised (review family)"           demotion order DELIVERED
+#:  14  "a promotion review was held but passed over this time"
+#:                                                 earned it, rank FULL (cap)
+#:  21  "... cannot hide their astonishment"       promoted straight after a demotion
+#:  22  "very high, the demotion review has been dropped"
+#:                                                 after a demotion: on track now
+#:  23  "still not recognised, a demotion review will be held shortly"
+#:                                                 a demotion order is decided /
+#:                                                 0 wins again after a demotion
+#:  24  "reassessed, the demotion review has been dropped"
+#:                                                 after a demotion: review KEPT
+OUTLOOK_REGARDED, OUTLOOK_ORDERS_SOON, OUTLOOK_UNRECOGNISED, OUTLOOK_NO_MESSAGE = 1, 2, 3, 4
+OUTLOOK_REVIEW_KEPT, OUTLOOK_PROMOTED, OUTLOOK_DEMOTED, OUTLOOK_PASSED_OVER = 11, 12, 13, 14
+OUTLOOK_ASTONISHED, OUTLOOK_WATCH_DROPPED, OUTLOOK_DEMOTION_SOON, OUTLOOK_REASSESSED = 21, 22, 23, 24
+OUTLOOK_TEXT = {
+    1: "highly regarded", 2: "orders expected soon", 3: "not recognised (review unavoidable)",
+    4: "no message", 11: "review: kept", 12: "promotion delivered", 13: "demotion delivered",
+    14: "promotion passed over (rank full)", 21: "astonishment", 22: "demotion review dropped",
+    23: "demotion review soon", 24: "reassessed, demotion review dropped"}
+
+
+def rank_order(char):
+    """The pilot's pending order {"rank", "kind", ...} or None."""
+    o = (char or {}).get("rank_order")
+    if isinstance(o, dict) and isinstance(o.get("rank"), int):
+        return o
+    return None
+
+
+def ordered_rank(char, rank):
+    """C for this pilot's 0x014A: the pending order's rank, else `rank`
+    (no order = acknowledged, the gate open)."""
+    o = rank_order(char)
+    return o["rank"] if o is not None else int(rank)
+
+
+def review_mode(mode=None):
+    m = (REVIEW if mode is None else str(mode)).strip().lower()
+    return "promote" if m == "1" else m
+
+
+def contribution_outlook(rank, contrib, ladder=None):
+    """Outlook below the review band: where the contribution stands against
+    this rank's bar and the next one."""
+    lo = ranks.rank_threshold(rank, ladder)
+    hi = ranks.rank_threshold(rank + 1, ladder) if rank < ranks.RANK_MAX_EARNABLE else None
+    if lo is None:
+        return OUTLOOK_NO_MESSAGE
+    if contrib < lo:
+        return OUTLOOK_UNRECOGNISED
+    if hi is None or hi <= lo:
+        return OUTLOOK_NO_MESSAGE
+    if contrib >= hi:
+        return OUTLOOK_ORDERS_SOON
+    return OUTLOOK_REGARDED if (contrib - lo) * 2 >= (hi - lo) else OUTLOOK_NO_MESSAGE
+
+
+def personnel_visit(char, client_rank, client_ack, now=None, mode=None, floor=None,
+                    held=None, ladder=None, promote_n=None, days=None):
+    """One talk with the Personnel Officer: deliver a pending order, run the
+    review, take a contribution step, and choose the outlook line.
+
+    `client_rank` / `client_ack` = the A / C this session's client holds
+    (status.rank_and_ack at the first visit, then what the last 0x0176 set).
+    `held(rank, nation)` counts pilots holding (or ordered to) a rank for the
+    cap; None = no cap check. MUTATES `char` (the caller commits when
+    `changed`). Returns {"send_rank", "outlook", "changed", "delivered",
+    "issued", "verdict", "notes"}."""
+    now = int(_now_unix(now))
+    mode = review_mode(mode)
+    floor = ranks.RANK_ORDER_FLOOR if floor is None else int(floor)
+    need = REVIEW_PROMOTE if promote_n is None else int(promote_n)
+    period = (REVIEW_DAYS if days is None else int(days)) * DAY
+    rank = int(economy._econ_value("rank", None, status.START_RANK, "FMO_RANK", char)[0] or 0)
+    contrib = int(economy._econ_value("contribution", None, status.STATUS_CONTRIB,
+                                      "FMO_STATUS_CONTRIB", char)[0] or 0)
+    out = {"send_rank": int(client_rank), "outlook": OUTLOOK_NO_MESSAGE, "changed": False,
+           "delivered": None, "issued": None, "verdict": None, "notes": []}
+    note = out["notes"].append
+
+    def apply(new, kind):
+        char["rank"] = new
+        if kind == "demote" and new <= RANK_CAPTAIN:
+            # SE: a demoted Captain keeps the bar at ~90% toward the rank lost
+            cap = review_demoted_contribution(new, ladder)
+            if contrib > cap:
+                char["contribution"] = cap
+        # a new rank starts a new review period (or leaves the band)
+        if RANK_CAPTAIN <= new <= RANK_COLONEL:
+            char["review_at"] = now
+        else:
+            char.pop("review_at", None)
+        out["changed"] = True
+
+    def deliverable(new):
+        return not ranks.orders_pending(new, floor, client_ack)
+
+    # 1. A pending order: delivered when this session's client was told of it.
+    order = rank_order(char)
+    if order is not None:
+        if deliverable(order["rank"]):
+            apply(order["rank"], order.get("kind"))
+            char.pop("rank_order", None)
+            out.update(send_rank=order["rank"], delivered=order)
+            watch = order.get("why") == "review" and char.get("review_last_before") == "demote"
+            char.pop("review_last_before", None)
+            out["outlook"] = (OUTLOOK_DEMOTED if order.get("kind") == "demote" else
+                              OUTLOOK_ASTONISHED if watch else OUTLOOK_PROMOTED)
+            note(f"ORDER DELIVERED: {ranks.rank_name(rank)} -> "
+                 f"{ranks.rank_name(order['rank'])} ({order.get('why')}, "
+                 f"+0x0D = {order['rank']} = the ordered rank, the desk's gate clears)")
+        else:
+            out["outlook"] = (OUTLOOK_DEMOTION_SOON if order.get("kind") == "demote"
+                              else OUTLOOK_ORDERS_SOON)
+            note(f"order to {ranks.rank_name(order['rank'])} pending: this session's "
+                 f"client was not told of it (ordered rank byte {client_ack}), it comes "
+                 f"down at the next login")
+        return out
+
+    def issue(new, kind, why):
+        o = {"rank": int(new), "kind": kind, "why": why, "from": rank, "at": now}
+        if deliverable(new):
+            apply(new, kind)
+            out.update(send_rank=int(new), delivered=o)
+            note(f"{why} {kind} to {ranks.rank_name(new)} applied at once "
+                 f"(the client's gate does not cover it)")
+            return True
+        if why == "contribution":
+            # banked now; the next 0x014A serves A = C = it (no order)
+            apply(new, kind)
+            out["issued"] = o
+            note(f"contribution step to {ranks.rank_name(new)} banked; the client "
+                 f"shows it from the next login (+0x0D stays {client_rank} now, "
+                 f"or the desk would lock)")
+            return False
+        char["rank_order"] = o
+        if char.get("review_last") == "demote":
+            char["review_last_before"] = "demote"
+        out.update(issued=o, changed=True)
+        note(f"ORDER ISSUED: {kind} to {ranks.rank_name(new)} -- served as the "
+             f"ordered rank at the next login, applied at this desk after it")
+        return False
+
+    # 2. Contribution: below Captain the ladder decides (SE: up to Captain).
+    if rank < RANK_CAPTAIN or (rank == RANK_CAPTAIN and mode not in ("promote", "full")):
+        earned = ranks.rank_for_contribution(contrib, ladder) if (
+            ranks.RANK_LADDER if ladder is None else ladder) else rank
+        if earned > rank:
+            now_shown = issue(earned, "promote", "contribution")
+            out["outlook"] = OUTLOOK_PROMOTED if now_shown else OUTLOOK_ORDERS_SOON
+        else:
+            out["outlook"] = contribution_outlook(rank, contrib, ladder)
+        return out
+    # 3. The review band, Captain..Colonel (SE: Captain on sector missions,
+    #    Major+ on area missions; a period, a quota, a cap, demotion).
+    if mode not in ("promote", "full") or rank > RANK_COLONEL:
+        return out                                    # 4: no message
+    since = char.get("review_at")
+    if not isinstance(since, int):
+        char["review_at"] = now
+        out["changed"] = True
+        note(f"review period opened for {ranks.rank_name(rank)} "
+             f"({period // DAY} days, FMO_REVIEW_DAYS)")
+        return out
+    wins = review_successes(char, rank, since, now)
+    watch = char.get("review_last") == "demote"
+    nat = zoneentry.nation_for_session(char, status.STATUS_NATION, "FMO_STATUS_NATION")[0]
+    cap = REVIEW_CAPS.get(rank + 1)
+    slot = True
+    if cap is not None and held is not None and rank < RANK_COLONEL and wins >= need:
+        slot = held(rank + 1, nat) < cap
+    what = ("sector" if rank <= RANK_CAPTAIN else "area") + " mission(s)"
+    if now - since < period:
+        # mid-period: the outlook only
+        if wins >= need and rank < RANK_COLONEL:
+            out["outlook"] = OUTLOOK_ORDERS_SOON if slot else OUTLOOK_REGARDED
+        elif wins >= 1:
+            out["outlook"] = OUTLOOK_WATCH_DROPPED if watch else OUTLOOK_REGARDED
+        elif mode == "full":
+            out["outlook"] = OUTLOOK_DEMOTION_SOON if watch else OUTLOOK_UNRECOGNISED
+        note(f"review: {wins} {what} since the period opened "
+             f"({(now - since) // DAY} of {period // DAY} days; promote at {need})")
+        return out
+    verdict = review_verdict(rank, wins, mode, promote_n=need, slot_free=slot)
+    char["review_at"] = now
+    out.update(verdict=verdict, changed=True)
+    note(f"REVIEW: {ranks.rank_name(rank)}, {wins} {what} in the period "
+         f"(promote at {need}{'' if slot else '; ' + ranks.rank_name(rank + 1) + ' is FULL'}) "
+         f"-> {verdict.upper()} (FMO_REVIEW={mode})")
+    if verdict == "promote":
+        issue(rank + 1, "promote", "review")
+        out["outlook"] = (OUTLOOK_PROMOTED if out["delivered"] else OUTLOOK_ORDERS_SOON)
+    elif verdict == "demote":
+        issue(rank - 1, "demote", "review")
+        out["outlook"] = (OUTLOOK_DEMOTED if out["delivered"] else OUTLOOK_DEMOTION_SOON)
+    elif wins >= need and not slot:
+        out["outlook"] = OUTLOOK_PASSED_OVER
+    elif wins >= 1:
+        out["outlook"] = OUTLOOK_REASSESSED if watch else OUTLOOK_REVIEW_KEPT
+    else:
+        out["outlook"] = OUTLOOK_NO_MESSAGE            # 'promote' mode: kept, no wins
+    char["review_last"] = verdict
+    return out
 
 
 def _now_unix(now=None):
