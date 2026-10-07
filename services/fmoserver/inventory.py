@@ -326,9 +326,44 @@ def stored_items(char):
 
 
 def stored_item_records(char):
-    """The 24-byte records of a pilot's acquired items, for 0x0133."""
-    return [item_record(it["serial"], it["id"], it["kind"])
-            for it in stored_items(char)]
+    """The 24-byte records of a pilot's acquired items, for 0x0133. An entry
+    taken over from a setup (own_equipped) keeps its record verbatim."""
+    out = []
+    for it in stored_items(char):
+        rec = item_record(it["serial"], it["id"], it["kind"])
+        try:
+            raw = bytes.fromhex(it.get("rec") or "")
+        except (TypeError, ValueError):
+            raw = b""
+        if len(raw) == INV_ENTRY_LEN and raw[:ITEM_KIND + 1] == rec[:ITEM_KIND + 1]:
+            rec = raw
+        out.append(rec)
+    return out
+
+
+#: KEY: AN UNFITTED PART MUST STAY OWNED. 0x0133 is the setups' own records
+#: plus the stored (acquired) items, so a starter part that a fit REPLACES
+#: (0x6103D330 overwrites the slot record; the client keeps the old entry in
+#: its own list) is in neither once the 0x0167 save lands, and it vanished at
+#: the next login. own_equipped() copies every equipped record into the stored
+#: list once, so ownership has ONE ledger: a sale (0x0169) removes it there,
+#: a refit cannot lose it. Called when parts are sellable (session, 0x0166).
+def own_equipped(char, block):
+    """Add each record `block` equips that the pilot does not already hold as
+    a stored item. Returns how many were added. Pure apart from `char`."""
+    have = {it["serial"] for it in stored_items(char)}
+    added = 0
+    for rec in inventory_from_setups(block):
+        serial = struct.unpack_from("<Q", rec, ITEM_SERIAL_LO)[0]
+        kind = rec[ITEM_KIND]
+        item_id = struct.unpack_from("<H", rec, ITEM_ID)[0]
+        if serial in have or not serial or not kind or not item_id:
+            continue
+        e = add_stored_item(char, serial, item_id, kind)
+        e["rec"], e["src"] = bytes(rec).hex(), "setup"
+        have.add(serial)
+        added += 1
+    return added
 
 
 def add_stored_item(char, serial, item_id, kind, price=0):

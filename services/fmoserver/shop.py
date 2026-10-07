@@ -64,11 +64,33 @@ ACQ_GATE, ACQ_RECORD = 0x14, 0x18
 REPLY_016B_LEN = ACQ_RECORD + inventory.INV_ENTRY_LEN    # 0x30 -- covers every read
 #: The refusal: a reply that is not 0x016B (message 2, as 0x017E's refusal).
 ACQ_REFUSE_MSG = 2
+#: KEY: WHY A PART BUY CRASHED (0x611A559D, live 2026-09-11) -- RE-DERIVED
+#: STATICALLY 2026-10-07 against the corrected reply. It was OUR 0x016B, not
+#: SE's undress code. The buy is the network dialog 0x6103FBB0 (type 1, event
+#: 0x1006) built at 0x610334F0 over a PENDING record at scene+0xB6F8 that
+#: 0x6103348B zeroes first (+0 id, +2 kind, +4 price), and 0x61178630 keeps
+#: that pointer as lobby+0x73FA. scene+0xB700 is pending+8: the 24-byte item
+#: record, and its ONLY writer is the gate-nonzero arm of the 0x016B poll
+#: (0x611787D5: edx = [lobby+0x73FA] + 8, copy packet+0x2C). The poll returns 1
+#: on BOTH arms, so event 0x1006 (case 0x610368F0) calls 0x61034450(1), and
+#: in buy-and-fit mode ([scene+0xBF94] == 0, [scene+0xBF98] == 0) that fits
+#: scene+0xB700 into the open slot: 0x6103E220 -> 0x6103D330(slot, rec).
+#: With the gate unread (we wrote it at payload+0x28 until 7e4c3fb1) the
+#: record was still the zeroed one, packed = (id << 16) | kind = 0, the setter
+#: 0x611AC4E0 strips the slot's node to 0x01 (`and byte [node],0x0F`), and the
+#: thunk 0x611A58D0 -- called only because the record POINTER is non-NULL --
+#: re-dispatches "part, category 0" into 0x611A5130 and reads [0]. The crash
+#: stack's 0x610344B5 is the return address of that 0x6103E220 call.
+#: SE's own unfit passes a NULL record (0x610342B4) and never reaches the
+#: thunk, so the strip alone is retail behaviour. With the gate at +0x14 the
+#: fitted record is ours: it must carry the client's own (id, kind) -- kind
+#: non-zero in a known master table -- and zeros at +0x0C..+0x17, which the
+#: thunk walks as per-stat bytes (0x611A55B0, zero = skip).
 #: FMO_ACQUIRE_KINDS: the item kinds an 0x0168 may buy, comma-separated, or
-#: 'all'. Default 0x13 (consumables and passes). A wanzer PART buy is refused
-#: (no debit, no item) because parts kill the client on undress
-#: (0x611A559D, live 2026-09-11) -- the shop should not list them anyway
-#: (FMO_PARTS_STOCK), this is the second lock.
+#: 'all'. Default 0x13 (consumables and passes) until a part buy has been seen
+#: live on the corrected reply; 'all' or '0x13,0x11,0x21,0x31,0x41,0x12' opts
+#: parts in. A refused kind gets message 2: the poll's other-id arm returns
+#: negative, 0x61034450 skips the fit, nothing is debited or appended.
 ACQUIRE_KINDS_RAW = os.environ.get("FMO_ACQUIRE_KINDS", "0x13").strip() or "0x13"
 
 
@@ -87,6 +109,48 @@ def acquire_allowed(kind, kinds=...):
     """True when an 0x0168 for item `kind` may be sold."""
     kinds = ACQUIRE_KINDS if kinds is ... else kinds
     return kinds is None or int(kind) in kinds
+
+
+#: The master tables an (id, kind) may name, and how many ids each holds
+#: (partsstock.PART_TABLE_COUNT, measured from D97). Repeated here as a lazy
+#: lookup so this module stays import-light.
+def _table_count(kind):
+    from .partsstock import PART_TABLE_COUNT
+    return PART_TABLE_COUNT.get(int(kind))
+
+
+def is_wanzer_kind(kind):
+    """A part (low nibble 1) or a weapon (low nibble 2): the kinds a fit
+    dresses onto a wanzer node, as opposed to items (3)."""
+    return (int(kind) & 0x0F) in (1, 2)
+
+
+def acquire_check(item_id, kind, stock=None, inv_count=0, kinds=...):
+    """(ok, why) for an 0x0168 of (item_id, kind). Pure.
+
+    Every refusal is message 2, which the client survives (no fit, no debit).
+    What a SUCCESSFUL reply must satisfy, because 0x61034450 fits it at once:
+      * the kind is allowed (FMO_ACQUIRE_KINDS)
+      * the kind is one of the client's 18 master tables and the id is inside
+        it: a zero kind or id would hand the fit a blank record (the crash)
+      * a part or weapon is in the stock we served (`stock` = victory_stock's
+        {kind: ids}; None = no 0x016A was sent, so nothing can be listed)
+      * the pilot's list has room: 0x61177B30 refuses the 401st entry but the
+        fit still dresses the record, leaving a fitted serial the inventory
+        lacks (SE's "had missing parts" deletes that setup on save)."""
+    kind, item_id = int(kind), int(item_id)
+    if not acquire_allowed(kind, kinds):
+        return False, f"kind 0x{kind:02X} not in FMO_ACQUIRE_KINDS={ACQUIRE_KINDS_RAW}"
+    n = _table_count(kind)
+    if n is None:
+        return False, f"kind 0x{kind:02X} is not a master table"
+    if not 1 <= item_id <= n:
+        return False, f"id {item_id} outside kind 0x{kind:02X}'s 1..{n}"
+    if is_wanzer_kind(kind) and item_id not in (stock or {}).get(kind, ()):
+        return False, f"kind 0x{kind:02X} id {item_id} is not in the stock we served"
+    if inv_count >= inventory.INV_MAX:
+        return False, f"inventory full ({inv_count}/{inventory.INV_MAX})"
+    return True, "ok"
 
 
 def acquire_reply_payload(serial, item_id, kind):

@@ -194,6 +194,16 @@ VICTORY_KINDS = (0x11, 0x21, 0x31)             # body, arms, legs: the series
 WANZER_PART_KINDS = (0x11, 0x21, 0x31, 0x41)
 
 
+def parts_sellable(kinds=...):
+    """True when an 0x0168 for every victory kind (body, arms, legs) would be
+    SOLD (shop.acquire_allowed). That is the switch that turns an owed victory
+    series into stock: the fit that killed the client was our unread 0x016B
+    gate (see shop.ACQUIRE_KINDS_RAW), fixed in 7e4c3fb1, and the parts stay
+    opt-in through FMO_ACQUIRE_KINDS until a live buy has been seen."""
+    from . import shop
+    return all(shop.acquire_allowed(k, kinds) for k in VICTORY_KINDS)
+
+
 def victory_unlocked(phases):
     """The nations whose victory series is unlocked by the judged `phases`
     ({n: {"winner": 0/1/2}}): every winner, and both nations for a tie
@@ -237,13 +247,14 @@ def victory_stock(nation=None):
         # unset = no push at all (the empty shop); a block holding ONLY the
         # reward series would be a different shop, not a reward
         return None, "FMO_PARTS_STOCK unset"
-    if not any(k in PARTS_STOCK for k in WANZER_PART_KINDS):
-        # the reward is a wanzer series, and buying/undressing a PART kills
-        # the client (0x611A559D, SE's own `and byte [node],0x0F`): a shop
-        # that sells no parts must not start selling them as a reward. The
-        # war state keeps the award (fmowar phases[n]["reward"]) as OWED.
+    if not (any(k in PARTS_STOCK for k in WANZER_PART_KINDS) or parts_sellable()):
+        # the reward is a wanzer series: a shop that sells no parts does not
+        # start selling them as a reward. The war state keeps the award
+        # (fmowar phases[n]["reward"]) as OWED, and it flows into this stock
+        # by itself once FMO_ACQUIRE_KINDS sells body/arms/legs (parts_sellable)
         return PARTS_STOCK, ("victory series OWED, not served: FMO_PARTS_STOCK "
-                             "sells no wanzer parts")
+                             "sells no wanzer parts and FMO_ACQUIRE_KINDS "
+                             "refuses them")
     war = warstate.war_state() if warstate.WAR != "0" else None
     phases = (war.data.get("phases") if war is not None else None) or {}
     # phases judged since rewards were recorded carry their own series

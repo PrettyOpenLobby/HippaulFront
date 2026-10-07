@@ -789,6 +789,14 @@ class Session(
             # A garage save (0x0167) beats the synthesized starter: serve the
             # block the client itself authored, byte-identical shape.
             _pc = self.playing_char() if charstore.CHAR_STORE else None
+            if _pc and partsstock.parts_sellable():
+                # parts can be bought and refitted: every equipped record
+                # becomes an owned item once (inventory.own_equipped), so a
+                # part a fit replaces stays in the next 0x0133
+                _own = inventory.own_equipped(_pc, self.setups_block())
+                if _own:
+                    self.commit(f"{_own} equipped part(s) now owned items "
+                                f"(they survive being unfitted)")
             if _pc and _pc.get("setups"):
                 stored = bytes.fromhex(_pc["setups"])
                 if len(stored) == inventory.REPLY_0166_LEN:
@@ -913,11 +921,23 @@ class Session(
             part_id = struct.unpack_from("<H", pl, 0)[0] if len(pl) >= 2 else 0
             kind = pl[2] if len(pl) >= 3 else 0
             extra = struct.unpack_from("<I", pl, 4)[0] if len(pl) >= 8 else 0
-            if not shop.acquire_allowed(kind):
+            _ok, _why = shop.acquire_allowed(kind), ""
+            if _ok:
+                # the reply is FITTED at once (0x61034450 -> 0x6103D330), so a
+                # part must be one we stocked and the list must have room
+                _apc = (self.playing_char() or {}) if charstore.CHAR_STORE else {}
+                _n_inv = len(inventory.merge_inventory(
+                    inventory.inventory_from_setups(self.setups_block())
+                    if inventory.INVENTORY_FROM_SETUPS else [],
+                    inventory.stored_item_records(_apc)))
+                _stock = (partsstock.victory_stock(self.grant_nation()[0])[0]
+                          if shop.is_wanzer_kind(kind) else None)
+                _ok, _why = shop.acquire_check(part_id, kind, _stock, _n_inv)
+            if not _ok:
                 # a non-0x016B reply: 0x61178896, a numbered refusal, and the
                 # debit at 0x6117886D is never reached -- no money, no item
                 log(f"{self.peer}   0x0168 = ACQUIRE: id {part_id} kind 0x{kind:02X} "
-                    f"price {extra} REFUSED (FMO_ACQUIRE_KINDS={shop.ACQUIRE_KINDS_RAW}): "
+                    f"price {extra} REFUSED ({_why or 'FMO_ACQUIRE_KINDS=' + shop.ACQUIRE_KINDS_RAW}): "
                     f"-> message {shop.ACQ_REFUSE_MSG}, nothing debited or granted")
                 return [packet.build(shop.ACQ_REFUSE_MSG, b"", self.reply_seq(), p["conn"])]
             lo, hi = shop.mint_serial()
@@ -957,10 +977,9 @@ class Session(
                     f"the client debits is not banked")
             log(f"{self.peer}   -> 0x016B, {shop.REPLY_016B_LEN}B: gate 1 at +0x{shop.ACQ_GATE:02X}, item "
                 f"record serial {hi:08x}:{lo:08x} -- the client appends it to "
-                f"its inventory (0x61177B30) and re-reads id/kind from the "
-                f"record. WARNING: No stock and no legality check on (id, kind); the "
-                f"master tables clamp a too-large id to the WRONG NAME rather "
-                f"than erroring.")
+                f"its inventory (0x61177B30) and FITS it in buy-and-fit mode "
+                f"(0x61034450 -> 0x6103D330); shop.acquire_check vetted (id, kind) "
+                f"against the master table, the served stock and the 400 cap.")
             return [packet.build(shop.MSG_ACQUIRE_REPLY, bytes(body),
                                  self.reply_seq(), p["conn"])]
 

@@ -3329,6 +3329,130 @@ def _shop_acquire_pins():
     return ok
 
 
+def _part_fit_pins():
+    """BUYING A WANZER PART IS A FIT (static 2026-10-07), no client.
+    0x61034450 fits scene+0xB700 = pending+8 the moment the buy's poll returns
+    1, and only the gate-nonzero arm of 0x611787C2 copies packet+0x2C there;
+    a blank record there is the 09-11 crash (packed 0 -> strip -> 0x611A559D).
+    (1) with parts opted in, an Arco body buy fits packed (1 << 16) | 0x11,
+    stat bytes +0x0C..+0x17 zero, debits once, keeps the item; (2) the twin:
+    the pre-fix reply leaves the fitted record blank (packed 0); (3) refusals:
+    off-stock id, id past the table, kind 0, full list; (4) the victory series
+    is OWED while FMO_ACQUIRE_KINDS refuses parts and SERVED once it sells
+    them, FMO_PARTS_STOCK still 0x13; (5) an unfitted starter part stays in
+    0x0133 after a refit save (inventory.own_equipped), once."""
+    import tempfile as _tf
+    ok, fails = True, []
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    def _fit(pk, iid, kind):
+        # 0x6103348B zeroes pending, 0x611787D5 fills pending+8 on a gate,
+        # 0x6103D3BA packs (record+8 << 16) | record+0xA
+        pend = bytearray(32)
+        struct.pack_into("<HB", pend, 0, iid, kind)
+        if (struct.unpack_from("<H", pk, 6)[0] == shop.MSG_ACQUIRE_REPLY
+                and struct.unpack_from("<I", pk, 0x28)[0]):
+            pend[8:32] = pk[0x2C:0x44]
+        rec = bytes(pend[8:32])
+        return (struct.unpack_from("<H", rec, 8)[0] << 16) | rec[0x0A], rec
+
+    def _sess(char):
+        s = session.Session("selftest-part-fit")
+        s._roster = [char]
+        s.playing_char = lambda: char
+        s.commit = lambda what: None
+        return s
+
+    def _buy(s, iid, kind, price):
+        return s.on_packet(packet.parse(packet.build(
+            shop.MSG_ACQUIRE, struct.pack("<HBBI", iid, kind, 0, price) + bytes(16), 0x168)))
+
+    def _msg(o):
+        return [struct.unpack_from("<H", x, 6)[0] for x in o]
+
+    _was = (charstore.CHAR_STORE, shop.ACQUIRE_KINDS, partsstock.PARTS_STOCK,
+            warstate.war_state, warstate.WAR)
+    with _tf.TemporaryDirectory() as _td:
+        try:
+            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+            partsstock.PARTS_STOCK = partsstock.parse_parts_stock("0x11:1,0x13")
+            warstate.WAR = "0"
+            shop.ACQUIRE_KINDS = shop.parse_acquire_kinds("all")
+            pilot = {"id": 7, "first": "Fit", "last": "Test", "money": 100,
+                     "nation": 1, "cls": 3}
+            s = _sess(pilot)
+            o = _buy(s, 1, 0x11, 10)
+            packed, rec = _fit(o[0], 1, 0x11) if len(o) == 1 else (0, bytes(24))
+            its = inventory.stored_items(pilot)
+            ok &= _c(1, packed == (1 << 16) | 0x11 and rec[0x0C:0x18] == bytes(12)
+                     and bool(its) and struct.unpack_from("<Q", rec, 0)[0] == its[-1]["serial"]
+                     and pilot["money"] == 90 and len(its) == 1)
+            old = bytearray(0x44)
+            struct.pack_into("<I", old, 0x28, 1)
+            old[0x2C:0x44] = inventory.item_record(9, 1, 0x11)
+            ok &= _c(2, _fit(packet.build(shop.MSG_ACQUIRE_REPLY, bytes(old), 2), 1, 0x11)
+                     == (0, bytes(24)))
+            o3 = _buy(s, 2, 0x11, 10) + _buy(s, 742, 0x11, 10) + _buy(s, 1, 0x00, 10)
+            st = partsstock.PARTS_STOCK
+            ok &= _c(3, _msg(o3) == [shop.ACQ_REFUSE_MSG] * 3 and pilot["money"] == 90
+                     and len(inventory.stored_items(pilot)) == 1
+                     and not shop.acquire_check(1, 0x11, st, inventory.INV_MAX)[0]
+                     and shop.acquire_check(1, 0x11, st, inventory.INV_MAX - 1)[0]
+                     and not shop.acquire_check(1, 0x11, None, 0)[0]
+                     and shop.acquire_check(41, 0x13, None, 0)[0])
+            # (4)
+            partsstock.PARTS_STOCK = partsstock.parse_parts_stock("0x13")
+            warstate.WAR = "1"
+            warstate.war_state = lambda: type("W", (), {"data": {"phases": {
+                "1": {"winner": 1}}}})()
+            shop.ACQUIRE_KINDS = shop.parse_acquire_kinds("0x13")
+            owed, why = partsstock.victory_stock(1)
+            shop.ACQUIRE_KINDS = shop.parse_acquire_kinds("0x13,0x11,0x21,0x31")
+            paid, _ = partsstock.victory_stock(1)
+            ok &= _c(4, owed == partsstock.PARTS_STOCK and "OWED" in why
+                     and all({181, 182, 183, 184} <= paid.get(k, set())
+                             for k in (0x11, 0x21, 0x31))
+                     and paid[0x13] == partsstock.PARTS_STOCK[0x13]
+                     and partsstock.parts_sellable()
+                     and not partsstock.parts_sellable(shop.parse_acquire_kinds("0x13")))
+            # (5) starter Giza: backpack idx10 serial 11 refitted with a bought one
+            shop.ACQUIRE_KINDS = shop.parse_acquire_kinds("all")
+            warstate.WAR = "0"
+            p5 = {"id": 8, "first": "Own", "last": "Test", "money": 0, "nation": 1, "cls": 3}
+            s5 = _sess(p5)
+            s5.on_packet(packet.parse(packet.build(inventory.MSG_0165_REQ, bytes(16), 0x165)))
+            n_own = len(inventory.stored_items(p5))
+            blk = bytearray(s5.setups_block())
+            off = inventory.SETUP_ITEM_OFF + 10 * inventory.INV_ENTRY_LEN
+            had = struct.unpack_from("<Q", blk, off)[0]
+            blk[off:off + 24] = inventory.item_record(0x6AA5000000010001, 141, 0x41)
+            inventory.add_stored_item(p5, 0x6AA5000000010001, 141, 0x41)
+            p5["setups"] = bytes(blk).hex()
+            s5.on_packet(packet.parse(packet.build(inventory.MSG_0165_REQ, bytes(16), 0x165)))
+            o5 = s5.on_packet(packet.parse(packet.build(inventory.MSG_0132_REQ, bytes(8), 0x132)))
+            body = o5[0][packet.HDR:] if o5 else b""
+            cnt = struct.unpack_from("<I", body, 0)[0] if body else 0
+            sers = {struct.unpack_from("<Q", body, 8 + i * 24)[0] for i in range(cnt)}
+            ok &= _c(5, n_own >= 6 and had == 11 and {11, 0x6AA5000000010001} <= sers
+                     and cnt == len(sers) and len(inventory.stored_items(p5)) == n_own + 1)
+        except Exception as e:
+            print(f"  part fit: EXC {e!r}")
+            ok = False
+        finally:
+            flat_globals()["CHAR_STORE"] = _was[0]
+            (shop.ACQUIRE_KINDS, partsstock.PARTS_STOCK, warstate.war_state,
+             warstate.WAR) = _was[1:]
+    print(f"  part fit (0x0168 buy = fit of pending+8): part buy fits a real record, "
+          f"pre-fix reply fits a blank one, off-stock/table/full refused, victory "
+          f"series owed -> served with FMO_ACQUIRE_KINDS, unfitted part stays owned: "
+          f"{'OK' if ok else 'FAIL at ' + str(fails)}")
+    return ok
+
+
 def _change_room_pins():
     """CHANGE ROOM maps and casts (move.ROOM_MAPS, roomcast.py, 2026-10-06):
     Room = 121, Briefing 122 / 123 by nation, Room B / C = 124, Hangar 141;
@@ -14094,6 +14218,7 @@ def _selftest_run(test_db):
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
     ok &= _war_phase_pins()         # a whole war phase offline: judge, reset, reward, restart (fmowar)
     ok &= _shop_acquire_pins()      # item shop buy 0x0168 -> 0x016B: gate at packet+0x28 (shop.py)
+    ok &= _part_fit_pins()          # part buy = fit of pending+8: real record, stock, owned (shop.py)
     ok &= _community_ps2_pins()     # PS2 community dialect (op 1 HELLO) + mission nation rules
 
     print("SELFTEST", "PASS" if ok else "FAIL")
