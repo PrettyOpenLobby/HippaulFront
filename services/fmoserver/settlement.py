@@ -672,10 +672,14 @@ class SessionSettlement:
             except Exception as _e:
                 log(f"{self.peer}   WARNING: {_hline} -- NOT banked ({_e!r}); the "
                     f"next 0x014A serves the old rank and the next battle end sets it again")
+        # +0x10C = 3 when the battle paid no exp and no contribution: the
+        # client then skips its EXP Gain window instead of showing it empty
+        # (an arena with FMO_ARENA_EXP_PCT=0, a zero-pay probe)
+        _empty = not rows and new == old
         pkt = battleend.battle_end_packet(conn_id, hangar_rank=_hr, contrib_new=new, contrib_old=old,
                                           exp_rows=rows, won=_won,
                                           victory=_won and bool(st["contribution"]),
-                                          next_battle=next_battle,
+                                          next_battle=next_battle, no_screen=_empty,
                                           **(getattr(self, "platoon_end", None) or {}))
         log(f"{self.peer}   -> 0x{battleend.MSG_BATTLE_END:04X} BATTLE END push, "
             f"{battleend.S14C_LEN}B on queue seq 0x{pushes.QUEUE_SEQ:08X}, trigger: {why}: "

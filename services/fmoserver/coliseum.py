@@ -1502,7 +1502,9 @@ class SessionColiseum:
             _hr = hangar.hangar_rank_at_battle_end(_hc)[0] if _hc is not None else 0
             log(f"{self.peer}   COLISEUM: the match this pilot watched ({watched}) is "
                 f"over -> 0x{battleend.MSG_BATTLE_END:04X} with no result and no pay")
-            return [battleend.battle_end_packet(conn_id, won=False, hangar_rank=_hr)]
+            # no pay -> +0x10C = 3: no EXP Gain window for a spectator
+            return [battleend.battle_end_packet(conn_id, won=False, hangar_rank=_hr,
+                                                no_screen=True)]
         v = _COLISEUM.take_verdict(self.account)
         if v is None:
             return []

@@ -2088,6 +2088,43 @@ def _coliseum_match_pins():
     return ok
 
 
+def _battle_end_title_pins():
+    """THE BATTLE-END TITLE AND THE EXP GAIN WINDOW (2026-10-07, static). The
+    client has ONE end banner per verdict, picked only by the 0x014C won test
+    at 0x6117E5CA (+0x144 own side == 1 ? +0x108 == 1 : +0x108 == 2): won ->
+    OBJECTIVES COMPLETE / VICTORY, else OBJECTIVES FAILED / DEFEAT, for a
+    sortie and an arena alike, and a draw can only be a loss. +0x10C = 3
+    skips the EXP Gain window (0x61176FD7); a battle that paid nothing sets it,
+    one that paid anything leaves it 0 so the window shows (retail did)."""
+    import inspect as _in
+    from . import coliseum as _co, settlement as _st
+
+    def client_won(body):            # 0x6117E5CA, transcribed
+        side = body[battleend.S14C_SURV_IDX]
+        res = struct.unpack_from("<I", body, battleend.S14C_RESULT)[0]
+        return res == 1 if side == 1 else res == 2
+
+    def screen_skipped(body):        # 0x61176FD7: bits 0 and 1 of block+8
+        f = body[battleend.S14C_FLAGS]
+        return bool(f & 1) and bool(f & 2)
+
+    w = battleend.battle_end_body(won=True, exp_rows=[(3, 10)])
+    l = battleend.battle_end_body(won=False, exp_rows=[(3, 10)])
+    e = battleend.battle_end_body(won=False, no_screen=True)
+    ok = (client_won(w) and not client_won(l) and not client_won(e)
+          and not screen_skipped(w) and not screen_skipped(l)
+          and screen_skipped(e) and e[battleend.S14C_FLAGS] == 3
+          and battleend.S14C_FLAGS - battleend.S14C_BLOCK == 8)
+    src_st = _in.getsource(_st.SessionSettlement.battle_end_push)
+    src_co = _in.getsource(_co)
+    ok = (ok and "no_screen=_empty" in src_st and "not rows and new == old" in src_st
+          and "no_screen=True" in src_co)
+    print(f"  0x014C title: won -> VICTORY, lost/draw -> DEFEAT (one banner for "
+          f"sortie and arena); +0x10C = 3 only when nothing was paid (spectator, "
+          f"zero-pay end), else the EXP Gain window shows: {'OK' if ok else 'FAIL'}")
+    return ok
+
+
 def _coliseum_spectate_pins():
     """COLISEUM SPECTATING (coliseum.py, 2026-10-01), no client: the 0x01C1 a
     spectator gets, Delacroix's list, the seats and refusals, the end of a
@@ -2611,6 +2648,117 @@ def _battle_spawn_pins():
               f"slots inside +/-300 and >= 12 apart, sides >= 100 apart, map 471 "
               f"present: {'OK' if _t_ok else 'FAIL ' + str(_bad[:5])}")
         ok &= _t_ok
+    return ok
+
+
+def _wanzer_paint_pins():
+    """WANZER PAINT (inventory.SETUP_CAMO.., popparts.paint_for_char, 2026-10-07):
+    the setup header's paint fields sit 0x1AC below the POP body's (lobby
+    builder 0x61003032 vs battle dresser 0x611F59E0); a starter setup wears the
+    nation's starting paint; a stored zero field is filled, a chosen one kept;
+    the battle paints from the SELECTED setup; the owned bits feed the pickers."""
+    ok = True
+    fails = []
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    inv, pp = inventory, popparts
+    sv = inv.SETUP_PAINT
+    try:
+        inv.SETUP_PAINT = True
+        # (1) offsets: entry + 0x1AC = POP body, for all five fields
+        ok &= _c(1, inv.POP_PAINT == {"camo": inv.SETUP_CAMO + 0x1AC,
+                                      "line": inv.SETUP_LINE + 0x1AC,
+                                      "armour": inv.SETUP_ARMOUR + 0x1AC,
+                                      "insignia": inv.SETUP_INSIGNIA + 0x1AC}
+                 and (inv.SETUP_CAMO, inv.SETUP_LINE, inv.SETUP_ARMOUR,
+                      inv.SETUP_INSIGNIA, inv.SETUP_PAINT_B17)
+                 == (0x0C, 0x0E, 0x10, 0x12, 0x17)
+                 and inv.POP_PAINT_B17 == inv.SETUP_PAINT_B17 + 0x1AC == 0x1C3
+                 and inv.POP_PAINT["camo"] == squad.POP_CAMO
+                 and inv.POP_PAINT["line"] == squad.POP_COLOUR_A
+                 and inv.POP_PAINT["armour"] == squad.POP_COLOUR_B
+                 and inv.POP_PAINT_B17 != popself.POP_PENALTY_LEVEL
+                 if hasattr(popself, "POP_PENALTY_LEVEL") else True)
+        # (2) the starter setup wears the nation's starting paint
+        st = inv.starter_setup(1, 1)
+        b1 = inv.reply_0166(parts=st, nation=1)
+        b2 = inv.reply_0166(parts=st, nation=2)
+        p1 = inv.setup_paint(b1[:inv.SETUP_ENTRY_LEN])
+        p2 = inv.setup_paint(b2[:inv.SETUP_ENTRY_LEN])
+        ok &= _c(2, p1 == {"camo": 101, "armour": 42, "line": 1, "insignia": 0, "b17": 0}
+                 and p2["armour"] == 6 and p2["line"] == 1
+                 and inv.reply_0166(parts=st) == inv.reply_0166(parts=st, nation=9)
+                 and inv.setup_paint(inv.reply_0166(parts=st)[:inv.SETUP_ENTRY_LEN])
+                 == {"camo": 0, "armour": 0, "line": 0, "insignia": 0, "b17": 0}
+                 and inv.reply_0166(parts=[], nation=1) == bytes(inv.REPLY_0166_LEN))
+        # (3) fill_paint: zero fields of a setup in use filled, choices kept
+        blk = bytearray(inv.reply_0166(parts=st))          # setup 1 in use, zero paint
+        e2 = bytearray(inv.setup_entry(st, serial_base=22))
+        inv.put_paint(e2, {"camo": 150, "armour": 77, "insignia": 412, "b17": 4})
+        blk[inv.SETUP_ENTRY_LEN:2 * inv.SETUP_ENTRY_LEN] = e2
+        blk = bytes(blk)
+        f, filled = inv.fill_paint(blk, 2)
+        f1 = inv.setup_paint(f[:inv.SETUP_ENTRY_LEN])
+        f2 = inv.setup_paint(f[inv.SETUP_ENTRY_LEN:2 * inv.SETUP_ENTRY_LEN])
+        ok &= _c(3, filled == [1, 2] and f1["armour"] == 6 and f1["camo"] == 101
+                 and f2 == {"camo": 150, "armour": 77, "line": 1, "insignia": 412, "b17": 4}
+                 and f[2 * inv.SETUP_ENTRY_LEN:] == blk[2 * inv.SETUP_ENTRY_LEN:]
+                 and inv.fill_paint(f, 2)[0] is f and inv.fill_paint(blk, None)[0] is blk)
+        # (4) the selected setup (0x0167 +0x00) wins when it is in use
+        ch = {"setups": blk.hex(), "nation_byte": 1}
+        ok &= _c(4, inv.active_setup_no(dict(ch, setup_sel=2))[0] == 2
+                 and inv.active_setup_no(dict(ch, setup_sel=5))[0] == 1
+                 and inv.active_setup_no(ch)[0] == 1
+                 and inv.active_setup_no({})[0] == 1
+                 and pp.stored_setup_parts(blk, 2) == pp.stored_setup1_parts(blk)
+                 and pp.stored_setup_parts(blk, 3) == [])
+        # (5) the battle paint: the selected setup's choices, zeros -> starting
+        pt, _src = pp.paint_for_char(dict(ch, setup_sel=2), 1)
+        px = pp.paint_pop_extra(pt)
+        pt0, _ = pp.paint_for_char({}, 2)
+        ok &= _c(5, pt == {"camo": 150, "armour": 77, "line": 1, "insignia": 412, "b17": 4}
+                 and px == {0x1B8: struct.pack("<H", 150), 0x1BA: struct.pack("<H", 1),
+                            0x1BC: struct.pack("<H", 77), 0x1BE: struct.pack("<H", 412),
+                            0x1C3: b"\x04"}
+                 and pp.paint_for_char(ch, 1)[0] == {"camo": 101, "armour": 42, "line": 1}
+                 and pt0 == {"camo": 101, "armour": 6, "line": 1}
+                 and pp.paint_for_char({}, None)[0] == {})
+        # (6) owned bits: starting paint + worn paint, LSB-first, category bias
+        bits = inv.owned_paint_bits(dict(ch, setup_sel=2), 1)
+        ok &= _c(6, bits.get(0x110) == 0x01                  # camo 101 -> bit 0
+                 and bits.get(0x110 + (49 >> 3)) == 1 << (49 & 7)   # camo 150
+                 and bits.get(0x190) == 0x02                  # colour 1
+                 and bits.get(0x190 + 5) == 0x04              # colour 42
+                 and bits.get(0x190 + 9) == 0x20              # colour 77
+                 and bits.get(0x3C0 + (311 >> 3)) == 1 << (311 & 7)  # insignia 412
+                 and inv.owned_paint_bits(None, None) == {})
+        body = status.reply_014a(rank=0, char={"nation_byte": 2}, active_setup=0,
+                                 class_table=False)
+        ok &= _c(7, body[status.S14A_OWNED + 0x110] == 0x01
+                 and body[status.S14A_OWNED + 0x190] == 0x42   # colours 1 and 6
+                 and status.reply_014a(rank=0, active_setup=0, class_table=False)
+                 [status.S14A_OWNED + 0x110:status.S14A_OWNED + 0x210]
+                 == bytes(0x100))
+        # (8) FMO_SETUP_PAINT=0 reverts: no paint served, no owned bits
+        inv.SETUP_PAINT = False
+        ok &= _c(8, inv.starter_paint(1) == {}
+                 and inv.reply_0166(parts=st, nation=1) == inv.reply_0166(parts=st)
+                 and inv.owned_paint_bits(ch, 1) == {}
+                 and inv.fill_paint(blk, 1)[0] is blk)
+    except Exception as e:
+        print(f"  wanzer paint: EXC {e!r}")
+        ok = False
+    finally:
+        inv.SETUP_PAINT = sv
+    print(f"  wanzer paint: setup +0x0C/0x0E/0x10/0x12/0x17 = POP +0x1B8.. "
+          f"(+0x1AC), starter wears nation paint, zero fields filled and "
+          f"choices kept, battle paints the selected setup, owned bits for the "
+          f"pickers, FMO_SETUP_PAINT=0 reverts: "
+          f"{'OK' if ok else 'FAIL at ' + str(fails)}")
     return ok
 
 
@@ -12748,6 +12896,7 @@ def _selftest_run(test_db):
     ok &= _coliseum_pins()          # the Coliseum desks (coliseum.py)
     ok &= _coliseum_match_pins()    # arena matches: pairing, judging, streak, bracket
     ok &= _coliseum_spectate_pins()  # Coliseum spectators: 0x01C0/0x01C1, receive-only
+    ok &= _battle_end_title_pins()  # 0x014C end banner + EXP Gain window flags
     ok &= _battle_spawn_pins()      # per-map battle spawn points (battlepop.BATTLE_SPAWNS)
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
 

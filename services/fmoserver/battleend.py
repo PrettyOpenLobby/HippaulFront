@@ -39,9 +39,24 @@ from .knobs import _env_float, _env_int
 #:           banks the same value 0x014A serves -- a 0 here would demote.
 #:   +0x104  372 B  THE RESULT BLOCK -> lobby+0x69C6 (0x5D dwords), only when
 #:           HAS BLOCK and [lobby+0x24] != 5. Fields the arm reads INSIDE it:
-#:           +0x108 u32 RESULT: won when it equals 1 with +0x144 == 1, else
-#:           when it equals 2 (the won flag picks 0x610E6E70 over 0x610E6EA0
-#:           at the transition); +0x10C u8 bit0 = SKIP the experience rows;
+#:           +0x108 u32 RESULT = the WINNING SIDE (1 or 2, 0 = nobody): won
+#:           when it equals +0x144 (the pilot's own side) for side 1, else
+#:           when it equals 2 (0x6117E5CA; script call 0xE230 at 0x610FA3B0
+#:           makes the same test against the nation byte lobby+0x8B4). The
+#:           won flag picks 0x610E6E70 over 0x610E6EA0 at the transition, and
+#:           those two hooks are the ONLY battle-end title the client has:
+#:           won -> HUD "OBJECTIVES" / "COMPLETE" / "VICTORY" (0x61237A20,
+#:           strings 0x61347DE0..DF4) plus radio 79:17 when the mission block
+#:           lobby+0x5C7E+0x50 is set, else 79:16; lost -> "OBJECTIVES" /
+#:           "FAILED" / "DEFEAT" plus radio 79:18. Nothing in the 0x014C,
+#:           the 0x015A or the mission block selects a mission, arena or
+#:           draw variant: an arena win/loss shows the same banner as a
+#:           sortie, and a draw can only be shown as a loss.
+#:           +0x10C u8 FLAGS: bit0 = SKIP the experience rows; bit0 AND bit1
+#:           (= 3) also skip the post-battle "EXP Gain" window (0x610CBA70,
+#:           74:0..5 contribution / direct / indirect / action exp, sortie /
+#:           kill contribution), tested at 0x61176FD7 on lobby+0x69CE --
+#:           every other battle end shows it, arena (lobby state 0xD) included;
 #:           +0x110 u32 == 1 -> 0x610D1C30(block, tail) (NOT the replay: a top-10
 #:           record/ranking table, 0x610D1580; the Battle Review is
 #:           recorded client-side, see MB_START_GAMETIME) (was: a replay/record
@@ -50,10 +65,17 @@ from .knobs import _env_float, _env_int
 #:           conditions was applied."; block+0x8D (= lobby+0x6A53) nonzero
 #:           -> lobby+0x6E42 = 1.
 #:   +0x27C  5 x 16 B  per-class rows, copied into the matching lobby+0x7C53
-#:           slot (in-battle only, [lobby+0x30] != 0).
+#:           slot (in-battle only, [lobby+0x30] != 0). Row i belongs to exp
+#:           row i: +4 direct, +8 indirect exp; the EXP Gain window draws the
+#:           class's whole gain and colours +4 / +8 of it as direct / indirect,
+#:           the rest as action exp (0x610CC17D), so all-zero rows show the
+#:           whole gain as action exp.
 #:   +0x2CC  72 B  THE TAIL -> lobby+0x7D13 (0x12 dwords): +0x2CC u32 join-in
 #:           base (nonzero AND +0x2DF > 100 -> 8:65 "Join-in time bonus:
-#:           +%d%%"); +0x2D4 u32 / +0x2F0 u32 either nonzero -> 8:62 mission
+#:           +%d%%"); +0x2D0 u32 / +0x2D8 u32 the EXP Gain window's split of
+#:           the contribution gain (74:4 sortie / 74:5 kill; which is which is
+#:           a labelled guess, both 0 = no split drawn, which is what we send);
+#:           +0x2D4 u32 / +0x2F0 u32 either nonzero -> 8:62 mission
 #:           participation bonus; +0x2DC u8 victory, +0x2DD u8 control,
 #:           +0x2DE u8 counterattack (with +0x2CC != 0 -> 8:60); +0x2DF u8
 #:           join-in percent; +0x2EC u32 H$ platoon bonus with +0x2E8 u32 the
@@ -82,6 +104,8 @@ S14C_BLOCK = 0x104
 S14C_BLOCK_LEN = 0x5D * 4
 S14C_RESULT = 0x108
 S14C_FLAGS = 0x10C
+S14C_FLAG_NO_EXP = 0x01              # skip the experience rows
+S14C_FLAGS_NO_SCREEN = 0x03          # ... and the EXP Gain window (0x61176FD7)
 S14C_REPLAY = 0x110
 S14C_SURV_TABLE = 0x140
 S14C_SURV_IDX = 0x144
@@ -474,10 +498,13 @@ def battle_end_body(hangar_rank=0, contrib_new=0, contrib_old=0, exp_rows=(),
                     won=True, platoon_pct=0, auto_disband=0, victory=0,
                     control=0, counterattack=0, participation=0, join_pct=0,
                     platoon_money=0, platoon_payer=0, op_bonus=0,
-                    has_block=True, block=b"", tail=b"", next_battle=False):
+                    has_block=True, block=b"", tail=b"", next_battle=False,
+                    no_screen=False):
     """The 0x014C body. `block` / `tail` are raw overrides for the 372-B result
     block and the 72-B tail; the named fields are written OVER them, so a
-    captured block can be replayed with only the verdict authored."""
+    captured block can be replayed with only the verdict authored.
+    `no_screen` sets +0x10C = 3: no experience rows and no EXP Gain window
+    after the battle (for a battle end that pays nothing to show)."""
     if len(exp_rows) > S14C_EXP_MAX:
         raise ValueError(f"0x{MSG_BATTLE_END:04X}: {len(exp_rows)} experience "
                          f"rows, the arm walks {S14C_EXP_MAX}")
@@ -505,6 +532,8 @@ def battle_end_body(hangar_rank=0, contrib_new=0, contrib_old=0, exp_rows=(),
     # won: RESULT == 2 with +0x144 == 0 (the `sub eax, 2` arm); lost: 0.
     struct.pack_into("<I", b, S14C_RESULT, 2 if won else 0)
     b[S14C_SURV_IDX] = 0
+    if no_screen:
+        b[S14C_FLAGS] = S14C_FLAGS_NO_SCREEN
     b[S14C_OP_BONUS] = 1 if op_bonus else 0
     # result block +0x8D (= lobby+0x6A53, "HasNextBattleWin"): nonzero sets
     # lobby+0x6E42, and after an ARENA battle (lobby state 0xD) the client
