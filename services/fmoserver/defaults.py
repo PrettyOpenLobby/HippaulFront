@@ -22,7 +22,7 @@ RELEASE_DEFAULTS = {
     "FMO_MOVE_LIST_BRIEFING": "122:0,123:0",
     # the Change Room maps: Room 121, Briefing 122 (O.C.U.) / 123 (U.S.N.),
     # Room B and C the bar 124, Hangar 141 (fmoserver/move.py)
-    "FMO_ROOM_MAPS": "1:121,2:122/123,3:124,4:124,5:141",
+    "FMO_ROOM_MAPS": "1:121,2:122/123,3:121,4:121,5:141",
     "FMO_UDP_POP_POS_MAP": ("101:-2.57,2.99,-43.44,0;102:0.52,3.11,9.41,0;"
                             "121:4.00,0.00,1.56,1.571;122:0.20,0.00,3.11,0;"
                             "123:-5.10,0.00,-0.83,0;124:-0.46,0.00,16.69,0;"

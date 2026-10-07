@@ -367,7 +367,7 @@ BRIEFING_ZONES = tuple(int(x, 0) for x in
                        .replace(" ", "").split(",") if x)
 
 
-ROOM_MAPS_DEFAULT = "1:121,2:122/123,3:124,4:124,5:141"
+ROOM_MAPS_DEFAULT = "1:121,2:122/123,3:121,4:121,5:141"
 
 
 def parse_room_maps_nation(spec):

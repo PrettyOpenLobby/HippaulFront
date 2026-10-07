@@ -2773,8 +2773,8 @@ def _change_room_pins():
     ok = True
     # (1) the maps, per kind and per nation
     _o, _u = _mv.parse_room_maps_nation("")
-    _m_ok = (_o == {1: 121, 2: 122, 3: 124, 4: 124, 5: 141}
-             and _u == {1: 121, 2: 123, 3: 124, 4: 124, 5: 141}
+    _m_ok = (_o == {1: 121, 2: 122, 3: 121, 4: 121, 5: 141}
+             and _u == {1: 121, 2: 123, 3: 121, 4: 121, 5: 141}
              and _mv.parse_room_maps("") == _o)
     _o2, _u2 = _mv.parse_room_maps_nation("1:124,2:123/122")
     _m_ok &= _o2[1] == 124 and _u2[1] == 124 and _o2[2] == 123 and _u2[2] == 122 and _o2[5] == 141
@@ -2790,9 +2790,9 @@ def _change_room_pins():
                   and _mv.place_map(509, 2, nation=2)[0] == 123
                   and _mv.place_map(509, 2)[0] == 122
                   and _mv.place_map(100, 1, nation=2)[0] == 121
-                  and _mv.place_map(100, 3)[0] == 124 and _mv.place_map(100, 4)[0] == 124
+                  and _mv.place_map(100, 3)[0] == 121 and _mv.place_map(100, 4)[0] == 121
                   and _mv.place_map(0, 5, nation=2)[0] == 141)
-    print(f"  change room maps: Room 121, Briefing 122 O.C.U. / 123 U.S.N., Room B/C 124, "
+    print(f"  change room maps: Room 121, Briefing 122 O.C.U. / 123 U.S.N., Room B/C 121, "
           f"Hangar 141: {'OK' if _m_ok else 'FAIL ' + str((_o, _u, _mv.ROOM_MAPS, _mv.ROOM_MAPS_USN))}")
     ok &= _m_ok
     # (2) the room people are in the catalogue, dressed from their own rows
