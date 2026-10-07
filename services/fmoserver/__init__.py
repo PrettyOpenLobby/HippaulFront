@@ -109,6 +109,8 @@
                       points.
     battlepop.py      The battle POP knobs: arena position, the gate pop, the dummy enemy and
                       the referee.
+    roomcast.py       Who stands in a Change Room "Room", per zone kind: the room people's
+                      catalogue rows and the shipped default cast.
     npccast.py        The lobby NPC cast: FMO_UDP_POP_NPC parsing, face angles, HQ marks and the
                       U.S.N. counterparts.
     npcroster.py      Which cast a zone pops: layout bands, per-host rosters, NPC POP records
@@ -157,8 +159,9 @@ from . import (
     missionboard, missionbook, sectorwins, areatargets, warmap, warstate, sortie, sortiepush,
     battlemaps, battlegroups, grouplogin, withdraw, scriptcall, resultpush, battleend,
     lobbymessage, timesync, pushes, trade, msgnames, pilotrecord, settlement, session,
-    tcpserver, community, udpconfig, popnames, poplook, popnation, popparts, battlepop, npccast,
-    npcroster, room, worldchannel, groupchannel, missiongroups, rooms, squad, roomrelay, peerlink,
+    tcpserver, community, udpconfig, popnames, poplook, popnation, popparts, battlepop, roomcast,
+    npccast, npcroster, room, worldchannel, groupchannel, missiongroups, rooms, squad, roomrelay,
+    peerlink,
     referee,
     datagram, devtool, gatetool, loot, penalty, solo, defection, main, selftests,
 )
@@ -173,7 +176,7 @@ __all__ = [
     'battlegroups', 'grouplogin', 'withdraw', 'scriptcall', 'resultpush', 'battleend',
     'lobbymessage', 'timesync', 'pushes', 'trade', 'pilotrecord', 'settlement', 'session',
     'tcpserver', 'community', 'udpconfig', 'popself', 'popnames', 'poplook', 'popnation',
-    'popparts', 'popsweep', 'battlepop', 'npccast', 'npcroster', 'room', 'worldchannel',
+    'popparts', 'popsweep', 'battlepop', 'roomcast', 'npccast', 'npcroster', 'room', 'worldchannel',
     'groupchannel', 'missiongroups', 'rooms', 'squad', 'roomrelay', 'peerlink', 'referee', 'datagram', 'devtool',
     'gatetool', 'loot', 'penalty', 'solo', 'defection', 'main', 'selftests',
 ]

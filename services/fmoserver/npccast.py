@@ -4,6 +4,7 @@ import math
 import os
 from .deps import fmolayout, fmoworld
 from .knobs import _env_int
+from . import roomcast
 
 
 #: WARNING:KEY: PLAN 3.1 -- NPC SOURCE RECORDS. `FMO_UDP_POP_NPC` pops the "source"
@@ -211,6 +212,7 @@ if HQ_MARKS:
 #: "the Operator"; nothing in the data ties them to a key.
 _USN_STAFF = {100: 101, 102: 104, 103: 105, 106: 107,   # D87, per its E060 branches
               30: 32, 31: 33}                            # D07, per its E060 branches
+_USN_STAFF.update(roomcast.ROOM_USN)                     # the Change Room people
 
 
 def usn_counterpart(typecode):

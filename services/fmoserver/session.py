@@ -1395,7 +1395,7 @@ class Session(
                     _zone = zoneentry.faction_mapkind(mk, _gnat)
                 _place, _pwhy = move.resolve_place_pick(_zone, category, picked)
                 if _place is not None:
-                    _pm, _pm_why = move.place_map(_zone, _place[1], mn)
+                    _pm, _pm_why = move.place_map(_zone, _place[1], mn, nation=_gnat)
                     log(f"{self.peer}   PLACE PICK: {move.place_name(_place)} -> MapNo "
                         f"{_pm} ({_pm_why}); grant +0x18 = {_place[1]} "
                         f"({move.PLACE_KIND_NAMES[_place[1]]}); people there now: "
@@ -1407,7 +1407,7 @@ class Session(
                     _cur = move.WORLD_PLACES.get(self.peer.split(":")[0])
                     if _cur is not None:
                         _place = _cur
-                        mn, _ = move.place_map(_zone, _cur[1], mn)
+                        mn, _ = move.place_map(_zone, _cur[1], mn, nation=_gnat)
                         kind = _cur[1]
             if _place is not None:
                 pass

@@ -140,7 +140,156 @@ if BATTLE_POS_SPEC:
 else:
     BATTLE_POS = None
 
-BATTLE_GATE_POP = os.environ.get("FMO_BATTLE_GATE_POP", "").strip() not in ("", "0")
+
+#: KEY: FMO_BATTLE_SPAWNS -- PER-MAP BATTLE SPAWN POINTS (2026-10-06). Default 1
+#: (on); 0 = the old behaviour, every battle at FMO_BATTLE_POS and the squad a
+#: line FMO_BATTLE_ENEMIES' distance along +x from it.
+#:
+#: WHY. On map 471 (Frontline 509 sector 32, prod 2026-10-06 15:55Z) the pilot
+#: started on a roof and the three enemies stacked on one another. Decoded
+#: from that battle's cmd 23/24 movement records (x/y/z = int16 at state+8,
+#: / 3.75): the pilot's first position was (64.0, 46.4, 0.0), on top of the
+#: building at x 0..64, z -16..48 (top 47.5); the enemies were at (184, 47.7,
+#: 0) twice and (184, 97.6, 0), the third standing on the other two.
+#:
+#: KEY: z WAS 0 FOR EVERY UNIT IN EVERY NORMAL BATTLE IN THE LOG, and the
+#: reason is body+0x27: fmoworld.POP_SIDE is the HIGH BYTE of the z float
+#: (POP_POS = 0x1C, z = 0x24..0x27). Writing side 0 turns z = 64.0
+#: (0x42800000) into 1.2e-38, side 1 into 2.4e-38. In the one battle that sent
+#: no side (a Coliseum pilot with no character, 16:16Z) every unit kept its z:
+#: (64, 32, 64), (184, 32, 24), (184, 82.1, 64), (184, 32, 104). And the side
+#: byte does nothing else on the battle path: friend/foe is body+0x7C, the
+#: NATION (fmo-dummy-cannot-die note, 2026-09-11, live probe). So a POP placed
+#: from this table sends NO side byte (side=None), or the table's z would be
+#: thrown away exactly like FMO_BATTLE_POS's was.
+#:
+#: The table (fmodata/fmo-battle-spawns.tsv, tools/fmodatagen/fmospawns.py):
+#: per battle map, side A's and side B's points, a y, and 12 clear slots per
+#: side along its front line (0-3 the pilots', 4-11 the squad's). A pilot takes
+#: its side's point (side 0 = A, side 1 = B: popnation.battle_side_for, the
+#: arena team in a match); the squad takes the OTHER side's slots. A map with
+#: no row keeps FMO_BATTLE_POS and the old squad line, byte for byte.
+#: WARNING: the points avoid every object in the map's placement table but not
+#: terrain relief (hills are in the undecoded terrain mesh), and y is an
+#: estimate set 4 below the ground: the client lifts a unit popped under the
+#: surface onto it (every battle so far popped at y 5), so low is the proven
+#: side to err on.
+BATTLE_SPAWNS = _env_int("FMO_BATTLE_SPAWNS", "1") != 0
+BATTLE_SPAWNS_TSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fmodata",
+    "fmo-battle-spawns.tsv")
+#: slots 0..SPAWN_PILOT_SLOTS-1 of a side are its pilots', the rest its squad's
+SPAWN_PILOT_SLOTS = 4
+#: the line a squad falls back to when a row has too few slots for it
+SPAWN_FALLBACK_GAP = 20.0
+
+
+def _parse_slots(text):
+    out = []
+    for tok in (text or "").split():
+        x, _, z = tok.partition(":")
+        out.append((float(x), float(z)))
+    return out
+
+
+def load_battle_spawns(path=None):
+    """{mapno: {"a", "b": (x, z), "y", "a_slots", "b_slots": [(x, z)],
+    "source"}} from fmo-battle-spawns.tsv. {} when the file is absent; a
+    malformed row is skipped, never fatal."""
+    rows = {}
+    try:
+        with open(path or BATTLE_SPAWNS_TSV, encoding="utf-8") as f:
+            cols = f.readline().rstrip("\r\n").split("\t")
+            for line in f:
+                r = dict(zip(cols, line.rstrip("\r\n").split("\t")))
+                try:
+                    m = int(r["map"])
+                    row = {"a": (float(r["ax"]), float(r["az"])),
+                           "b": (float(r["bx"]), float(r["bz"])),
+                           "y": float(r["y"]),
+                           "a_slots": _parse_slots(r.get("a_slots")),
+                           "b_slots": _parse_slots(r.get("b_slots")),
+                           "source": r.get("source", "")}
+                except (KeyError, ValueError):
+                    continue
+                for k in ("a", "b"):
+                    if not row[k + "_slots"]:
+                        row[k + "_slots"] = [row[k]]
+                rows[m] = row
+    except OSError:
+        return {}
+    return rows
+
+
+BATTLE_SPAWN_ROWS = load_battle_spawns()
+
+
+def spawn_side_key(side):
+    """'b' for side 1, else 'a' (side 0 or unknown)."""
+    return "b" if side == 1 else "a"
+
+
+def spawn_row(mapno, rows=None):
+    """The table row for battle map `mapno`, or None (knob off, no map, no row)."""
+    if not BATTLE_SPAWNS and rows is None:
+        return None
+    rows = BATTLE_SPAWN_ROWS if rows is None else rows
+    try:
+        return rows.get(int(mapno)) if mapno is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def battle_spawn_pos(mapno, side, index=0, rows=None):
+    """((x, y, z, 0.0), why) for a pilot of `side` taking pilot slot `index`
+    on battle map `mapno`, or (None, why) when the table has no row."""
+    row = spawn_row(mapno, rows)
+    if row is None:
+        return None, f"no fmo-battle-spawns.tsv row for map {mapno!r}"
+    k = spawn_side_key(side)
+    slots = row[k + "_slots"][:SPAWN_PILOT_SLOTS] or [row[k]]
+    x, z = slots[index % len(slots)]
+    return ((x, row["y"], z, 0.0),
+            f"fmo-battle-spawns.tsv map {int(mapno)} side {k.upper()} pilot slot "
+            f"{index % len(slots)} ({row['source']})")
+
+
+def squad_spawn_positions(mapno, pilot_side, n, rows=None):
+    """n (x, y, z, 0.0) drop points for the enemy squad of a `pilot_side`
+    pilot: the OTHER side's squad slots (4..11), then, if the row has too few,
+    a line SPAWN_FALLBACK_GAP apart behind its point. None without a row."""
+    row = spawn_row(mapno, rows)
+    if row is None:
+        return None
+    k = "a" if spawn_side_key(pilot_side) == "b" else "b"
+    slots = list(row[k + "_slots"][SPAWN_PILOT_SLOTS:])
+    if len(slots) < n:
+        px, pz = row[k]
+        ox, oz = row["a" if k == "b" else "b"]
+        ux, uz = px - ox, pz - oz
+        d = math.hypot(ux, uz) or 1.0
+        ux, uz = ux / d, uz / d                     # away from the pilots
+        vx, vz = -uz, ux
+        i = 0
+        while len(slots) < n:
+            i += 1
+            back = 2 * SPAWN_FALLBACK_GAP + SPAWN_FALLBACK_GAP * (i // 5)
+            col = (i % 5) - 2
+            slots.append((round(px + back * ux + col * SPAWN_FALLBACK_GAP * vx, 1),
+                          round(pz + back * uz + col * SPAWN_FALLBACK_GAP * vz, 1)))
+    return [(x, row["y"], z, 0.0) for x, z in slots[:n]]
+
+
+def spawn_pilot_index(chan, side, mates):
+    """The lowest pilot slot of `side` no battle room-mate already holds."""
+    taken = {getattr(o, "spawn_slot", None) for o in mates
+             if getattr(o, "spawn_side", None) == side}
+    i = 0
+    while i in taken:
+        i += 1
+    return i
+
+BATTLE_GATE_POP =os.environ.get("FMO_BATTLE_GATE_POP", "").strip() not in ("", "0")
 #: The client_kind the gate POP carries. 3 is the only value that sets +0x10DC;
 #: the knob exists so a run can prove the gate pop is what moved the state.
 BATTLE_GATE_KIND = _env_int("FMO_BATTLE_GATE_KIND", "3")

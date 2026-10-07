@@ -2475,6 +2475,270 @@ def _mission_group_fee_pins():
     return ok
 
 
+def _battle_spawn_pins():
+    """PER-MAP BATTLE SPAWNS (battlepop.BATTLE_SPAWNS, fmo-battle-spawns.tsv)."""
+    import math
+    import tempfile
+    import types as _ty
+    ok = True
+
+    def _apart(pts, d=12.0):
+        return all(math.hypot(a[0] - b[0], a[2] - b[2]) >= d
+                   for i, a in enumerate(pts) for b in pts[i + 1:])
+
+    # (1) the loader: a written table round-trips; a malformed row is skipped;
+    # a missing file is an empty table, never an import failure
+    _tmp = os.path.join(tempfile.mkdtemp(prefix="fmo-spawns-"), "spawns.tsv")
+    _a_sl = " ".join(f"{-96 + 20 * k}:-32" for k in range(12))
+    _b_sl = " ".join(f"{112 - 20 * k}:96" for k in range(12))
+    with open(_tmp, "w", encoding="utf-8") as f:
+        f.write("map\tax\taz\tbx\tbz\ty\ta_slots\tb_slots\tsource\tnotes\n")
+        f.write(f"471\t-96\t-32\t112\t96\t28\t{_a_sl}\t{_b_sl}\tselftest\t\n")
+        f.write("472\tx\t0\t0\t0\t0\t\t\tbad\t\n")
+        f.write("473\t0\t-120\t0\t120\t30\t0:-120\t0:120 20:120\tshort\t\n")
+    _rows = battlepop.load_battle_spawns(_tmp)
+    _l_ok = (sorted(_rows) == [471, 473] and _rows[471]["a"] == (-96.0, -32.0)
+             and len(_rows[471]["b_slots"]) == 12 and _rows[471]["y"] == 28.0
+             and battlepop.load_battle_spawns(_tmp + ".absent") == {})
+    print(f"  spawns: the table loads, a bad row is skipped, no file = no rows: "
+          f"{'OK' if _l_ok else 'FAIL'}")
+    ok &= _l_ok
+
+    # (2) a pilot takes its own side's point (side 0 / unknown = A, 1 = B), a
+    # second pilot of the side the next slot; a map without a row falls back
+    _pa, _ = battlepop.battle_spawn_pos(471, 0, 0, rows=_rows)
+    _pb, _ = battlepop.battle_spawn_pos(471, 1, 0, rows=_rows)
+    _pn, _ = battlepop.battle_spawn_pos(471, None, 0, rows=_rows)
+    _p1, _ = battlepop.battle_spawn_pos(471, 0, 1, rows=_rows)
+    _p5, _ = battlepop.battle_spawn_pos(471, 0, 5, rows=_rows)
+    _px, _why = battlepop.battle_spawn_pos(999, 0, 0, rows=_rows)
+    _mates = [_ty.SimpleNamespace(spawn_side=0, spawn_slot=0),
+              _ty.SimpleNamespace(spawn_side=1, spawn_slot=1),
+              _ty.SimpleNamespace()]
+    _p_ok = (_pa == (-96.0, 28.0, -32.0, 0.0) and _pb == (112.0, 28.0, 96.0, 0.0)
+             and _pn == _pa and _p1 == (-76.0, 28.0, -32.0, 0.0) and _p5 == _p1
+             and _px is None and "no fmo-battle-spawns.tsv row" in _why
+             and battlepop.spawn_pilot_index(None, 0, _mates) == 1
+             and battlepop.spawn_pilot_index(None, 1, _mates) == 0)
+    print(f"  spawns: side A/B points, the next pilot slot, no row -> fallback: "
+          f"{'OK' if _p_ok else 'FAIL'}")
+    ok &= _p_ok
+
+    # (3) the squad stands on the OTHER side, spread: no two within 12, all far
+    # from the pilot; a row with too few slots still spreads them
+    _sqa = battlepop.squad_spawn_positions(471, 0, 3, rows=_rows)
+    _sqb = battlepop.squad_spawn_positions(471, 1, 8, rows=_rows)
+    _sqs = battlepop.squad_spawn_positions(473, 0, 5, rows=_rows)
+    _s_ok = (_sqa == [(32.0, 28.0, 96.0, 0.0), (12.0, 28.0, 96.0, 0.0), (-8.0, 28.0, 96.0, 0.0)]
+             and _apart(_sqa) and len(_sqb) == 8 and _apart(_sqb)
+             and all(p[2] == -32.0 for p in _sqb)
+             and len(_sqs) == 5 and _apart(_sqs)
+             and all(math.hypot(p[0], p[2] + 120) >= 100 for p in _sqs)
+             and battlepop.squad_spawn_positions(999, 0, 3, rows=_rows) is None)
+    print(f"  spawns: the squad takes the other side's slots, >= 12 apart (a short "
+          f"row falls back to a spread line): {'OK' if _s_ok else 'FAIL'}")
+    ok &= _s_ok
+
+    # (4) battle_squad_for places a NEW squad on the given positions, else the
+    # old line off the drop point
+    _sv = (dict(squad.BATTLE_SQUADS), {h: referee.BATTLE_STATE.get(h) for h in ("spA", "spB")})
+    try:
+        squad.BATTLE_SQUADS.clear()
+        for _h in ("spA", "spB"):
+            referee.battle_state(_h, reset=True)
+        _cA = _ty.SimpleNamespace(addr=("spA", 1), key=b"%xbattle", last_fire=None)
+        _cB = _ty.SimpleNamespace(addr=("spB", 1), key=b"%xbattle", last_fire=None)
+        rooms.WORLD_MAPS["spA"], rooms.WORLD_MAPS["spB"] = 471, 418
+        _q1, _ = squad.battle_squad_for(_cA, (0, 0, 0, 0), 2, [], mates=[], n=3,
+                                        level=1, rows=[], positions=_sqa)
+        _q2, _ = squad.battle_squad_for(_cB, (10.0, 5.0, 20.0, 0.0), 2, [], mates=[], n=3,
+                                        level=1, rows=[])
+        _b_ok = (_q1["pos"] == _sqa and _q1["pos_src"] == "spawn table"
+                 and _q2["pos_src"] == "line off the drop point"
+                 and _q2["pos"] == squad.squad_positions((10.0, 5.0, 20.0, 0.0), 3,
+                                                         squad.BATTLE_ENEMIES[1], squad.squad_gap()))
+    finally:
+        squad.BATTLE_SQUADS.clear()
+        squad.BATTLE_SQUADS.update(_sv[0])
+        for _h, _st in _sv[1].items():
+            if _st is None:
+                referee.BATTLE_STATE.pop(_h, None)
+            else:
+                referee.BATTLE_STATE[_h] = _st
+        rooms.WORLD_MAPS.pop("spA", None)
+        rooms.WORLD_MAPS.pop("spB", None)
+    print(f"  spawns: a new squad stands on the table's slots, without them on the "
+          f"old line: {'OK' if _b_ok else 'FAIL'}")
+    ok &= _b_ok
+
+    # (5) WHY a table POP sends no side byte: body+0x27 is the z float's high
+    # byte. z survives with side None and is destroyed by side 0 (the twin)
+    _zb = fmoworld.record_pop(0x2222, unit_type=0, pos=(112.0, 28.0, 96.0, 0.0))
+    _z0 = fmoworld.record_pop(0x2222, unit_type=0, pos=(112.0, 28.0, 96.0, 0.0), side=0)
+    _zoff = fmoworld.REC_HDR + fmoworld.POP_POS + 8
+    _z_ok = (fmoworld.POP_SIDE == fmoworld.POP_POS + 11
+             and struct.unpack_from("<f", _zb, _zoff)[0] == 96.0
+             and abs(struct.unpack_from("<f", _z0, _zoff)[0]) < 1e-30)
+    print(f"  spawns: body+0x27 (side) is the z float's top byte -- z 96 survives "
+          f"only without it: {'OK' if _z_ok else 'FAIL'}")
+    ok &= _z_ok
+
+    # (6) the knob: on unless the env says otherwise; off -> no row at all
+    _k_ok = (battlepop.BATTLE_SPAWNS
+             or os.environ.get("FMO_BATTLE_SPAWNS", "").strip() not in ("", "1"))
+    if not battlepop.BATTLE_SPAWNS:
+        _k_ok = _k_ok and battlepop.spawn_row(471) is None
+    print(f"  knob: FMO_BATTLE_SPAWNS defaults ON, 0 = FMO_BATTLE_POS for every "
+          f"map ({'on' if battlepop.BATTLE_SPAWNS else 'off'}): {'OK' if _k_ok else 'FAIL'}")
+    ok &= _k_ok
+
+    # (7) the shipped table, when it was built: every row's points inside the
+    # POP guard, the sides apart, every side's slots >= 12 apart
+    if not battlepop.BATTLE_SPAWN_ROWS:
+        print("  spawns: shipped table SKIP (fmodata/fmo-battle-spawns.tsv missing; "
+              "tools/fmodatagen/fmospawns.py builds it)")
+    else:
+        _bad = []
+        for _m, _r in battlepop.BATTLE_SPAWN_ROWS.items():
+            for _k in ("a", "b"):
+                _pts = [(x, 0.0, z) for x, z in _r[_k + "_slots"]]
+                if not _apart(_pts) or any(max(abs(p[0]), abs(p[2])) > 300 for p in _pts):
+                    _bad.append((_m, _k))
+            if math.hypot(_r["a"][0] - _r["b"][0], _r["a"][1] - _r["b"][1]) < 100:
+                _bad.append((_m, "sep"))
+        _t_ok = not _bad and 471 in battlepop.BATTLE_SPAWN_ROWS
+        print(f"  spawns: shipped table, {len(battlepop.BATTLE_SPAWN_ROWS)} maps, "
+              f"slots inside +/-300 and >= 12 apart, sides >= 100 apart, map 471 "
+              f"present: {'OK' if _t_ok else 'FAIL ' + str(_bad[:5])}")
+        ok &= _t_ok
+    return ok
+
+
+def _change_room_pins():
+    """CHANGE ROOM maps and casts (move.ROOM_MAPS, roomcast.py, 2026-10-06):
+    Room = 121, Briefing 122 / 123 by nation, Room B / C = 124, Hangar 141;
+    a Room's cast follows the ZONE kind it hangs off; an old plain 'room'
+    layout band is still honoured."""
+    import tempfile as _tf
+    from . import move as _mv, npccast as _nc, npcroster as _nr, popnation as _pn
+    from . import roomcast as _rc, zoneentry as _ze
+    ok = True
+    # (1) the maps, per kind and per nation
+    _o, _u = _mv.parse_room_maps_nation("")
+    _m_ok = (_o == {1: 121, 2: 122, 3: 124, 4: 124, 5: 141}
+             and _u == {1: 121, 2: 123, 3: 124, 4: 124, 5: 141}
+             and _mv.parse_room_maps("") == _o)
+    _o2, _u2 = _mv.parse_room_maps_nation("1:124,2:123/122")
+    _m_ok &= _o2[1] == 124 and _u2[1] == 124 and _o2[2] == 123 and _u2[2] == 122 and _o2[5] == 141
+    for _bad in ("2:122/999", "6:121", "1:x"):
+        try:
+            _mv.parse_room_maps_nation(_bad)
+            _m_ok = False
+        except SystemExit:
+            pass
+    if (os.environ.get("FMO_ROOM_MAPS", "").strip() or _mv.ROOM_MAPS_DEFAULT) == _mv.ROOM_MAPS_DEFAULT:
+        _m_ok &= (_mv.ROOM_MAPS == _o and _mv.ROOM_MAPS_USN == _u
+                  and _mv.place_map(509, 2, nation=1)[0] == 122
+                  and _mv.place_map(509, 2, nation=2)[0] == 123
+                  and _mv.place_map(509, 2)[0] == 122
+                  and _mv.place_map(100, 1, nation=2)[0] == 121
+                  and _mv.place_map(100, 3)[0] == 124 and _mv.place_map(100, 4)[0] == 124
+                  and _mv.place_map(0, 5, nation=2)[0] == 141)
+    print(f"  change room maps: Room 121, Briefing 122 O.C.U. / 123 U.S.N., Room B/C 124, "
+          f"Hangar 141: {'OK' if _m_ok else 'FAIL ' + str((_o, _u, _mv.ROOM_MAPS, _mv.ROOM_MAPS_USN))}")
+    ok &= _m_ok
+    # (2) the room people are in the catalogue, dressed from their own rows
+    _c_ok = all(fmoworld.NPC_CATALOGUE.get(k) == v for k, v in _rc.ROOM_CATALOGUE.items())
+    _c_ok &= (fmoworld.NPC_CATALOGUE[300][:2] == ("James", "Douglas")
+              and fmoworld.NPC_CATALOGUE[300][3:5] == (53, 101)
+              and fmoworld.NPC_CATALOGUE[301][3:5] == (53, 201)
+              and fmoworld.NPC_CATALOGUE[304][3:5] == (58, 152)
+              and fmoworld.NPC_CATALOGUE[305][3:5] == (58, 252)
+              and fmolayout.PLACE_BANDS.get(1) == "room"
+              and fmolayout.place_band_ids(1, 100) == ["room_hq", "room"]
+              and fmolayout.place_band_ids(1, 600) == ["room"]
+              and fmolayout.place_band_ids(3, 100) == ["roomb"])
+    print(f"  change room people in the catalogue (300..307), zone bands resolve: "
+          f"{'OK' if _c_ok else 'FAIL'}")
+    ok &= _c_ok
+    if _nc.NPC_LAYOUT is None:
+        return ok
+    # (3) the cast per zone kind, from the shipped defaults (an empty layout)
+    _lp = os.path.join(_tf.mkdtemp(prefix="fmo-roomcast-"), "layout.json")
+    _saved = (_nc.NPC_LAYOUT.path, _nc.NPC_LAYOUT._mtime, _nc.NPC_LAYOUT._data)
+    _saved_pn, _saved_npc = _pn.pop_nation_for, _ze.NATION_PER_CHARACTER
+    _h = "selftest-roomcast"
+    _saved_pl = _mv.WORLD_PLACES.get(_h)
+    _nc.NPC_LAYOUT.path, _nc.NPC_LAYOUT._mtime = _lp, None
+
+    def _fw(d):
+        return fmolayout.face_to_wire(d, _nc.FACE_SIGN)
+
+    def _cast(zone):
+        b, r, _src = _nr.place_band_roster(1, zone)
+        return b, ({u: (c, p) for u, _t, p, c in r[0]} if r else None)
+
+    def _served(zone, nation):
+        _mv.WORLD_PLACES[_h] = (zone, 1, 1)
+        _pn.pop_nation_for = lambda host: (nation, "selftest")
+        r = _nr.roster_for(_h)
+        return {u: c for u, _t, _p, c in r[0]}, r[1], r[2]
+    try:
+        _ze.NATION_PER_CHARACTER = True
+        _hq, _hq3, _oc, _oc4, _fz, _col = (_cast(z) for z in (100, 300, 200, 400, 509, 600))
+        _sg = (102, (-0.46, 0.0, 13.69, _fw(0)))
+        _d_ok = (_hq == ("room_hq", {0x82081022: (300, (5.42, 0.0, 1.56, _fw(270))),
+                                     0x82081023: (302, (6.58, 0.0, 11.03, _fw(90))),
+                                     0x82080800: _sg})
+                 and _hq3 == _hq
+                 and _oc == ("room_occ", {0x82081012: (306, (5.42, 0.0, 1.56, _fw(270))),
+                                          0x82080800: _sg})
+                 and _oc4 == _oc
+                 and _fz == ("room_fz", {0x82081022: (304, (5.42, 0.0, 1.56, _fw(270))),
+                                         0x82080800: _sg})
+                 and _col == ("room", None))
+        print(f"  room cast per zone kind: HQ Douglas + Harada, occupied Sassoon, frontline "
+              f"Forster, the sergeant in all: {'OK' if _d_ok else 'FAIL ' + str((_hq, _oc, _fz, _col))}")
+        ok &= _d_ok
+        # (4) the pilot's nation picks the person: U.S.N. pilots meet Klein,
+        # Burnet, Wright, Miller, and Goodwin as the sergeant
+        if _mv.PLACES:
+            _sv = {(z, n): _served(z, n) for z in (100, 200, 509) for n in (1, 2)}
+            _n_ok = (_sv[(100, 1)][0] == {0x82081022: 300, 0x82081023: 302, 0x82080800: 102}
+                     and _sv[(100, 2)][0] == {0x82081022: 301, 0x82081023: 303, 0x82080800: 104}
+                     and _sv[(200, 1)][0] == {0x82081012: 306, 0x82080800: 102}
+                     and _sv[(200, 2)][0] == {0x82081012: 307, 0x82080800: 104}
+                     and _sv[(509, 1)][0] == {0x82081022: 304, 0x82080800: 102}
+                     and _sv[(509, 2)][0] == {0x82081022: 305, 0x82080800: 104}
+                     and _sv[(100, 2)][1].get(0x82080800) == ("Training", "Sergeant")
+                     and "room_hq" in _sv[(100, 1)][2])
+            print(f"  room cast per nation (U.S.N.: Klein, Burnet, Wright, Miller, Goodwin): "
+                  f"{'OK' if _n_ok else 'FAIL ' + str(_sv)}")
+            ok &= _n_ok
+        # (5) an OLD layout with only the plain 'room' band still serves it, in
+        # every zone; a zone band in the file beats it for its own zones
+        _old = [{"key": 0x82080800, "x": -0.46, "y": 0.0, "z": 13.69, "face": 0,
+                 "cat": 102, "label": "Training.Sergeant"}]
+        _nc.NPC_LAYOUT.set_band("room", 124, _old)
+        _p100, _p200, _p600 = _cast(100), _cast(200), _cast(600)
+        _nc.NPC_LAYOUT.set_band("room_hq", 121, [{"key": 0x82081022, "x": 5.0, "y": 0.0,
+                                                  "z": 1.0, "face": 270, "cat": 300}])
+        _q100, _q200 = _cast(100), _cast(200)
+        _l_ok = (_p100 == ("room", {0x82080800: _sg}) and _p200 == _p100 and _p600 == _p100
+                 and _q100 == ("room_hq", {0x82081022: (300, (5.0, 0.0, 1.0, _fw(270)))})
+                 and _q200 == _p100)
+        print(f"  an old plain 'room' layout band is still honoured; a zone band wins "
+              f"for its zones: {'OK' if _l_ok else 'FAIL ' + str((_p100, _q100, _q200))}")
+        ok &= _l_ok
+    finally:
+        _nc.NPC_LAYOUT.path, _nc.NPC_LAYOUT._mtime, _nc.NPC_LAYOUT._data = _saved
+        _pn.pop_nation_for, _ze.NATION_PER_CHARACTER = _saved_pn, _saved_npc
+        _mv.WORLD_PLACES.pop(_h, None)
+        if _saved_pl is not None:
+            _mv.WORLD_PLACES[_h] = _saved_pl
+    return ok
+
+
 def selftest():
     """Checks that need no client: the checksum against real captured bytes.
 
@@ -5072,7 +5336,9 @@ def _selftest_run(test_db):
         _pr_ok &= _live == {(200, 0, 1): 2, (200, 0, 2): 1}
         _pr_ok &= move.place_rows(200, 0) == [(1, 2), (2, 1), (3, 0)]
         _pr_ok &= npcroster.roster_for(_pa[0])[0] is not None
-        move.WORLD_PLACES[_pa[0]] = (200, 1, 1)
+        # a Room has a per-zone cast since 2026-10-06 (roomcast.py); Room B
+        # (kind 3) has no band and still pops nobody
+        move.WORLD_PLACES[_pa[0]] = (200, 3, 1)
         _pr_ok &= npcroster.roster_for(_pa[0])[0] == [] and "not a lobby" in npcroster.roster_for(_pa[0])[2]
     finally:
         groupchannel.WORLD_PEERS.clear(); groupchannel.WORLD_PEERS.update(_saved[0])
@@ -5834,7 +6100,11 @@ def _selftest_run(test_db):
                       f"stream: {'OK' if _self is None else 'FAIL'}")
                 ok &= _self is None
 
-            # Different zones are different rooms.
+            # Different zones are different rooms. The depop is pinned OFF for
+            # this pump (it is ON by default since 2026-10-06); the block
+            # below turns it on and off itself, then restores the default.
+            _depop_default = room.ROOM_DEPOP
+            room.ROOM_DEPOP = False
             rooms.WORLD_MAPS[B[0]] = 121
             outs = pump(A, 3, 4, 2)
             others = rooms.room_mates(groupchannel.WORLD_PEERS[A])
@@ -5849,7 +6119,7 @@ def _selftest_run(test_db):
             # unacked record is retransmitted by design, so every pump below
             # acks what was pending BEFORE it: only records queued in that
             # very round show up in `outs`.
-            _saved_depop = room.ROOM_DEPOP
+            _saved_depop = _depop_default
 
             def _ack_all():
                 return groupchannel.WORLD_PEERS[A].tx_base + len(groupchannel.WORLD_PEERS[A].pending)
@@ -5862,24 +6132,27 @@ def _selftest_run(test_db):
                 room.ROOM_DEPOP = True
                 groupchannel.WORLD_PEERS[A].remotes[alias].gone = None
                 outs = pump(A, 4, 5, _ack_all())
+                # a LOBBY channel: the lobby depop cmd 0xD3, body u32 UnitID
+                # (cmd 8 is the battle class's and the lobby ignores it)
                 deps = [r for o in outs if o and o["peer"] == 1
+                        for r in o["records"] if r[2] == fmoworld.CMD_LOBBY_DEPOP]
+                old8 = [r for o in outs if o and o["peer"] == 1
                         for r in o["records"] if r[2] == fmoworld.CMD_DEPOP]
-                dp = fmoworld.parse_depop(deps[0][3]) if deps else None
                 on_alias = [o for o in outs if o and o["peer"] == alias]
-                good = (len(deps) == 1 and dp is not None
-                        and dp["unit_id"] == alias
-                        and dp["status"] == room.ROOM_DEPOP_STATUS
+                good = (len(deps) == 1 and not old8
+                        and struct.unpack_from("<I", deps[0][3], 0)[0] == alias
                         and not on_alias
                         and alias not in groupchannel.WORLD_PEERS[A].remotes
                         and B not in groupchannel.WORLD_PEERS[A].alias_of)
-                print(f"  room: FMO_UDP_ROOM_DEPOP=1 -- a leaver's alias gets "
-                      f"ONE cmd 8 on the SELF stream (UnitID {alias:#x} "
-                      f"Status {room.ROOM_DEPOP_STATUS}) and is forgotten: "
+                print(f"  room: FMO_UDP_ROOM_DEPOP=1 -- a lobby leaver's alias "
+                      f"gets ONE cmd 0xD3 on the SELF stream (UnitID {alias:#x}) "
+                      f"and is forgotten: "
                       f"{'OK' if good else 'FAIL'}")
                 ok &= good
                 outs = pump(A, 5, 6, _ack_all())
                 again = [r for o in outs if o and o["peer"] == 1
-                         for r in o["records"] if r[2] == fmoworld.CMD_DEPOP]
+                         for r in o["records"]
+                         if r[2] in (fmoworld.CMD_DEPOP, fmoworld.CMD_LOBBY_DEPOP)]
                 print(f"  room: and it is queued ONCE, not on every datagram: "
                       f"{'OK' if not again else 'FAIL'}")
                 ok &= not again
@@ -5903,7 +6176,8 @@ def _selftest_run(test_db):
                 n_marked = rooms.room_left(B[0], "0x0152 LOG OUT")
                 outs = pump(A, 7, 8, _ack_all())
                 deps = [r for o in outs if o and o["peer"] == 1
-                        for r in o["records"] if r[2] == fmoworld.CMD_DEPOP]
+                        for r in o["records"]
+                        if r[2] in (fmoworld.CMD_DEPOP, fmoworld.CMD_LOBBY_DEPOP)]
                 rs2 = groupchannel.WORLD_PEERS[A].remotes.get(alias2)
                 kept = (n_marked == 1 and not deps and rs2 is not None
                         and rs2.gone == "0x0152 LOG OUT"
@@ -11879,8 +12153,13 @@ def _selftest_run(test_db):
                  and _nb0[fmoworld.POP_HP_SCALE] > 0
                  and struct.unpack_from("<I", _nb0, fmoworld.POP_CLIENT_KIND)[0] == 1
                  and fmoworld.POP_HP_SCALE >= battlepop.POP_AI_BRAIN + 4)
+    # 1b: paint. A U.S.N. squad wanzer wears D30 6 (Dark Gray) in both colour
+    # slots and camo 101; a human (UnitType 4) gets none (+0x1B8 = NPC number)
+    _n_ok &= _nc(2, struct.unpack_from("<HHH", _nb0, squad.POP_CAMO) == (101, 6, 6)
+                 and squad.npc_paint(1, 0)[squad.POP_COLOUR_A] == struct.pack("<H", 42)
+                 and squad.npc_paint(1, 4) == {} and squad.npc_paint(9, 0) == {})
     # 2: the loadout, not the pilot's parts, lands at body+0x8C
-    _n_ok &= _nc(3, struct.unpack_from("<H", _nb0, fmoworld.POP_PARTS)[0] == 262
+    _n_ok &= _nc(3,struct.unpack_from("<H", _nb0, fmoworld.POP_PARTS)[0] == 262
                  and _nb0[fmoworld.POP_PARTS + 2] == 0x11
                  and struct.unpack_from("<H", _nb0, fmoworld.POP_PARTS + 4 * fmoworld.POP_PART_STRIDE)[0] == 92)
     _np1 = squad.enemy_pop(_nsq, 1, 0x2223, (1.0, 2.0, 3.0, 0.0), 0x1001, 1, 0, 101)
@@ -12469,6 +12748,8 @@ def _selftest_run(test_db):
     ok &= _coliseum_pins()          # the Coliseum desks (coliseum.py)
     ok &= _coliseum_match_pins()    # arena matches: pairing, judging, streak, bracket
     ok &= _coliseum_spectate_pins()  # Coliseum spectators: 0x01C0/0x01C1, receive-only
+    ok &= _battle_spawn_pins()      # per-map battle spawn points (battlepop.BATTLE_SPAWNS)
+    ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1

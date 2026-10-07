@@ -1782,6 +1782,7 @@ _MODULES = {m: importlib.import_module("fmoserver." + m) for m in (
     'popparts',
     'popsweep',
     'battlepop',
+    'roomcast',
     'npccast',
     'npcroster',
     'room',

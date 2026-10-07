@@ -400,6 +400,14 @@ CMD_DEPOP = 8           # WARNING: NOT in this dispatcher: 0x611EBC44 maps 8 to 
                         # default arm (`mov eax,1`). It is the sibling BATTLE
                         # peer class's command (0x611D4750 -> 0x611D3050 ->
                         # 0x611EE9E0 "RecvDepop"). See record_depop.
+#: KEY: THE LOBBY DEPOP (static 2026-10-06, retracts "nothing on the wire removes
+#: a lobby unit"): cmd 0xD3 -> 0x611EBB6B -> 0x611E7610 reads body u32 +0x00 =
+#: UnitID; for any id but the receiver's own it sets peer+0x1AF1 = 1 and
+#: entity+0x2C = 1, and the base tick (0x611E3A55..0x611E3A8E) deletes both on
+#: its next pass. Its own id returns 1 and does nothing. The dispatcher's
+#: `cmp [peer+0x10],[mgr+0x2C]` is a SELF-STREAM check (the record came from
+#: the server), not "about self" -- cmd 7 POP passes the same check for others.
+CMD_LOBBY_DEPOP = 0xD3
 CMD_UNK9 = 9            # 0x611EBB8E -> 0x611E7670
 CMD_DISCONNECT_A = 11   # 0x611EBBB1 -> set_state(4): 4 is the state the sender
 CMD_DISCONNECT_B = 12   #   skips (0x611E27F0), i.e. this peer is finished
@@ -1490,6 +1498,16 @@ DEPOP_LOST_COMMS = 1    # peer state 4 only
 DEPOP_DESTROYED = 2     # wreck effect, entity kept
 DEPOP_REMOVE = 3        # scene-list removal + entity destroyed
 DEPOP_STATUSES = (DEPOP_LEFT, DEPOP_LOST_COMMS, DEPOP_DESTROYED, DEPOP_REMOVE)
+
+
+def record_lobby_depop(unit_id):
+    """One cmd-0xD3 record: remove lobby unit `unit_id` (CMD_LOBBY_DEPOP).
+    Rides the receiver's SELF stream, like the POP that created the unit.
+    Deletion is deferred to the client's next tick, so the same id must not
+    be re-POPped in the same flush (room_prune forgets the alias)."""
+    if not unit_id:
+        raise ValueError("UnitID 0 is what every map miss looks like")
+    return record(CMD_LOBBY_DEPOP, struct.pack("<I", unit_id & M32))
 
 
 def parse_depop(body):

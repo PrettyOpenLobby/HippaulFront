@@ -83,6 +83,26 @@ def band_rosters():
     return {1: hq, 3: hq, 2: occ, 4: occ, 5: fz, 6: col}
 
 
+def place_band_roster(place_kind, zone):
+    """(band, (roster, names) or None, source) for a place of `place_kind`
+    off `zone`. Most specific wins: the layout file's zone-kind band
+    (room_hq / room_occ / room_fz for a Room), then its plain place band
+    ('room' -- what an older layout carries), then the shipped zone-kind
+    default (roomcast.ROOM_DEFAULT_ROWS). None = nobody stands there."""
+    ids = fmolayout.place_band_ids(place_kind, zone) if fmolayout else []
+    for b in ids:
+        r = layout_band(b)
+        if r is not None:
+            return b, r, f"the layout file's {b} band ({len(r[0])} rows)"
+    for b in ids:
+        rows = roomcast.ROOM_DEFAULT_ROWS.get(b)
+        if rows:
+            return b, fmolayout.rows_to_roster(rows, npccast.FACE_SIGN), (
+                f"the shipped {b} cast (roomcast.py, {len(rows)} rows; a layout "
+                f"{b} band replaces it)")
+    return (ids[-1] if ids else None), None, "no band"
+
+
 def roster_for(host_ip):
     """(roster, names, why) to pop for this host: the band of the zone its
     last 0x0153 granted (WORLD_ZONES), the faction of its pilot. A place
@@ -95,10 +115,10 @@ def roster_for(host_ip):
             # editor's Room / Briefing Room / Room B / Room C / Hangar tabs)
             # is the cast for that room kind -- SE's tables carry room and
             # hangar staff keys; whether a popped body renders and talks in a
-            # room is the live test the editor exists to run. No band = no
-            # cast, exactly as before.
-            _pb = fmolayout.PLACE_BANDS.get(_pl[1]) if fmolayout else None
-            _plr = layout_band(_pb) if _pb else None
+            # room is the live test the editor exists to run. A Room (kind 1)
+            # also has a shipped cast per zone kind (place_band_roster,
+            # 2026-10-06); any other place with no band still has no cast.
+            _pb, _plr, _psrc = place_band_roster(_pl[1], _pl[0])
             _bays = hangar.hangar_resident_units(host_ip, _pl)
             if _plr is not None and _bays:
                 # KEY: A LAYOUT ROW FOR A BAY KEY IS A POSITION, NOT A BODY.
@@ -127,7 +147,7 @@ def roster_for(host_ip):
                 _have = {e[0] for e in _plr[0]}
                 _miss = [hex(k) for k in hangar.HANGAR_REQUIRED_KEYS if k not in _have] if _pl[1] == 5 else []
                 return (list(_plr[0]) + _bays, _plr[1],
-                        f"{move.place_name(_pl)}: the layout file's {_pb} band ({len(_plr[0])} rows)"
+                        f"{move.place_name(_pl)}: {_psrc if _pb else 'no band'}"
                         + (f" + {len(_bays)} bay unit(s) for the owner's wanzer setups" if _bays else "")
                         + (f"; WARNING: the owner's consoles stay SHUT until {_miss} are placed "
                            f"(0x61002BC0)" if _bays and _miss else ""))
@@ -324,5 +344,5 @@ def npc_move_queue(chan, moves):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    hangar, move, npccast, popnation, popparts, room, rooms, worldchannel, zoneentry,
+    hangar, move, npccast, popnation, popparts, room, roomcast, rooms, worldchannel, zoneentry,
 )

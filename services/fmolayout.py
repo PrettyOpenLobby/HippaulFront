@@ -72,11 +72,38 @@ BANDS = (
     ("roomc", "Room C", (), (100, 137), "Change Room kind 4", 4),
     ("hangar", "Hangar", (), (100, 137),
      "kind 5 -- one private hangar per pilot; hanger_event / wanzer + pilot setup", 5),
+    # A "Room" (kind 1) per ZONE kind: the room's NPC keys resolve through the
+    # zone's event table, so the cast follows the zone the room hangs off
+    # (fmoserver/roomcast.py). These win over the plain 'room' band, which
+    # still serves a zone kind with neither a band here nor a default.
+    ("room_hq", "Room (HQ)", (), (100, 307),
+     "Room kind 1 off an HQ zone (1xx / 3xx) -- Pvt Douglas, Kyoko Harada, the sergeant", 1),
+    ("room_occ", "Room (occupied)", (), (100, 307),
+     "Room kind 1 off an occupied zone (2xx / 4xx) -- Francis Sassoon, the sergeant", 1),
+    ("room_fz", "Room (frontline)", (), (100, 307),
+     "Room kind 1 off a frontline zone (5xx) -- 1st Lt Forster, the sergeant", 1),
 )
 BAND_IDS = tuple(b[0] for b in BANDS)
 LOBBY_BANDS = tuple(b[0] for b in BANDS if b[5] == 0)
-#: place kind -> band id
-PLACE_BANDS = {b[5]: b[0] for b in BANDS if b[5]}
+#: (place kind, zone kind) -> the zone-specific place band
+ROOM_ZONE_BANDS = {(1, 1): "room_hq", (1, 3): "room_hq", (1, 2): "room_occ",
+                   (1, 4): "room_occ", (1, 5): "room_fz"}
+#: place kind -> band id (the plain band, whatever the zone)
+PLACE_BANDS = {b[5]: b[0] for b in BANDS
+               if b[5] and b[0] not in ROOM_ZONE_BANDS.values()}
+
+
+def place_band_ids(place_kind, zone):
+    """The layout bands a place of `place_kind` off `zone` reads, most
+    specific first: the zone-kind band (if one exists for that pair), then
+    the plain place band. Pure."""
+    out = []
+    zb = ROOM_ZONE_BANDS.get((place_kind, int(zone) // 100)) if zone is not None else None
+    if zb:
+        out.append(zb)
+    if place_kind in PLACE_BANDS:
+        out.append(PLACE_BANDS[place_kind])
+    return out
 
 #: The function behind each SCP entry name the event tables load, in English.
 TAG_LABELS = (
@@ -157,7 +184,7 @@ def _roles_from_tsv(path=KEYS_TSV):
             lines = fh.read().splitlines()
     except OSError:
         return None
-    place_ids = tuple(PLACE_BANDS.values())
+    place_ids = tuple(PLACE_BANDS.values()) + tuple(sorted(set(ROOM_ZONE_BANDS.values())))
     for ln in lines[1:]:
         parts = ln.split("\t")
         if len(parts) < 4:

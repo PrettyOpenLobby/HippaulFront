@@ -9,6 +9,12 @@ try:
 except ImportError:                                  # pragma: no cover
     fmoworld = None
 
+if fmoworld is not None:
+    # the Change Room people (roomcast.py) join the catalogue here, before any
+    # module reads it
+    from . import roomcast as _roomcast
+    _roomcast.register(fmoworld.NPC_CATALOGUE)
+
 try:
     # THE PER-LOGIN CONTENT AUTH VALUE the lobby mints on 4:5 -- the first 16
     # bytes of this title's TCP key. See contentauth.py and Session.resolve_key.

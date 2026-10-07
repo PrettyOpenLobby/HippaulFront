@@ -154,14 +154,44 @@ def enemy_parts(sq, i):
     return sq.get("parts") or None
 
 
+#: The squad's name tag: its nation, not "Enemy" -- a pilot who joins the
+#: other side's map fights ALONGSIDE that squad (live 2026-10-06: an O.C.U.
+#: pilot saw friendly O.C.U. NPCs labelled "Enemy.1").
+NPC_NAME_BY_NATION = {1: "OCU", 2: "USN"}
+#: KEY: WANZER PAINT (static 2026-10-06). The battle dresser 0x611ED760 hands
+#: 0x611F59E0 body+0x1B8 u16 camouflage (D29 row), +0x1BA / +0x1BC u16 the two
+#: colour slots (D30 row, clamped < 371) and +0x1BE insignia; we sent zeros and
+#: every NPC drew the same red. SE's own D30 notes name the starting colours:
+#: 42 Olive Green "O.C.U.初期カラー", 6 Dark Gray "U.S.N.初期カラー"; camo 101 is
+#: what the client gives an empty setup (0x61002FB3). That the NPCs wore their
+#: nation's starting colour is OURS (no SE text states the NPC rule).
+#: A wanzer offset only: on a UnitType-4 human +0x1B8 is POP_NPC_NUMBER.
+NPC_PAINT_BY_NATION = {1: 42, 2: 6}
+NPC_CAMO = 101
+POP_CAMO, POP_COLOUR_A, POP_COLOUR_B = 0x1B8, 0x1BA, 0x1BC
+
+
+def npc_paint(nation, unit_type):
+    """{POP offset: bytes} painting an NPC wanzer of `nation`, or {} for a
+    human (UnitType 4) or a nation with no starting colour. Pure."""
+    col = NPC_PAINT_BY_NATION.get(nation)
+    if col is None or unit_type == 4:
+        return {}
+    return {POP_CAMO: struct.pack("<H", NPC_CAMO),
+            POP_COLOUR_A: struct.pack("<H", col),
+            POP_COLOUR_B: struct.pack("<H", col)}
+
+
 def enemy_pop(sq, i, uid, pos, owner, side, unit_type, brain):
     """The cmd-7 POP of squad unit `i` (id `uid`): an AI unit (client_kind 1)
     owned by `owner`, dressed from its loadout, with the HP scale byte."""
     return fmoworld.record_pop(
         uid, unit_type=unit_type, pos=pos, client_kind=1,
-        name1="Enemy", name2=str(i + 1), nation=sq["nation"], side=side,
+        name1=NPC_NAME_BY_NATION.get(sq["nation"], "Unit"), name2=str(i + 1),
+        nation=sq["nation"], side=side,
         parts=enemy_parts(sq, i),
-        extra={battlepop.POP_AI_OWNER: struct.pack("<I", owner),
+        extra={**npc_paint(sq["nation"], unit_type),
+               battlepop.POP_AI_OWNER: struct.pack("<I", owner),
                battlepop.POP_AI_BRAIN: struct.pack("<I", brain),
                # client_kind 1 scales part HP by this byte x 10 % (0x611F7124);
                # 0 left every enemy part at 1 HP. A per-unit percent wins
@@ -266,7 +296,7 @@ def squad_positions(base, n, spread, gap=40.0):
 
 
 def battle_squad_for(chan, base, nation, parts, now=None, mates=None,
-                     level=None, rows=None, rnd=None, n=None):
+                     level=None, rows=None, rnd=None, n=None, positions=None):
     """(squad, owner channel or None) for the room `chan` stands in. Creates a
     squad owned by `chan`'s host when there is none, when its owner has left
     the room, or when the owner's sortie is not the one it was made for.
@@ -274,7 +304,9 @@ def battle_squad_for(chan, base, nation, parts, now=None, mates=None,
     battle's NPC level (`level`, else enemy_level_for); `parts` (the pilot's)
     is only the fallback. Every pilot in the room gets the same squad, so all
     of them see the same enemies. `n` overrides FMO_BATTLE_ENEMIES' count
-    for a new squad (the solo area opens with SE's two)."""
+    for a new squad (the solo area opens with SE's two). `positions`, when it
+    holds at least n points, places a new squad instead of the line off
+    `base` (battlepop.squad_spawn_positions, the map's spawn table)."""
     ip = referee.chan_bkey(chan)
     key = worldchannel.chan_where(chan)          # the room THIS channel stands in
     sq = BATTLE_SQUADS.get(key)
@@ -291,7 +323,10 @@ def battle_squad_for(chan, base, nation, parts, now=None, mates=None,
         n, spread = (n or BATTLE_ENEMIES[0]), BATTLE_ENEMIES[1]
         uid0 = battlepop.BATTLE_DUMMY[0] if battlepop.BATTLE_DUMMY else 0x2222
         sq = {"owner": ip, "ids": [uid0 + i for i in range(n)],
-              "pos": squad_positions(base, n, spread, squad_gap()),
+              "pos": (list(positions[:n]) if positions and len(positions) >= n
+                      else squad_positions(base, n, spread, squad_gap())),
+              "pos_src": ("spawn table" if positions and len(positions) >= n
+                          else "line off the drop point"),
               "dead": set(), "last_hit": {},
               "granted": (referee.BATTLE_STATE.get(ip) or {}).get("granted_at"),
               "nation": nation, "parts": parts, "made": now or time.time()}

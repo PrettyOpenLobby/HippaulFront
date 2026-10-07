@@ -17,13 +17,19 @@ def devtool_ctx():
     B = npcroster.band_rosters()
     for bid, _title, kinds, _cat, _desc, place_kind in fmolayout.BANDS:
         if place_kind:
-            # a room / hangar: its map from FMO_ROOM_MAPS, its cast only ever
-            # the layout file's (nothing else pops there)
+            # a room / hangar: its map from FMO_ROOM_MAPS (the O.C.U. one for
+            # the nation-split Briefing Room), its cast the layout file's band
+            # or, for the zone-kind Room bands, the shipped roomcast default
             mapno = move.ROOM_MAPS.get(place_kind)
             _lr = npcroster.layout_band(bid)
+            _dflt = roomcast.ROOM_DEFAULT_ROWS.get(bid)
+            if _lr is None and _dflt:
+                _lr = fmolayout.rows_to_roster(_dflt, npccast.FACE_SIGN)
+                src = f"the shipped {bid} cast (roomcast.py); a layout {bid} band replaces it"
+            else:
+                src = (f"the layout file's {bid} band" if _lr is not None
+                       else f"nothing -- no {move.PLACE_KIND_NAMES.get(place_kind)} cast until one is placed")
             roster, names = _lr if _lr is not None else ([], {})
-            src = (f"the layout file's {bid} band" if _lr is not None
-                   else f"nothing -- no {move.PLACE_KIND_NAMES.get(place_kind)} cast until one is placed")
         else:
             kind = kinds[0]
             mapno, _why = areachange.zone_mapno(kind * 100, zoneentry.MAPNO, "FMO_MAPNO")
@@ -95,5 +101,5 @@ def devtool_start():
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    areachange, gatetool, groupchannel, move, npccast, npcroster, popsweep, rooms, zoneentry,
+    areachange, gatetool, groupchannel, move, npccast, npcroster, popsweep, roomcast, rooms, zoneentry,
 )

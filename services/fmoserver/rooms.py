@@ -223,9 +223,13 @@ def room_prune(chan, now):
         if rs.gone:
             continue                    # already told, once
         if room.ROOM_DEPOP:
+            # the lobby's own depop is cmd 0xD3 (fmoworld.CMD_LOBBY_DEPOP); the
+            # battle peer class takes cmd 8 RecvDepop
+            _battle = _is_battle_chan(chan)
             try:
-                rec = fmoworld.record_depop(alias, from_id=0,
-                                            status=room.ROOM_DEPOP_STATUS)
+                rec = (fmoworld.record_depop(alias, from_id=0,
+                                             status=room.ROOM_DEPOP_STATUS)
+                       if _battle else fmoworld.record_lobby_depop(alias))
             except ValueError as e:
                 log(f"[udp {chan.addr[0]}:{chan.addr[1]}] WARNING: ROOM DEPOP for "
                     f"{alias:#x} refused by our own guard: {e}")
@@ -234,14 +238,14 @@ def room_prune(chan, now):
             chan.pending.append(rec)
             del chan.remotes[alias]
             chan.alias_of.pop(rs.peer_addr, None)
-            log(f"[udp {chan.addr[0]}:{chan.addr[1]}] PARTIAL: ROOM DEPOP: "
-                f"{rs.peer_addr[0]}:{rs.peer_addr[1]} left ({why}) -- cmd 8 "
-                f"RecvDepop(UnitID={alias:#x} FromID=0 Status="
-                f"{room.ROOM_DEPOP_STATUS}) queued on the SELF stream (record "
+            log(f"[udp {chan.addr[0]}:{chan.addr[1]}] ROOM DEPOP: "
+                f"{rs.peer_addr[0]}:{rs.peer_addr[1]} left ({why}) -- "
+                + (f"cmd 8 RecvDepop(UnitID={alias:#x} FromID=0 Status="
+                   f"{room.ROOM_DEPOP_STATUS})" if _battle else
+                   f"cmd 0xD3 lobby depop UnitID={alias:#x}")
+                + f" queued on the SELF stream (record "
                 f"{chan.tx_base + len(chan.pending) - 1}); alias forgotten, a "
-                f"return re-POPs under a new id. WARNING: PREDICTED INERT on the "
-                f"lobby session (0x611EBC44 maps cmd 8 to the default arm): "
-                f"expect an ack and a unit that stays.")
+                f"return re-POPs under a new id.")
         else:
             rs.gone = why
             log(f"[udp {chan.addr[0]}:{chan.addr[1]}] WARNING: ROOM: "

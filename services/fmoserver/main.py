@@ -110,18 +110,13 @@ def run():
         log(f"   with ONE client connected this changes nothing -- there is "
             f"nobody to relay to, which is why it is on by default. A second "
             f"client is the whole test.")
-        log(f"   WARNING: A PLAYER WHO LEAVES STAYS ON SCREEN. SE's \"RecvDepop(UnitID"
-            f"=%x FromID=%u Status=%u)\" is cmd 8 {{u32 UnitID, FromID, "
-            f"Status}} (decoded 2026-08-26) -- and the LOBBY peer class "
-            f"ignores it (0x611EBC44 -> default arm); only the battle class "
-            f"(0x611D4750) handles it. No other wire removal exists. "
-            + (f"FMO_UDP_ROOM_DEPOP=1: sending it anyway on 0x0152 / map "
-               f"change / {room.ROOM_TTL:g}s silence, Status={room.ROOM_DEPOP_STATUS}, "
-               f"PREDICTED INERT -- a measurement, not a fix."
-               if room.ROOM_DEPOP else
-               f"FMO_UDP_ROOM_DEPOP=0: on 0x0152 / map change / "
-               f"{room.ROOM_TTL:g}s silence the relay stops and the log says so; "
-               f"nothing is sent."))
+        log(f"   A player who leaves is removed from each viewer: cmd 0xD3 "
+            f"(the lobby depop, 0x611E7610) on lobby channels, cmd 8 RecvDepop "
+            f"Status={room.ROOM_DEPOP_STATUS} on battle channels, on 0x0152 / "
+            f"map change / {room.ROOM_TTL:g}s silence. "
+            + ("FMO_UDP_ROOM_DEPOP=1 (on)." if room.ROOM_DEPOP else
+               "FMO_UDP_ROOM_DEPOP=0: OFF, the relay stops and the unit stays "
+               "on screen."))
     else:
         log("ROOM RELAY OFF (FMO_UDP_ROOM=0): each world channel is served in "
             "isolation, chat echoes only to its sender, and a second client is "

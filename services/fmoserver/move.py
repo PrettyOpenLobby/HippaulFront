@@ -336,12 +336,22 @@ def move_list_for(category):
 #: People column is who actually has a live world channel there.
 #:
 #: The map a place stands in: lobby = FMO_ZONE_MAPNO (102), rooms by kind from
-#: FMO_ROOM_MAPS -- defaults by eye and the texture tags
-#: (2026-09-09): Room = 124 the bar, Briefing = 122 (prmhq monitors), Room B =
-#: 151 the corridors, Room C = 101 the hangar hall, Hangar = 141 (the four
-#: hangar maps 141..144 grow with size; a hangar-RANK ladder is plausible and
-#: unproved). WARNING: Which real room was "Room" vs "Room B/C" is NOT known; these
-#: are labelled guesses that put every kind in a real, walkable map.
+#: FMO_ROOM_MAPS. No script E200-attaches a room map on its own, so the map is
+#: the server's choice; the defaults (2026-10-06) follow the scripts that DO
+#: stage people in them:
+#:   Room (1)          121 -- the room scripts stage the player at (4.0, 0,
+#:                     1.56) and the NPC at (5.42, 0, 1.56) facing 270, open
+#:                     floor on 121 (on 124, the bar, that spot clips)
+#:   Briefing Room (2) 122 for O.C.U., 123 for U.S.N. -- the shared script
+#:                     helper (e.g. AI/F00/D19 at 0x1C46) asks 0xE060 for the
+#:                     nation and E200s 122 when it is 1, 123 otherwise. The
+#:                     branch sense is read from the compiled if/else shape
+#:                     (compare, setcc, branch-if-zero over the 122 arm), the
+#:                     same shape D87's cast switch uses; the VM ops themselves
+#:                     are not decoded from their handlers.
+#:   Room B / C (3, 4) 124 -- no data names them; the bar is a real map
+#:   Hangar (5)        141 (141..144 grow with size; unproved ladder)
+#: Grammar: `kind:mapno` or, per nation, `kind:ocu/usn`.
 #: FMO_PLACES=0 restores the FMO_MOVE_LIST* behaviour exactly.
 PLACES = (os.environ.get("FMO_PLACES", "").strip() or "1") != "0"
 PLACE_KIND_NAMES = {0: "Lobby", 1: "Room", 2: "Briefing Room", 3: "Room B",
@@ -357,27 +367,42 @@ BRIEFING_ZONES = tuple(int(x, 0) for x in
                        .replace(" ", "").split(",") if x)
 
 
+ROOM_MAPS_DEFAULT = "1:121,2:122/123,3:124,4:124,5:141"
+
+
+def parse_room_maps_nation(spec):
+    """`kind:mapno` / `kind:ocu/usn`, comma-separated, over the defaults ->
+    ({kind: O.C.U. mapno}, {kind: U.S.N. mapno}); a kind with one map has the
+    same map in both. Every map must exist (VALID_MAPNOS)."""
+    ocu, usn = {}, {}
+    for src in (ROOM_MAPS_DEFAULT, spec or ""):
+        for e in src.replace(" ", "").split(","):
+            if not e:
+                continue
+            k, _, m = e.partition(":")
+            m1, _, m2 = m.partition("/")
+            try:
+                k, m1 = int(k, 0), int(m1, 0)
+                m2 = int(m2, 0) if m2 else m1
+            except ValueError:
+                raise SystemExit(f"FMO_ROOM_MAPS entry {e!r}: wants <kind>:<mapno> "
+                                 f"or <kind>:<ocu>/<usn>")
+            if k not in PLACE_KIND_NAMES or k == 0:
+                raise SystemExit(f"FMO_ROOM_MAPS entry {e!r}: kind must be 1..5")
+            for mm in (m1, m2):
+                if mm not in zoneentry.VALID_MAPNOS:
+                    raise SystemExit(f"FMO_ROOM_MAPS entry {e!r}: MapNo {mm} is not one of "
+                                     f"the twelve maps {zoneentry.VALID_MAPNOS}")
+            ocu[k], usn[k] = m1, m2
+    return ocu, usn
+
+
 def parse_room_maps(spec):
-    """`kind:mapno,...` -> {kind: mapno}; every map must exist (VALID_MAPNOS)."""
-    out = {1: 124, 2: 122, 3: 151, 4: 101, 5: 141}
-    for e in (spec or "").replace(" ", "").split(","):
-        if not e:
-            continue
-        k, _, m = e.partition(":")
-        try:
-            k, m = int(k, 0), int(m, 0)
-        except ValueError:
-            raise SystemExit(f"FMO_ROOM_MAPS entry {e!r}: wants <kind>:<mapno>")
-        if k not in PLACE_KIND_NAMES or k == 0:
-            raise SystemExit(f"FMO_ROOM_MAPS entry {e!r}: kind must be 1..5")
-        if m not in zoneentry.VALID_MAPNOS:
-            raise SystemExit(f"FMO_ROOM_MAPS entry {e!r}: MapNo {m} is not one of "
-                             f"the twelve maps {zoneentry.VALID_MAPNOS}")
-        out[k] = m
-    return out
+    """{kind: mapno} as an O.C.U. pilot sees it (parse_room_maps_nation)."""
+    return parse_room_maps_nation(spec)[0]
 
 
-ROOM_MAPS = parse_room_maps(os.environ.get("FMO_ROOM_MAPS", ""))
+ROOM_MAPS, ROOM_MAPS_USN = parse_room_maps_nation(os.environ.get("FMO_ROOM_MAPS", ""))
 #: host -> (zone, kind, instance): the place its last 0x0153 put it in.
 WORLD_PLACES = {}
 
@@ -401,12 +426,15 @@ def place_name(place):
     return f"zone {zone} {PLACE_KIND_NAMES.get(kind, kind)} #{inst}"
 
 
-def place_map(zone, kind, default=None):
+def place_map(zone, kind, default=None, nation=None):
     """(mapno, why) for a place: the zone's lobby map for kind 0, else the
-    room kind's map."""
+    room kind's map, the U.S.N. one when `nation` is 2."""
     if kind == 0:
         return areachange.zone_mapno(zone, zoneentry.MAPNO if default is None else default, "FMO_MAPNO")
-    return ROOM_MAPS[kind], f"FMO_ROOM_MAPS[{kind} {PLACE_KIND_NAMES[kind]}]"
+    if nation == 2:
+        return ROOM_MAPS_USN[kind], f"FMO_ROOM_MAPS[{kind} {PLACE_KIND_NAMES[kind]}, U.S.N.]"
+    return ROOM_MAPS[kind], (f"FMO_ROOM_MAPS[{kind} {PLACE_KIND_NAMES[kind]}"
+                             + (", O.C.U.]" if nation == 1 else "]"))
 
 
 def place_population(peers=None, places=None, now=None):

@@ -631,6 +631,27 @@ def _serve_datagram(sock, peers, dg, addr):
                            f"{rooms.WORLD_MAPS.get(addr[0])!r} and is not a mission-"
                            f"map position)")
                 _pos, _pw = battlepop.BATTLE_POS, None
+            # PER-MAP SPAWNS (FMO_BATTLE_SPAWNS): the battle map's own point for
+            # the pilot's side wins over FMO_BATTLE_POS when the table has a row
+            _spawn_from_table = False
+            if (battlepop.BATTLE_SPAWNS and chan.key and chan.key.endswith(b"battle")):
+                _bk = referee.chan_bkey(chan)
+                _smap = rooms.SORTIE_MAP.get(_bk) or (referee.BATTLE_STATE.get(_bk) or {}).get("mapno")
+                _sside = popnation.battle_side_for(addr[0])[0]
+                _srow = battlepop.spawn_row(_smap)
+                if _srow is not None:
+                    _smates = [o for o in rooms.room_mates(chan) if rooms._is_battle_chan(o)]
+                    _sidx = battlepop.spawn_pilot_index(chan, _sside, _smates)
+                    _spos, _ssrc = battlepop.battle_spawn_pos(_smap, _sside, _sidx)
+                    if _spos is not None:
+                        _possrc = (f"{_ssrc}; pilot side "
+                                   f"{_sside if _sside is not None else 'unknown -> A'}, "
+                                   f"instead of {'FMO_BATTLE_POS ' + str(battlepop.BATTLE_POS) if battlepop.BATTLE_POS else 'the lobby table'}")
+                        _pos, _pw = _spos, None
+                        chan.spawn_side, chan.spawn_slot = _sside, _sidx
+                        _spawn_from_table = True
+                else:
+                    _possrc += f" [FMO_BATTLE_SPAWNS: no row for battle map {_smap!r}]"
             if not chan.moved_at:
                 # WARNING: Seed this player's ROOM position with the spawn actually
                 # served (the per-map POS_MAP row), not the global POP_POS the
@@ -762,7 +783,15 @@ def _serve_datagram(sock, peers, dg, addr):
             # human creators key the model on it. See battle_side_for.
             _side, _sidesrc = (popnation.battle_side_for(addr[0]) if _battle_pop
                                else (None, "lobby pop, side stays 0"))
-            if _battle_pop:
+            if _battle_pop and _spawn_from_table and _side is not None:
+                # body+0x27 is the HIGH BYTE of the z float (battlepop.BATTLE_SPAWNS):
+                # writing it would put this pilot at z ~ 0 again, not at the point
+                log(f"[udp {addr[0]}:{addr[1]}] BATTLE SIDE: body+0x27 NOT SENT "
+                    f"(would be {_side} -- {_sidesrc}): it is the high byte of "
+                    f"the z float at body+0x24 and would zero the spawn point's z "
+                    f"{_pos[2]}; friend/foe rides on the nation byte body+0x7C")
+                _side = None
+            elif _battle_pop:
                 log(f"[udp {addr[0]}:{addr[1]}] BATTLE SIDE: body+0x27 = "
                     f"{_side if _side is not None else 'unset (0)'} -- {_sidesrc}")
             chan.pop_args = dict(
@@ -786,6 +815,16 @@ def _serve_datagram(sock, peers, dg, addr):
                 _pen = popself.penalty_pop_extra(chan)
                 if _pen:
                     chan.pop_args.setdefault("extra", {}).update(_pen)
+                # PAINT (squad.npc_paint): no pilot has a hangar paint on file,
+                # so the starter wanzer wears its nation's starting colour (SE's
+                # D30 notes) instead of the zeros that drew every unit red; kept
+                # in pop_args so the room relay paints it on the peers too
+                _paint = squad.npc_paint(_nat, utype)
+                if _paint:
+                    chan.pop_args.setdefault("extra", {}).update(_paint)
+                    log(f"[udp {addr[0]}:{addr[1]}] PAINT: nation {_nat} starting colour "
+                        f"D30 {squad.NPC_PAINT_BY_NATION.get(_nat)}, camo {squad.NPC_CAMO} "
+                        f"(body+0x1B8..0x1BD)")
             chan.pending.append(fmoworld.record_pop(
                 uid, look=_lk_now, **chan.pop_args))
         except ValueError as e:
@@ -879,6 +918,18 @@ def _serve_datagram(sock, peers, dg, addr):
 
     # VERIFIED:KEY: THE ENEMY SQUAD (FMO_BATTLE_DUMMY_AI + FMO_BATTLE_ENEMIES): see
     # battle_squad_for. Popped once per battle channel, after the self-POP.
+    # A Coliseum battle is pilots only (Playing Manual p.45): live 2026-10-06
+    # the first arena match got the NPC squad every sortie gets.
+    _arena_fight = False
+    if (battlepop.BATTLE_DUMMY and battlepop.BATTLE_DUMMY_AI and chan.popped
+            and not getattr(chan, "squad_popped", False)
+            and rooms._is_battle_chan(chan)):
+        _arena_fight = bool((referee.BATTLE_STATE.get(referee.bkey(addr[0])) or {}).get(
+            "arena_match")) or settlement.arena_zone(rooms.WORLD_ZONES.get(addr[0]))
+        if _arena_fight:
+            chan.squad_popped = True
+            log(f"[udp {addr[0]}:{addr[1]}] ARENA: no NPC squad (a Coliseum battle "
+                f"is pilots only)")
     if (battlepop.BATTLE_DUMMY and battlepop.BATTLE_DUMMY_AI and chan.popped
             and not getattr(chan, "squad_popped", False)
             and rooms._is_battle_chan(chan)):
@@ -897,8 +948,21 @@ def _serve_datagram(sock, peers, dg, addr):
         # SOLO AREA (solo.py): the sortie grant marked this battle; the squad
         # opens with SE's two enemies and the first ally (Assault)
         _solo = _bst.get("solo")
+        # PER-MAP SPAWNS (battlepop.BATTLE_SPAWNS): when the self-POP came from
+        # the spawn table, the squad stands on the OTHER side's slots
+        _sqpos, _sqside = None, None
+        if (getattr(chan, "spawn_slot", None) is not None and not battlepop.BATTLE_DUMMY[2]):
+            _sqside = getattr(chan, "spawn_side", None)
+            _bk = referee.chan_bkey(chan)
+            _sqpos = battlepop.squad_spawn_positions(
+                rooms.SORTIE_MAP.get(_bk) or (referee.BATTLE_STATE.get(_bk) or {}).get("mapno"),
+                _sqside, solo.solo_on_field(_solo) or squad.BATTLE_ENEMIES[0])
         _sq, _och = squad.battle_squad_for(chan, _base, _snat, _sparts,
-                                           n=solo.solo_on_field(_solo))
+                                           n=solo.solo_on_field(_solo), positions=_sqpos)
+        # body+0x27 is the z float's high byte: a squad placed from the table
+        # sends no side byte, or every enemy lands at z ~ 0 and they stack
+        _esside = (None if _sq.get("pos_src") == "spawn table"
+                   else popnation.enemy_side_for(addr[0])[0])
         _mine = _sq["owner"] == referee.bkey(addr[0])
         _owner = squad.squad_owner_uid(chan, _mine, _och)
         if _solo and _mine:
@@ -911,7 +975,7 @@ def _serve_datagram(sock, peers, dg, addr):
             try:
                 # dressed from its NPC loadout, part HP scaled (squad.enemy_pop)
                 chan.pending.append(squad.enemy_pop(
-                    _sq, _i, _eid, _epos, _owner, popnation.enemy_side_for(addr[0])[0],
+                    _sq, _i, _eid, _epos, _owner, _esside,
                     battlepop.BATTLE_DUMMY[1], battlepop.BATTLE_DUMMY_AI))
             except ValueError as e:
                 log(f"[udp {addr[0]}:{addr[1]}] WARNING: SQUAD POP {_eid:#x} REFUSED "
@@ -931,7 +995,10 @@ def _serve_datagram(sock, peers, dg, addr):
         chan.dummy_pos = tuple(_sq["pos"][0][:3])
         log(f"[udp {addr[0]}:{addr[1]}] -> ENEMY SQUAD: {len(_sq['ids'])} AI "
             f"wanzer(s) {', '.join(f'{i:#x}' for i in _sq['ids'])} (nation "
-            f"{_sq['nation']}, brain {battlepop.BATTLE_DUMMY_AI}) round {tuple(_base[:3])}; "
+            f"{_sq['nation']}, brain {battlepop.BATTLE_DUMMY_AI}) "
+            + (f"on the spawn table's side {'A' if battlepop.spawn_side_key(_sqside) == 'b' else 'B'} slots "
+               f"{[tuple(round(v, 1) for v in p[:3]) for p in _sq['pos']]} (no side byte); "
+               if _sq.get("pos_src") == "spawn table" else f"round {tuple(_base[:3])}; ")
             + (f"NPC level {_sq['level']} ({_sq.get('level_src') or 'given'}), loadouts "
                + ", ".join((lo['name'] if lo else "pilot's parts")
                            for lo in _sq['loadouts'])
@@ -1362,6 +1429,6 @@ def _serve_datagram(sock, peers, dg, addr):
 from . import (  # noqa: E402
     battleend, battlepop, charlist, groupchannel, loot, missionblock, missiongroups, npcroster,
     peerlink, poplook,
-    popnames, popnation, popparts, popself, popsweep, referee, room, roomrelay, rooms, solo,
-    squad, udpconfig, warmap, worldchannel,
+    popnames, popnation, popparts, popself, popsweep, referee, room, roomrelay, rooms,
+    settlement, solo, squad, udpconfig, warmap, worldchannel,
 )

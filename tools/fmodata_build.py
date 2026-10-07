@@ -21,6 +21,8 @@ was produced):
   7. script-marks AI/F00/D07, D87, AH/F99/D47 (SCP) -> fmo-script-marks.json
   8. backdrop    AJ/F40/D54 (TIM2)            -> services/boardart/fmo/backdrop.png
                  (the City Control board's satellite image; needs Pillow)
+  9. spawns      every battle MAP container's placement table
+                                              -> fmo-battle-spawns.tsv
 
 The install directory is the one holding PolBoot.exe, FrontMissionOnline.dll
 and Data/; the Data directory itself is accepted too. Nothing is decrypted:
@@ -41,7 +43,7 @@ results = []
 
 EXPECTED = ["fmo-class-exp.tsv", "fmo-ranks.tsv", "fmo-cosmetics.tsv",
             "fmo-insignia.tsv", "fmo-missions.tsv", "fmo-cutscenes.tsv",
-            "fmo-npc-keys.tsv", "fmo-script-marks.json"]
+            "fmo-npc-keys.tsv", "fmo-script-marks.json", "fmo-battle-spawns.tsv"]
 LOBBY_MAPNOS = (101, 102, 121, 122, 123, 124, 141, 142, 143, 144, 151, 161)
 
 
@@ -100,6 +102,7 @@ def main():
                       "--out", os.path.join(args.out, "fmo-npc-keys.tsv")])
     step("script-marks", [PY, os.path.join(HERE, "fmo_script_marks.py"), *client,
                           "--out", os.path.join(args.out, "fmo-script-marks.json")])
+    step("spawns", [PY, os.path.join(GEN, "fmospawns.py"), *client, "--out", args.out])
     if not args.no_backdrop:
         step("backdrop", [PY, os.path.join(HERE, "fmo_boardart_bake.py"), *client,
                           "--out", args.boardart])

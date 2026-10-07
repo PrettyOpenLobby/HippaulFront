@@ -20,6 +20,9 @@ RELEASE_DEFAULTS = {
     "FMO_MOVE_LIST": "102:2",
     "FMO_MOVE_LIST_ROOM": "141:3,142:2,143:1,144:2,124:1,151:0,101:3",
     "FMO_MOVE_LIST_BRIEFING": "122:0,123:0",
+    # the Change Room maps: Room 121, Briefing 122 (O.C.U.) / 123 (U.S.N.),
+    # Room B and C the bar 124, Hangar 141 (fmoserver/move.py)
+    "FMO_ROOM_MAPS": "1:121,2:122/123,3:124,4:124,5:141",
     "FMO_UDP_POP_POS_MAP": ("101:-2.57,2.99,-43.44,0;102:0.52,3.11,9.41,0;"
                             "121:-0.36,0.00,-17.76,0;122:0.20,0.00,3.11,0;"
                             "123:-5.10,0.00,-0.83,0;124:-0.46,0.00,16.69,0;"
@@ -65,6 +68,9 @@ RELEASE_DEFAULTS = {
     "FMO_UDP_POP_BATTLE": "1:0", "FMO_BATTLE_DUMMY": "0x2222:0",
     "FMO_UDP_POP_CLIENT_KIND": "0", "FMO_BATTLE_GATE_POP": "1",
     "FMO_BATTLE_POS": "64,5,64", "FMO_BATTLE_BOUNDS": "-2048,-2048,2048,2048",
+    # per-map spawn points (fmodata/fmo-battle-spawns.tsv); FMO_BATTLE_POS is
+    # the fallback for a map without a row
+    "FMO_BATTLE_SPAWNS": "1",
     "FMO_SORTIE": "1", "FMO_SORTIE_MAPNO": "418",
     "FMO_BATTLE_MAPS": ("418:0,418:1,418:2,418:3,418:4,418:5,418:6,418:7,"
                         "418:8,418:9,418:10,418:11,418:12,418:13,418:14,418:15"),

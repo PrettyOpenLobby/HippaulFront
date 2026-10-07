@@ -104,6 +104,9 @@ ROOM_SAME_ZONE = os.environ.get("FMO_UDP_ROOM_SAME_ZONE", "1") != "0"
 #: who leaves goes still and stays on screen until the scene ends. Say so in
 #: the log rather than pretending they left.
 ROOM_TTL = _env_float("FMO_UDP_ROOM_TTL", "45")
+#: KEY: 2026-10-06 the lobby HAS a depop: cmd 0xD3 (fmoworld.CMD_LOBBY_DEPOP);
+#: room_prune sends it on lobby channels and cmd 8 on battle ones, ON by
+#: default. The 2026-08-26 note below is the old reading, kept for the trail.
 #: PARTIAL: THE DEPOP, decoded 2026-08-26 and OFF BY DEFAULT because it is decoded
 #: as INERT on the session we serve. SE's "RecvDepop(UnitID=%x FromID=%u
 #: Status=%u)" is **cmd 8**, body `{u32 UnitID; u32 FromID; u32 Status}`
@@ -118,7 +121,7 @@ ROOM_TTL = _env_float("FMO_UDP_ROOM_TTL", "45")
 #: measuring exactly that; ON also re-mints a fresh alias for a returning
 #: player (their old entity would have been destroyed by Status 3), OFF keeps
 #: the alias so the relay resumes onto the unit that never left the screen.
-ROOM_DEPOP = (os.environ.get("FMO_UDP_ROOM_DEPOP", "").strip() or "0") != "0"
+ROOM_DEPOP = (os.environ.get("FMO_UDP_ROOM_DEPOP", "").strip() or "1") != "0"
 #: Which Status to send: 3 = scene-list removal + entity destroyed (the full
 #: removal), 0 = "left" (scene-list removal, entity kept, peer -> state 4),
 #: 1 = "lost comms" (peer -> state 4 only), 2 = "destroyed" (wreck effect).
