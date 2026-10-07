@@ -3023,6 +3023,99 @@ def selftest():
         charstore._db_ready[0] = _db_was[1]
 
 
+def _battle_position_pins():
+    """BATTLE POSITIONS (2026-10-07): a battle channel is placed by its own
+    cmd 23/24 motion state (s16 / 3.75), not by cmd 240's int16 hundredths;
+    a lobby channel keeps cmd 240 exactly; a wrapped cmd 240 cannot corrupt
+    a battle position; a lobby never inherits a battle one."""
+    ok = True
+    W = fmoworld
+
+    class _Ch:
+        def __init__(self, key, me=0x1001):
+            self.key, self._me, self.pos, self.pos_src = key, me, (0.0, 5.0, 0.0), None
+
+        def self_unit(self):
+            return self._me
+
+    # (1) the client's own bytes (prod fmo.log 2026-10-07 05:36:12Z, cmd 24,
+    # 76 B): unit 0x2223's state carries the s16 position AND, under flag 0x40,
+    # the same point as floats (128.0, 69.97, -168.0) -- the 3.75 scale checked
+    # against the client's own float, not against a guess
+    _b = bytes.fromhex(
+        "03000110000000080000 95badc14 4407ddd3"
+        "23220000 0071000095badc14 e00106018bfd 000000438cf28b42ffff27c3 0000 000000000000"
+        "24220000 0020000095badc14 000000000000 1a00".replace(" ", ""))
+    _got = W.battle_motion_positions(W.CMD_BM_MOVE_BATCH, _b, 0x1001)
+    _fl = struct.unpack_from("<fff", _b, 2 + 16 + 4 + 8 + 6)
+    _r_ok = (len(_got) == 1 and _got[0][0] == 0x2223
+             and all(abs(a - b) < 0.27 for a, b in zip(_got[0][1], _fl)))
+    print(f"  battle pos: real cmd 24 -> unit 0x2223 at "
+          f"{tuple(round(v, 2) for v in _got[0][1]) if _got else None}, the "
+          f"state's own floats {tuple(round(v, 2) for v in _fl)}; 0x1001 (no "
+          f"flag bit 0) gives none: {'OK' if _r_ok else 'FAIL'}")
+    ok &= _r_ok
+
+    # (2) a battle pilot at x 1343 / z 1477 (map 471, live 10-06) is tracked
+    # there from cmd 23 and from its own cmd 24 entry, not a squad unit's
+    _far = (1343.0, 40.0, 1477.0)
+    _st = W.record_motion_pos(_far)
+    _bc = _Ch(b"1234battle")
+    referee.enter_battle_pos(_bc, (64.0, 46.4, 0.0, 0.0))
+    _p23 = referee.track_battle_motion(_bc, 23, _st, 0x1001)
+    _bc2 = _Ch(b"1234battle")
+    _batch = (struct.pack("<H", 2) + struct.pack("<I", 0x2222) + W.record_motion_pos((5.0, 0, 5.0))
+              + struct.pack("<I", 0x1001) + _st)
+    _p24 = referee.track_battle_motion(_bc2, 24, _batch, 0x1001)
+    _not_mine = referee.track_battle_motion(_Ch(b"1234battle"), 23, _st, 0x2222)
+    _t_ok = (all(_p is not None and all(abs(a - b) < 0.27 for a, b in zip(_p, _far))
+                 for _p in (_p23, _p24))
+             and _bc.pos == _p23 and _bc.pos_src == "state" and _bc2.pos == _p24
+             and _not_mine is None and referee.objective_zone_contains(
+                 (1300, 1400, 100, 100), _bc.pos))
+    print(f"  battle pos: x 1343 / z 1477 from cmd 23 {_p23} and cmd 24 {_p24}; "
+          f"a squad unit's record moves nobody; hold zone sees it: "
+          f"{'OK' if _t_ok else 'FAIL'}")
+    ok &= _t_ok
+
+    # (3) a wrapped cmd 240 does not corrupt it: ignored once cmd 23/24 placed
+    # the pilot, unwrapped against the last position before that
+    _wrap = tuple(((v * 100 + 32768) % 65536 - 32768) / 100 for v in _far)
+    _ign = referee.battle_move_pos(_bc, _wrap)
+    _bc3 = _Ch(b"1234battle")
+    referee.enter_battle_pos(_bc3, (1340.0, 40.0, 1470.0))
+    _unw = referee.battle_move_pos(_bc3, _wrap)
+    _w_ok = (_ign is None and _bc.pos == _p23 and _unw is not None
+             and all(abs(a - b) < 0.02 for a, b in zip(_unw, _far))
+             and abs(_wrap[0] - 1343.0) > 600)
+    print(f"  battle pos: cmd 240 wrapped to {_wrap} is ignored after cmd 23/24, "
+          f"unwrapped to {_unw} before: {'OK' if _w_ok else 'FAIL'}")
+    ok &= _w_ok
+
+    # (4) LOBBY unchanged: cmd 240 taken verbatim, cmd 23/24 ignored, and a
+    # channel back from a battle gets its lobby position, never x 1343
+    _lc = _Ch(b"1234lobby")
+    _lp = (12.34, 0.0, -300.5)
+    _l_ok = (referee.battle_move_pos(_lc, _lp) == _lp
+             and referee.track_battle_motion(_lc, 23, _st, 0x1001) is None
+             and _lc.pos == (0.0, 5.0, 0.0) and not referee.leave_battle_pos(_lc))
+    _rc = _Ch(b"1234lobby")
+    _rc.pos = (10.0, 0.0, 20.0)
+    _rc.key = b"1234battle"
+    referee.enter_battle_pos(_rc, (64.0, 46.4, 0.0))
+    referee.track_battle_motion(_rc, 23, _st, 0x1001)
+    _rc.key = b"1234lobby"
+    _back = referee.leave_battle_pos(_rc)
+    _l_ok &= _back and _rc.pos == (10.0, 0.0, 20.0) and _rc.pos_src is None
+    _m = W.parse_move(bytes.fromhex("06000000" "25000000" "9200f700"))
+    _l_ok &= referee.battle_move_pos(_rc, _m["pos"]) == _m["pos"]
+    print(f"  battle pos: lobby keeps cmd 240 as is and ignores cmd 23/24; back "
+          f"from a battle the lobby position returns ({_rc.pos}): "
+          f"{'OK' if _l_ok else 'FAIL'}")
+    ok &= _l_ok
+    return ok
+
+
 def _pvp_room_pins():
     """FRONTLINE PvP (pvproom.py, 2026-10-07), no client: P1 the WAITING block
     on a creating sortie in a PvP selector (and nowhere else), the start on a
@@ -13305,6 +13398,7 @@ def _selftest_run(test_db):
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
     ok &= _pvp_room_pins()          # Frontline PvP rooms: waiting, start, judge, war (pvproom.py)
+    ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1

@@ -144,6 +144,13 @@ def room_queue(chan):
                     f"dressed {poplook.POP_LOOK_DEFER:g}s after joining bare")
             rs.look_sent = True
         elif (other.pos != rs.sent_pos
+              and getattr(other, "pos_src", None) == "state"):
+            # A battle pilot placed by its own cmd 23/24: that motion state
+            # already reaches this client verbatim (peerlink / squad relay),
+            # and a cmd 240 copy cannot carry past +/-327.67 on a map that
+            # runs to +/-2048. Nothing to re-encode.
+            rs.sent_pos = other.pos
+        elif (other.pos != rs.sent_pos
               and now - rs.sent_at >= room.ROOM_MIN_INTERVAL):
             try:
                 rs.pending.append(fmoworld.record_move(

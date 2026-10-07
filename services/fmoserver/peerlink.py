@@ -72,6 +72,11 @@ def peer_link_serve(chan, rs, got, addr):
                                               int(time.time() * 1000) & 0xFFFFFFFF,
                                               0), arg8=rs.alias))
             continue
+        if cmd in (fmoworld.CMD_BM_MOVE_ONE, fmoworld.CMD_BM_MOVE_BATCH) \
+                and len(got["plain"]) >= off + 12:
+            # a linked pilot's own movement rides this stream, not the self one
+            referee.track_battle_motion(
+                chan, cmd, body, struct.unpack_from("<I", got["plain"], off + 8)[0])
         if other is None or not other.tables:
             continue
         if coliseum.spectator_of_chan(chan) is not None:
@@ -178,4 +183,4 @@ def spectator_copies(chan, cmd, nb, own, flt, b_alias):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import addressing, groupchannel, room, roomrelay, squad  # noqa: E402
+from . import addressing, groupchannel, referee, room, roomrelay, squad  # noqa: E402

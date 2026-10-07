@@ -110,6 +110,84 @@ def battle_state(host, reset=False):
     return st
 
 
+#: KEY: WHERE A BATTLE PILOT IS (2026-10-07). chan.pos is what the referee range
+#: check, the hold:x,z,w,h objective, say-radius chat and a late room-mate's
+#: battle POP read. In a lobby it comes from cmd 240 (int16 hundredths,
+#: +/-327.67, proven). In a battle the map runs to +/-2048 and the client's
+#: own movement is cmd 23/24 (fmoworld.battle_motion_positions, s16 / 3.75),
+#: so a battle channel takes its position from the motion state naming its
+#: own unit and keeps cmd 240 only as a fallback, unwrapped against the last
+#: known position. chan.pos_src says which: "pop" (the spawn we served),
+#: "state" (cmd 23/24), "move" (cmd 240).
+def track_battle_motion(chan, cmd, body, arg8):
+    """Update a BATTLE channel's own position from a cmd 23/24 record about
+    its own unit. Returns the new (x, y, z) or None. Lobby: never touches it."""
+    if not (getattr(chan, "key", None) and chan.key.endswith(b"battle")):
+        return None
+    if cmd not in (fmoworld.CMD_BM_MOVE_ONE, fmoworld.CMD_BM_MOVE_BATCH):
+        return None
+    mine = chan.self_unit()
+    if mine is None:
+        return None
+    got = None
+    for uid, pos in fmoworld.battle_motion_positions(cmd, body, arg8):
+        if uid == mine:
+            got = pos
+    if got is None:
+        return None
+    _keep_lobby_pos(chan)
+    chan.pos, chan.pos_src = got, "state"
+    chan.state_pos_at = time.time()
+    return got
+
+
+def battle_move_pos(chan, pos):
+    """What a cmd-240 (x, y, z) means for `chan`. A lobby: exactly the cmd
+    240 position. A battle: None once cmd 23/24 has placed the pilot (the
+    motion state is authoritative and cmd 240 cannot carry past +/-327.67),
+    else the cmd 240 position unwrapped against the last known one."""
+    if not (getattr(chan, "key", None) and chan.key.endswith(b"battle")):
+        return pos
+    if getattr(chan, "pos_src", None) == "state":
+        return None
+    near = (getattr(chan, "pos", None)
+            if getattr(chan, "pos_src", None) in BATTLE_POS_SRCS else None)
+    _keep_lobby_pos(chan)
+    chan.pos_src = "move"
+    return fmoworld.unwrap_move_pos(pos, near)
+
+
+#: the chan.pos_src values that mean "a battle position", which a lobby must
+#: never inherit: a lobby room POP is held to +/-327.67 and a refused one is
+#: never retried, so a returning pilot left at x 1343 would vanish from the
+#: lobby for everyone.
+BATTLE_POS_SRCS = ("pop", "state", "move")
+
+
+def _keep_lobby_pos(chan):
+    """Remember the lobby position the first time a battle one replaces it."""
+    if getattr(chan, "pos_src", None) not in BATTLE_POS_SRCS:
+        chan.lobby_pos = getattr(chan, "pos", None)
+
+
+def enter_battle_pos(chan, pos):
+    """Seed a battle channel's position with the spawn its self POP serves."""
+    _keep_lobby_pos(chan)
+    chan.pos, chan.pos_src = tuple(pos[:3]), "pop"
+
+
+def leave_battle_pos(chan):
+    """A LOBBY channel still holding a battle position gets its lobby one
+    back (the pre-battle position, which is what it held before battles were
+    tracked). True when it did. A battle channel is left alone."""
+    if (getattr(chan, "key", None) and chan.key.endswith(b"battle")) or             getattr(chan, "pos_src", None) not in BATTLE_POS_SRCS:
+        return False
+    lp = getattr(chan, "lobby_pos", None)
+    chan.pos = tuple(lp) if lp is not None else tuple(battlepop.popsweep.POP_POS[:3])
+    chan.pos_src = None
+    return True
+
+
 def objective_zone_contains(rect, pos):
     x, z, w, h = rect
     return pos is not None and x <= pos[0] <= x + w and z <= pos[2] <= z + h

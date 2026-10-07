@@ -589,6 +589,105 @@ def record_move(pos, rot=0.0, flags=6, body_len=MOVE_BODY_LEN):
     return record(CMD_MOVE, bytes(body))
 
 
+#: One full turn of a cmd-240 axis: an int16 hundredth wraps every 655.36.
+MOVE_WRAP = 65536 * MOVE_K_POS
+
+
+def unwrap_move_pos(pos, near):
+    """A cmd-240 (x, y, z) moved by whole 655.36 turns to the copy nearest
+    `near` on each axis. Only for a BATTLE, where the map runs to +/-2048 and a
+    hundredths int16 overflows; a lobby position is never unwrapped. That the
+    client WRAPS rather than saturates past 327.67 is not proved (no battle
+    cmd 240 past it has been captured); a saturated axis reads +/-327.67 and
+    this leaves it where it is unless `near` is a turn away."""
+    if near is None:
+        return tuple(pos)
+    out = []
+    for v, n in zip(pos, near):
+        k = round((n - v) / MOVE_WRAP)
+        out.append(v + k * MOVE_WRAP)
+    return tuple(out)
+
+
+#: --- cmd 23 / cmd 24, BATTLE MOVEMENT: where a battle unit IS ---------------
+#:
+#: VERIFIED live 2026-10-06/07 (prod fmo.log, nine battle maps): the motion
+#: state (decoder 0x6104C2F0) is +0x00 u8, +0x01 u8 FLAGS, +0x02 u16, +0x04 u32
+#: sender clock, then the optional fields in flag order starting at +0x08.
+#: Flag bit 0 is the POSITION and comes first, so when it is set the unit
+#: stands at three int16 at state+0x08 (x, y, z) times 4/15 ([0x6132D980] =
+#: 0.26666668, i.e. x = s16 / 3.75), +/-8738 on each axis. A pilot on map 471
+#: walked x -101..1343, z -148..1477, which cmd 240's +/-327.67 cannot carry.
+#: cmd 23 is ONE state for the unit named at record +0x08; cmd 24 is u16 n
+#: then n x {u32 UnitID, state}, entry lengths per squad.move_state_len.
+CMD_BM_MOVE_ONE, CMD_BM_MOVE_BATCH = 23, 24
+MOTION_FLAGS = 0x01
+MOTION_HAS_POS = 0x01
+MOTION_POS = 0x08
+MOTION_K_POS = 4.0 / 15.0
+MOTION_POS_MAX = 32767 * MOTION_K_POS
+
+
+def motion_state_len(state, at=0):
+    """Byte length of one motion state at `at`, or None when it runs short."""
+    if at + 2 > len(state):
+        return None
+    f = state[at + MOTION_FLAGS]
+    n = (8 + 6 * bool(f & 0x01) + 2 * bool(f & 0x02) + 4 * bool(f & 0x04)
+         + 4 * bool(f & 0x08) + 2 * bool(f & 0x10) + 6 * bool(f & 0x20)
+         + 12 * bool(f & 0x40))
+    return n if at + n <= len(state) else None
+
+
+def parse_motion_pos(state, at=0):
+    """(x, y, z) world units out of one motion state at `at`, or None when
+    the state carries no position (flag bit 0 clear) or runs short."""
+    if at + MOTION_POS + 6 > len(state) or not state[at + MOTION_FLAGS] & MOTION_HAS_POS:
+        return None
+    return tuple(v * MOTION_K_POS
+                 for v in struct.unpack_from("<hhh", state, at + MOTION_POS))
+
+
+def battle_motion_positions(cmd, body, arg8):
+    """[(UnitID, (x, y, z))] for every unit a cmd 23 / cmd 24 body places, in
+    record order; [] for any other command or a body that does not parse."""
+    if cmd == CMD_BM_MOVE_ONE:
+        p = parse_motion_pos(body) if arg8 is not None else None
+        return [(arg8, p)] if p is not None else []
+    if cmd != CMD_BM_MOVE_BATCH or len(body) < 2:
+        return []
+    n = struct.unpack_from("<H", body, 0)[0]
+    at, out = 2, []
+    for _ in range(n):
+        if at + 4 > len(body):
+            break
+        uid = struct.unpack_from("<I", body, at)[0]
+        ln = motion_state_len(body, at + 4)
+        if ln is None:
+            break
+        p = parse_motion_pos(body, at + 4)
+        if p is not None:
+            out.append((uid, p))
+        at += 4 + ln
+    return out
+
+
+def record_motion_pos(pos, flags=MOTION_HAS_POS, clock=0):
+    """One minimal motion state carrying only a position (8 + 6 bytes), the
+    encode twin of parse_motion_pos for the selftest; the server relays the
+    clients' own states verbatim and builds none on the wire."""
+    for axis, v in zip("xyz", pos):
+        if not -MOTION_POS_MAX <= v <= MOTION_POS_MAX:
+            raise ValueError("%s=%g is outside the +/-%.1f a motion state can "
+                             "express" % (axis, v, MOTION_POS_MAX))
+    body = bytearray(MOTION_POS + 6)
+    body[MOTION_FLAGS] = flags & 0xFF
+    struct.pack_into("<I", body, 4, clock & 0xFFFFFFFF)
+    struct.pack_into("<hhh", body, MOTION_POS,
+                     *[int(round(v / MOTION_K_POS)) for v in pos[:3]])
+    return bytes(body)
+
+
 def record(cmd, body=b"", arg8=1, flt=REC_FLT_ONE):
     """One record, with the 0x10-byte header the accept path requires.
 

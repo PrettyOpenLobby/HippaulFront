@@ -187,6 +187,7 @@ def _serve_datagram(sock, peers, dg, addr):
     if (got and alias_rs is None and got.get("from") == 0 and got.get("ack") == 0
             and (chan.tx_base or chan.pending or chan.popped or chan.said)):
         was = chan.restart()
+        referee.leave_battle_pos(chan)     # back in a lobby: no battle position
         log(f"[udp {addr[0]}:{addr[1]}] \U0001f7e2 CHANNEL RESTARTED: the "
             f"peer is sending from record 0 and acking 0, so the new "
             f"scene has begun. Dropped tx_base={was[0]}, {was[1]} "
@@ -313,6 +314,8 @@ def _serve_datagram(sock, peers, dg, addr):
                 pvproom.note_cmd(chan, addr, cmd, body)
             _a8 = struct.unpack_from("<I", got["plain"], off + 8)[0] \
                 if off + 12 <= len(got["plain"]) else None
+            # WHERE THIS PILOT IS in a battle: its own cmd 23/24 motion state
+            referee.track_battle_motion(chan, cmd, body, _a8)
             if rooms._is_battle_chan(chan):
                 _nr = squad.squad_relay(chan, addr, cmd, body, _a8)
                 if cmd == squad.CMD_BM_HITLIST:
@@ -366,7 +369,13 @@ def _serve_datagram(sock, peers, dg, addr):
                 f"(0x611EAC0C) -- not reading a position out of it")
             continue
         _was = chan.pos
-        chan.pos, chan.rot = _m["pos"], _m["rot"]
+        # A lobby takes cmd 240 as is (proven). A battle takes its position from
+        # cmd 23/24 (referee.track_battle_motion) and only falls back to an
+        # unwrapped cmd 240 before the first of those.
+        _mpos = referee.battle_move_pos(chan, _m["pos"])
+        if _mpos is not None:
+            chan.pos = _mpos
+        chan.rot = _m["rot"]
         chan.move_flags, chan.moved_at = _m["flags"], time.time()
         #: VERIFIED: STAMPED WITH THE MapNo, because a coordinate without its map is
         #: not a spawn point. `WORLD_MAPS` already holds it -- the 0x0153 grant
@@ -655,7 +664,11 @@ def _serve_datagram(sock, peers, dg, addr):
                         _spawn_from_table = True
                 else:
                     _possrc += f" [FMO_BATTLE_SPAWNS: no row for battle map {_smap!r}]"
-            if not chan.moved_at:
+            if rooms._is_battle_chan(chan):
+                # A battle pilot starts where its battle POP puts it, whatever
+                # it did in the lobby; cmd 23/24 takes over from there.
+                referee.enter_battle_pos(chan, _pos)
+            elif referee.leave_battle_pos(chan) or not chan.moved_at:
                 # WARNING: Seed this player's ROOM position with the spawn actually
                 # served (the per-map POS_MAP row), not the global POP_POS the
                 # channel was constructed with (2026-09-05). Until a cmd 240
