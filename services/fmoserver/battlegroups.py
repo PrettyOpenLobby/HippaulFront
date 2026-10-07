@@ -1,6 +1,8 @@
 """Battle groups on the lobby side: create, join and comment (0x0156, 0x0157 -> 0x0158)."""
+import json
 import os
 import struct
+import threading
 import time
 from .knobs import _env_int
 from .wirelog import log
@@ -533,6 +535,7 @@ def bonus_request(gid, account, amount):
                                     f"{st['bonus']}; SE: it can be raised, never "
                                     f"lowered (D92 236)")
     st["bonus"] = amount
+    save_groups(f"group {gid} B.G.Bonus")
     return None
 
 
@@ -602,6 +605,7 @@ def group_battle_begin(gid, account, mapno, payer_id, now=None):
            "payer_id": payer_id, "disbanded": False}
     GROUP_BATTLE[gid] = rec
     PLATOON_CTX[account] = {"gid": gid, "battle": rec}
+    save_groups(f"group {gid} battle {rec['n']}")
     return rec
 
 
@@ -652,11 +656,16 @@ def group_disband(gid, why):
     BATTLE_GROUPS_MADE[:] = [g for g in BATTLE_GROUPS_MADE if g[1] != gid]
     GROUP_CREATOR_ACCOUNT.pop(gid, None)
     GROUP_STATE.pop(gid, None)
+    GROUP_SEEN.pop(gid, None)
+    for peer in [p for p, g in _RESTORED_PEERS.items() if g == gid]:
+        _RESTORED_PEERS.pop(peer, None)
+        BATTLE_GROUPS.pop(peer, None)
     rec = GROUP_BATTLE.get(gid)
     if rec is not None:
         rec["disbanded"] = True
     log(f"   GROUP {gid} DISBANDED ({why}): members {gone} released and the "
         f"Scramble Board row is gone")
+    save_groups(f"group {gid} disbanded")
     return gone
 
 
@@ -706,6 +715,7 @@ def group_change_leader(gid, account, target):
     st["leader"] = target
     st["bonus"] = 0
     GROUP_CREATOR_ACCOUNT[gid] = target
+    save_groups(f"group {gid} leader")
     n = groupchannel.group_push_flags(account) + groupchannel.group_push_flags(target)
     log(f"   GROUP {gid}: LEADER {account} -> {target}; B.G.Bonus cleared "
         f"(D92 237); cmd 191 queued on {n} group channel(s)")
@@ -798,6 +808,274 @@ def platoon_settle(account, won, own_id=None):
                            f"(AH/F98/D92 210)")
         out["disbanded"] = True
     return out
+
+
+# --------------------------------------------------------------------------- #
+# GROUPS SURVIVE A RESTART (2026-10-07). Manual p.42: logging out does not
+# take you out of your battle group, and groupchannel.group_reattach already
+# puts a relogged member back. But the groups themselves lived in this
+# process only, so every deploy dissolved every group. The standing groups
+# (members, leader, create-form numbers, comment, B.G.Bonus, battles fought,
+# each member's sortie setting) are now one JSON document, fmo_battle_groups
+# (migration 2006), written whole on every change like fmo_coliseum, and read
+# back at start. A battle in progress, a group sortie and the board's
+# on-sortie offer are NOT kept: the restart ends those with the battle
+# connections, and the members simply re-attach on their next login.
+# --------------------------------------------------------------------------- #
+#: FMO_GROUP_PERSIST=1 (default): keep the groups across a restart. 0 = the
+#: old in-memory groups (nothing is read or written).
+GROUP_PERSIST = _env_int("FMO_GROUP_PERSIST", "1") != 0
+#: FMO_GROUP_PERSIST_HOURS: a stored group none of whose members has been
+#: online for this long is NOT restored (it is dropped from the document).
+#: SE never published how long an abandoned group stood; 24 h is OURS, so a
+#: deploy never costs an active group and a dead one does not stand forever.
+#: 0 = no expiry.
+GROUP_PERSIST_HOURS = _env_int("FMO_GROUP_PERSIST_HOURS", "24")
+#: How often a member's keepalive may refresh its group's last-seen time in
+#: the stored document (the in-memory time moves on every keepalive).
+GROUP_SEEN_WRITE_S = 3600
+#: {GroupID: wall time a member was last online / the group last changed}.
+GROUP_SEEN = {}
+_SEEN_WRITTEN = {}
+#: {peer key: GroupID} of the BATTLE_GROUPS rows a restore made ("restored:N",
+#: so a new session on the same address cannot overwrite a restored comment).
+_RESTORED_PEERS = {}
+#: The next GroupID to hand out. WARNING: this used to be
+#: len(BATTLE_GROUPS_MADE) + 1, which REPEATS an id once a group is disbanded
+#: (groups 1 and 2, disband 1, the next create got 2 again). A restored
+#: document seeds it, so a restart cannot reuse a standing group's id either.
+_NEXT_GID = [1]
+#: loaded: the stored document has been read (or there is none); writes wait
+#: for it, so a process that could not read the table never writes an EMPTY
+#: document over the groups it failed to load. tried: monotonic of the last
+#: failed read (retried at most every GROUP_LOAD_RETRY_S).
+_PERSIST = {"loaded": False, "tried": None}
+_SAVE_LOCK = threading.Lock()
+GROUP_LOAD_RETRY_S = 60
+
+
+def next_group_id():
+    """A GroupID no standing group holds, never handed out before in this
+    process (or, with a stored document, before the restart)."""
+    ensure_groups_loaded()
+    used = ({g[1] for g in BATTLE_GROUPS_MADE} | set(GROUP_STATE)
+            | set(groupchannel.GROUP_MEMBERS))
+    gid = max(_NEXT_GID[0], max(used, default=0) + 1)
+    _NEXT_GID[0] = gid + 1
+    return gid
+
+
+def groups_document():
+    """The standing groups as the stored JSON document. A group with no
+    member left is not written (it is dissolved)."""
+    groups = {}
+    for peer, gid, leader, when in BATTLE_GROUPS_MADE:
+        mem = list(groupchannel.GROUP_MEMBERS.get(gid, []))
+        if not mem:
+            continue
+        rec = BATTLE_GROUPS.get(peer) or {}
+        st = GROUP_STATE.get(gid) or group_state(gid) or {}
+        groups[str(gid)] = {
+            "leader_name": leader or "", "made_at": float(when or 0),
+            "creator": GROUP_CREATOR_ACCOUNT.get(gid),
+            "comment": rec.get("comment") or "", "f114": rec.get("f114") or "",
+            "total_battles": int(rec.get("total_battles") or 0),
+            "state": {"total": int(st.get("total") or 0),
+                      "required": int(st.get("required") or 0),
+                      "bonus": int(st.get("bonus") or 0),
+                      "battles": int(st.get("battles") or 0),
+                      "leader": st.get("leader") or GROUP_CREATOR_ACCOUNT.get(gid)},
+            "members": mem,
+            "ready": {a: list(groupchannel.GROUP_READY[a]) for a in mem
+                      if a in groupchannel.GROUP_READY},
+            "seen": float(GROUP_SEEN.get(gid) or when or 0)}
+    return {"version": 1, "next_gid": _NEXT_GID[0], "groups": groups}
+
+
+def adopt_groups(doc, now=None, idle_hours=None):
+    """Restore the groups of a stored document into this process. A group
+    already standing here, one whose members have all been offline for
+    `idle_hours` (GROUP_PERSIST_HOURS), one with no member left or whose
+    leader is no longer a member is not restored. A member already in a
+    group here stays there. Returns (restored ids, {dropped id: why})."""
+    now = time.time() if now is None else now
+    idle_hours = GROUP_PERSIST_HOURS if idle_hours is None else idle_hours
+    doc = doc if isinstance(doc, dict) else {}
+    made = {g[1] for g in BATTLE_GROUPS_MADE}
+    restored, dropped = [], {}
+    for key, g in sorted((doc.get("groups") or {}).items(),
+                         key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
+        try:
+            gid = int(key)
+            st = dict(g.get("state") or {})
+            leader = st.get("leader") or g.get("creator")
+            seen = float(g.get("seen") or g.get("made_at") or 0)
+            members = [a for a in (g.get("members") or []) if a]
+        except (TypeError, ValueError, AttributeError):
+            dropped[key] = "unreadable"
+            continue
+        if gid <= 0 or gid in made or gid in GROUP_STATE:
+            dropped[gid] = "a group with this id already stands"
+            continue
+        if idle_hours > 0 and now - seen > idle_hours * 3600:
+            dropped[gid] = (f"no member online for {int((now - seen) // 3600)} h "
+                            f"(FMO_GROUP_PERSIST_HOURS={idle_hours})")
+            continue
+        members = [a for a in members if a not in groupchannel.GROUP_OF]
+        if not members:
+            dropped[gid] = "no member left"
+            continue
+        if not leader or leader not in members:
+            dropped[gid] = f"its leader {leader} is no longer a member"
+            continue
+        peer = f"restored:{gid}"
+        _RESTORED_PEERS[peer] = gid
+        BATTLE_GROUPS[peer] = {"leader": g.get("leader_name") or "",
+                               "comment": g.get("comment") or "",
+                               "total_battles": int(g.get("total_battles") or 0),
+                               "f114": g.get("f114") or "",
+                               "at": float(g.get("made_at") or 0)}
+        BATTLE_GROUPS_MADE.append((peer, gid, g.get("leader_name") or "",
+                                   float(g.get("made_at") or 0)))
+        GROUP_CREATOR_ACCOUNT[gid] = g.get("creator") or leader
+        GROUP_STATE[gid] = {"total": int(st.get("total") or 0),
+                            "required": int(st.get("required") or 0),
+                            "bonus": int(st.get("bonus") or 0) if BG_BONUS else 0,
+                            "battles": int(st.get("battles") or 0),
+                            "leader": leader}
+        groupchannel.GROUP_MEMBERS[gid] = list(members)
+        ready = g.get("ready") or {}
+        for a in members:
+            groupchannel.GROUP_OF[a] = gid
+            r = ready.get(a)
+            if isinstance(r, (list, tuple)) and len(r) == 2:
+                groupchannel.GROUP_READY[a] = (int(r[0]), int(r[1]))
+        GROUP_SEEN[gid] = seen
+        restored.append(gid)
+    BATTLE_GROUPS_MADE.sort(key=lambda g: g[1])
+    try:
+        nxt = int(doc.get("next_gid") or 1)
+    except (TypeError, ValueError):
+        nxt = 1
+    _NEXT_GID[0] = max(_NEXT_GID[0], nxt, max(restored, default=0) + 1)
+    return restored, dropped
+
+
+def _fmodb():
+    try:
+        import fmodb
+        return fmodb
+    except ImportError:
+        return None
+
+
+def read_groups_doc():
+    """(ok, document): ok False when the table could not be read (no
+    database, or it failed); document None when nothing is stored."""
+    fdb = _fmodb()
+    if fdb is None:
+        return False, None
+    try:
+        fdb.ready()
+        row = fdb.db.query_one("SELECT data FROM fmo_battle_groups WHERE id = 1")
+    except fdb.ERRORS:
+        return False, None
+    if not row:
+        return True, None
+    try:
+        d = json.loads(row["data"])
+    except ValueError:
+        return True, None
+    return True, (d if isinstance(d, dict) else None)
+
+
+def write_groups_doc(doc, now=None):
+    fdb = _fmodb()
+    if fdb is None:
+        return False
+    try:
+        fdb.ready()
+        fdb.db.upsert("fmo_battle_groups",
+                      {"id": 1, "data": json.dumps(doc, sort_keys=True),
+                       "updated_at": float(time.time() if now is None else now)},
+                      key="id")
+        return True
+    except fdb.ERRORS:
+        return False
+
+
+def ensure_groups_loaded(now=None):
+    """Read the stored groups once per process. True once that has happened
+    (or persistence is off); False while the table cannot be read."""
+    if not GROUP_PERSIST or _PERSIST["loaded"]:
+        return True
+    mono = time.monotonic()
+    if _PERSIST["tried"] is not None and mono - _PERSIST["tried"] < GROUP_LOAD_RETRY_S:
+        return False
+    ok, doc = read_groups_doc()
+    if not ok:
+        _PERSIST["tried"] = mono
+        return False
+    _PERSIST["loaded"] = True
+    restored, dropped = adopt_groups(doc, now=now)
+    if restored or dropped:
+        log(f"battle groups: restored {len(restored)} standing group(s) {restored} "
+            f"from fmo_battle_groups; their members are attached again on their "
+            f"next login (0x0174)"
+            + (f"; NOT restored: {dropped}" if dropped else ""))
+    if dropped:
+        save_groups("expired groups dropped")
+    return True
+
+
+def save_groups(why=""):
+    """Write the standing groups (groups_document). Skipped, with a warning,
+    while the stored document has not been read: writing then would replace
+    the groups that failed to load with whatever this process holds."""
+    if not GROUP_PERSIST:
+        return False
+    if not ensure_groups_loaded():
+        log(f"WARNING: battle groups NOT saved ({why}): the stored groups could "
+            f"not be read yet (no database?), so a write could erase them")
+        return False
+    # built and written under one lock: two sessions saving at once must not
+    # let the older document land last
+    with _SAVE_LOCK:
+        try:
+            done = write_groups_doc(groups_document())
+        except Exception as e:                   # noqa: BLE001 -- never cost the request
+            log(f"WARNING: battle groups NOT saved ({why}): {e!r}")
+            return False
+    if not done:
+        log(f"WARNING: battle groups NOT saved ({why}): fmo_battle_groups could "
+            f"not be written -- they live until a restart")
+        return False
+    return True
+
+
+def group_seen(gid, now=None):
+    """A member of `gid` is online: its group is not abandoned. Written to the
+    document at most every GROUP_SEEN_WRITE_S."""
+    if not gid or gid not in groupchannel.GROUP_MEMBERS:
+        return False
+    now = time.time() if now is None else now
+    GROUP_SEEN[gid] = now
+    if now - _SEEN_WRITTEN.get(gid, 0) >= GROUP_SEEN_WRITE_S:
+        _SEEN_WRITTEN[gid] = now
+        return save_groups(f"group {gid} seen")
+    return False
+
+
+def load_at_start():
+    """The service's start: read the stored groups before the first login."""
+    if not GROUP_PERSIST:
+        log("battle groups: FMO_GROUP_PERSIST=0, groups live in this process only")
+        return False
+    if not ensure_groups_loaded():
+        log("WARNING: battle groups not loaded at start (the database is "
+            "unusable); they load on first use")
+        return False
+    return True
 
 
 # Called at run time only; imported last so that import cycles resolve.

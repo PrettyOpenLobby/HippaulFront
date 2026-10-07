@@ -118,6 +118,71 @@ S163_ON_SORTIE, S163_SECTOR, S163_MAPROW = 0x00, 0x10, 0x14
 REPLY_0163_LEN = 0x668
 
 
+#: KEY: HOW LONG A MEMBER MAY STILL FOLLOW ITS GROUP ONTO THE MAP (manual p.54,
+#: "If you joined a group that is already on sortie"): "If Battle Start has
+#: not been selected (standby), you can sortie up to 20 minutes. When the
+#: standby time passes 20 minutes, it automatically becomes Battle Start.
+#: Even after the battle has started, sortieing is possible until less than
+#: 5 minutes have elapsed." So the 20 minutes is the BATTLE MAP's standby, not
+#: a timer on a Not-Ready member (that rule is the auto-kick at the leader's
+#: sortie, battlegroups.auto_remove_unready). The offer is 0x0163's on-sortie
+#: flag (9:10); it used to stand for max(MISSION_TIME, 600) s whatever the
+#: battle did. FMO_GROUP_STANDBY (1200) and FMO_GROUP_LATE_JOIN (300) are SE's
+#: numbers; FMO_GROUP_STANDBY=0 restores the old fixed offer. On this server
+#: only a Frontline matching room (pvproom) is ever served in standby; every
+#: other battle starts at the sortie, so its offer is the 5 minutes after it.
+GROUP_STANDBY_S = _env_int("FMO_GROUP_STANDBY", "1200")
+GROUP_LATE_JOIN_S = _env_int("FMO_GROUP_LATE_JOIN", "300")
+
+
+def _group_battle_room(so):
+    """The Frontline matching room the group's sortie went into, or None
+    (read only; pvproom keys its members by battle key, with the account)."""
+    try:
+        from . import pvproom
+        for room in list(pvproom.ROOMS.values()):
+            if room.get("mapno") != so.get("map"):
+                continue
+            if any(m.get("account") == so.get("by")
+                   for m in list(room.get("members", {}).values())):
+                return room
+    except Exception:
+        return None
+    return None
+
+
+def group_sortie_open(gid, now=None, room=None, look=True):
+    """(open, why): may a member of `gid` still follow its group's sortie
+    (the 0x0163 on-sortie offer)? SE's rule above. `room` is the matching
+    room to judge by; left out it is looked up (look=False: none, so the
+    battle started at the sortie)."""
+    so = GROUP_SORTIE.get(gid)
+    if not so:
+        return False, "the group is not on a sortie"
+    now = time.time() if now is None else now
+    at = float(so.get("at") or 0)
+    if GROUP_STANDBY_S <= 0:
+        lim = max(missionblock.MISSION_TIME, 600)
+        return now - at < lim, f"FMO_GROUP_STANDBY=0: the fixed {lim} s offer"
+    if room is None and look:
+        room = _group_battle_room(so)
+    standby_end = at + GROUP_STANDBY_S
+    if room is not None and room.get("verdict") is not None:
+        return False, "the battle is over"
+    started = room.get("started") if room is not None else at
+    if started is None:
+        if now < standby_end:
+            return True, (f"standby (Battle Start not chosen), "
+                          f"{int(now - at)} s of {GROUP_STANDBY_S} s")
+        started = standby_end
+    started = min(float(started), standby_end)
+    if now < started + GROUP_LATE_JOIN_S:
+        return True, (f"the battle started {int(now - started)} s ago, under "
+                      f"{GROUP_LATE_JOIN_S} s")
+    return False, (f"the battle started {int(now - started)} s ago; joining "
+                   f"closes {GROUP_LATE_JOIN_S} s after the start (manual p.54)")
+
+
 def reply_0163(gid):
     """The 0x0163 body for group `gid`: its members at +0x80/+0x84 (the
     board's Player List, for creator, joiner and a pre-join viewer alike) and,
@@ -128,7 +193,7 @@ def reply_0163(gid):
     struct.pack_into("<I", b, S158_PLAYERS_N, n)
     b[S158_PLAYERS:S158_PLAYERS + len(rows)] = rows
     so = GROUP_SORTIE.get(gid)
-    if so and time.time() - so["at"] < max(missionblock.MISSION_TIME, 600):
+    if so and group_sortie_open(gid)[0]:
         b[S163_ON_SORTIE] = 1
         struct.pack_into("<I", b, S163_SECTOR, so["sector"])
         row = so["row"][:0x6C]
@@ -282,7 +347,8 @@ def group_member_live(account, now=None):
 #: GROUP_MEMBERS still lists it. FMO_GROUP_REATTACH=1 (default): on the
 #: session's first keepalive, a pilot whose group still exists on this
 #: server is attached to it again with the same 0x0174 push a JOIN uses.
-#: Groups live in this process only, so a server restart still ends them.
+#: Since 2026-10-07 the groups are also stored (battlegroups.save_groups,
+#: fmo_battle_groups), so a member is re-attached after a server restart too.
 GROUP_REATTACH = _env_int("FMO_GROUP_REATTACH", "1") != 0
 
 
@@ -290,12 +356,19 @@ def group_reattach(sess, conn_id):
     """The 0x0174 that puts `sess`'s pilot back in its battle group after a
     relog, once per session, or None. The group must still exist (not
     disbanded) and still list the account."""
+    # a member online keeps its group from expiring (battlegroups.GROUP_SEEN);
+    # first use also reads the stored groups if the start could not
+    try:
+        _acct = sess.account
+    except Exception:
+        _acct = None
+    if _acct and battlegroups.ensure_groups_loaded():
+        battlegroups.group_seen(GROUP_OF.get(_acct))
     if not GROUP_REATTACH or getattr(sess, "group_reattach_done", False):
         return None
     sess.group_reattach_done = True
-    try:
-        acct = sess.account
-    except Exception:
+    acct = _acct
+    if not acct:
         return None
     gid = GROUP_OF.get(acct) if acct else None
     if (not gid or acct not in GROUP_MEMBERS.get(gid, [])
@@ -400,12 +473,31 @@ def group_join(gid, account):
     old = GROUP_OF.get(account)
     if old and old != gid and account in GROUP_MEMBERS.get(old, []):
         GROUP_MEMBERS[old].remove(account)
+        _dissolve_if_left(old, account)
     mem = GROUP_MEMBERS.setdefault(gid, [])
     if account not in mem:
         mem.append(account)
     GROUP_OF[account] = gid
     _joined_at[account] = time.monotonic()
+    battlegroups.GROUP_SEEN[gid] = time.time()
+    battlegroups.save_groups(f"{account} joined group {gid}")
     return True
+
+
+def _dissolve_if_left(gid, account):
+    """`account` has just left `gid`: SE's lifetime rules. The leader leaving
+    disbands the group (AH/F98/D92 214-215, the 0x0172 arm), and a group
+    with no member left is dissolved, so neither stands on the board or in
+    the stored document. True when it was disbanded."""
+    if gid not in GROUP_MEMBERS:
+        return False
+    if not GROUP_MEMBERS.get(gid):
+        battlegroups.group_disband(gid, f"its last member {account} left")
+        return True
+    if battlegroups.group_leader(gid) == account:
+        battlegroups.group_disband(gid, f"its leader {account} left it")
+        return True
+    return False
 
 
 def group_leave(account):
@@ -416,6 +508,8 @@ def group_leave(account):
         GROUP_MEMBERS[gid].remove(account)
     GROUP_READY.pop(account, None)
     _joined_at.pop(account, None)
+    if gid is not None and not _dissolve_if_left(gid, account):
+        battlegroups.save_groups(f"{account} left group {gid}")
     return gid
 
 

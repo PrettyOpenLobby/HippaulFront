@@ -196,6 +196,22 @@ def parse_lobapi_mark(spec):
     return out
 
 
+#: KEY: TWO CLIENT NOTICES THAT OWE NOTHING BACK. Both come in on the queue
+#: sequence 0x7FFFFFFE, the one the keepalive (0x0198) uses, which no request
+#: object polls; the client enqueues them and does not wait (static: 0x6117A56B
+#: enqueues 0x0131, 0x61174740 enqueues 0x0189 with one status byte; prod log
+#: from 2026-08-22: each arrives right after a scene exit / logout, body of
+#: 0x0189 = 01 00 00 00, and the session goes on with no reply). Until
+#: 2026-10-07 each fell through to "no handler" (several hundred lines in
+#: fmo.log); session.py now names them and stays silent, as before.
+#: WARNING: 0x0131 here is the CLIENT's message with the same number as our
+#: start-game reply (handshake.MSG_START_GAME_OK); the client never reads ours.
+CLIENT_NOTICES = {
+    0x0131: "a client notice after a scene exit (0x6117A56B)",
+    0x0189: "a client status notice (0x61174740, one status byte)",
+}
+
+
 try:
     MARK_LOBAPI = parse_lobapi_mark(os.environ.get("FMO_LOBAPI_MARK", ""))
 except ValueError as _e:

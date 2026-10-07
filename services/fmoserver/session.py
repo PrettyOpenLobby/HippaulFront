@@ -1986,6 +1986,7 @@ class Session(
                 _rd = _b[4] or _old[0]
                 _ct = _b[7] or _old[1]
                 groupchannel.GROUP_READY[self.account] = (_rd, _ct)
+                battlegroups.save_groups(f"{self.account} sortie setting")
                 _nq = groupchannel.group_push_flags(self.account)
                 log(f"{self.peer}   SORTIE SETTING: {self.account} is "
                     f"{'READY' if _rd == 1 else 'STANDING BY' if _rd == 2 else 'unset'}"
@@ -2272,7 +2273,9 @@ class Session(
             # and the group connection's first message lands in this log as the
             # next decode. The 88-B block (+0x20 -> globals+0x128) is the same
             # unidentified structure 0x0153 carries at +0x124; zeros, like there.
-            _gid = len(battlegroups.BATTLE_GROUPS_MADE) + 1
+            # next_group_id: len(BATTLE_GROUPS_MADE) + 1 repeated an id after
+            # a disband, and restored groups (fmo_battle_groups) hold theirs
+            _gid = battlegroups.next_group_id()
             battlegroups.BATTLE_GROUPS_MADE.append((self.peer, _gid, _leader, time.time()))
             battlegroups.GROUP_CREATOR_ACCOUNT[_gid] = self.account
             _pst = battlegroups.register_group(_gid, self.account, _form)
@@ -2718,6 +2721,14 @@ class Session(
                     f"-- the re-entered script played the tutorial again; NOT "
                     f"re-granting (one-shot), so this cannot loop.")
             return outs
+
+        if p["msg"] in lobapi.CLIENT_NOTICES:
+            # 0x0131 / 0x0189: fire-and-forget notices on the queue sequence
+            # (see lobapi.CLIENT_NOTICES); nothing polls, nothing is owed.
+            log(f"{self.peer}   0x{p['msg']:04X} = {lobapi.CLIENT_NOTICES[p['msg']]} "
+                f"({len(p['payload'])}B {p['payload'][:8].hex(' ')}): a client "
+                f"notice, no reply")
+            return []
 
         if p["msg"] == charselect.MSG_KEEPALIVE:
             # 8 bytes: SECONDS and MICROSECONDS of the client's synced clock

@@ -71,6 +71,8 @@ def run():
             # the stored state
             log("WARNING: war state not loaded at start (the database is "
                 "unusable); it loads on first use")
+        # the standing battle groups a restart must not dissolve (2006)
+        battlegroups.load_at_start()
     log(f"listening on {wirelog.PORT} -- FMO world door [build {room.BUILD}] "
         + (f"TCP + UDP world channel (hid={udpconfig.UDP_HID}, "
            f"endpoint {addressing.BATTLE_HOST}:{addressing.BATTLE_PORT}, key {room._udp_key_hint()})"
@@ -293,7 +295,7 @@ def run():
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    addressing, charlist, charstore, devtool, identity, lobapi, missiongroups, move, popself,
+    addressing, battlegroups, charlist, charstore, devtool, identity, lobapi, missiongroups, move, popself,
     popsweep, resume, room, sectorwins, sortie, sortiepush, squadron, status, tcpserver,
     udpconfig, warstate, worldchannel, zonecontrol, zoneentry,
 )
