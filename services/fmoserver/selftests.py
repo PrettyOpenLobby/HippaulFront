@@ -2570,10 +2570,13 @@ def _battle_spawn_pins():
              and _apart(_sqa) and len(_sqb) == 8 and _apart(_sqb)
              and all(p[2] == -32.0 for p in _sqb)
              and len(_sqs) == 5 and _apart(_sqs)
+             and _sqs[0] == (20.0, 30.0, 120.0, 0.0)
              and all(math.hypot(p[0], p[2] + 120) >= 100 for p in _sqs)
+             and _apart(_sqs[1:], battlepop.SPAWN_FALLBACK_GAP - 0.1)
              and battlepop.squad_spawn_positions(999, 0, 3, rows=_rows) is None)
     print(f"  spawns: the squad takes the other side's slots, >= 12 apart (a short "
-          f"row falls back to a spread line): {'OK' if _s_ok else 'FAIL'}")
+          f"row uses its spare pilot slot, then a line {battlepop.SPAWN_FALLBACK_GAP:g} "
+          f"apart): {'OK' if _s_ok else 'FAIL'}")
     ok &= _s_ok
 
     # (4) battle_squad_for places a NEW squad on the given positions, else the
@@ -2648,7 +2651,45 @@ def _battle_spawn_pins():
               f"slots inside +/-300 and >= 12 apart, sides >= 100 apart, map 471 "
               f"present: {'OK' if _t_ok else 'FAIL ' + str(_bad[:5])}")
         ok &= _t_ok
+        ok &= _battle_spawn_ground_pins(_apart)
     return ok
+
+
+def _battle_spawn_ground_pins(_apart):
+    """THE SHIPPED TABLE IS CUT FROM COLLISION (fmospawns.py, 2026-10-07).
+    The live facts it is pinned to: on 471 the open ground is y 32 (11 min of
+    pilot movement at 31.7..32.3); on 86 the floors are 25.3/27.2 with the
+    arena at 32.2 and a unit settles on the highest; units 40 apart stacked,
+    so every side's slots are >= 50 apart. A row in the old shape (placement
+    source, 16-unit slots) fails the same test."""
+    rows = battlepop.BATTLE_SPAWN_ROWS
+    bad = []
+    for m, r in rows.items():
+        if not r["source"].startswith("collision:"):
+            bad.append((m, "source"))
+        for k in ("a", "b"):
+            if not _apart([(x, 0.0, z) for x, z in r[k + "_slots"]], 50.0):
+                bad.append((m, k + " spacing"))
+        if not -327.67 <= r["y"] <= 300.0:
+            bad.append((m, "y"))
+    # the five maps the placement-only reader could not serve now have rows
+    for m in (122, 169, 445, 446, 448):
+        if m not in rows:
+            bad.append((m, "missing"))
+    r471, r86 = rows.get(471), rows.get(86)
+    if r471 is None or not 16.0 <= r471["y"] <= 28.0:
+        bad.append((471, "y vs live ground 32"))
+    if r86 is None or not 19.0 <= r86["y"] <= 28.2:
+        bad.append((86, "y vs live floors 25.3..32.2"))
+    twin = {"source": "placement sec4:169 objects/232 tiles",
+            "a_slots": [(-80.0, -80.0), (-94.1, -65.9)]}
+    twin_fails = (not twin["source"].startswith("collision:")
+                  and not _apart([(x, 0.0, z) for x, z in twin["a_slots"]], 50.0))
+    g_ok = not bad and twin_fails and len(rows) >= 225
+    print(f"  spawns: shipped table from COLLISION, {len(rows)} maps (122 169 445 446 "
+          f"448 included), slots >= 50 apart, 471 y under live ground 32, 86 under "
+          f"25.3..32.2, an old-shape row fails: {'OK' if g_ok else 'FAIL ' + str(bad[:6])}")
+    return g_ok
 
 
 def _wanzer_paint_pins():

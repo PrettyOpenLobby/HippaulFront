@@ -169,19 +169,23 @@ else:
 #: its side's point (side 0 = A, side 1 = B: popnation.battle_side_for, the
 #: arena team in a match); the squad takes the OTHER side's slots. A map with
 #: no row keeps FMO_BATTLE_POS and the old squad line, byte for byte.
-#: WARNING: the points avoid every object in the map's placement table but not
-#: terrain relief (hills are in the undecoded terrain mesh), and y is an
-#: estimate set 4 below the ground: the client lifts a unit popped under the
-#: surface onto it (every battle so far popped at y 5), so low is the proven
-#: side to err on.
+#: Since 2026-10-07 the table is cut from the map's COLLISION meshes: every slot
+#: stands where the highest surface is open, flat ground (no roof, bridge or
+#: hill top), and y is the lowest slot ground minus 4. The ground read matched
+#: the decoded y of 2,720 of 2,735 live movement positions on nine battle maps.
+#: The client lifts a unit popped under the surface onto the HIGHEST surface
+#: under it (map 86: popped at 5, settled at 32.2 over floors at 25 and 27).
+#: WARNING: units 40 apart stacked (map 86, 16:16Z), so slots are 56 apart; the
+#: spacing is not proved to be enough.
 BATTLE_SPAWNS = _env_int("FMO_BATTLE_SPAWNS", "1") != 0
 BATTLE_SPAWNS_TSV = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fmodata",
     "fmo-battle-spawns.tsv")
 #: slots 0..SPAWN_PILOT_SLOTS-1 of a side are its pilots', the rest its squad's
 SPAWN_PILOT_SLOTS = 4
-#: the line a squad falls back to when a row has too few slots for it
-SPAWN_FALLBACK_GAP = 20.0
+#: the line a squad falls back to when a row has too few slots for it (units
+#: 40 apart stacked live, so the line is as wide as the table's slots)
+SPAWN_FALLBACK_GAP = 56.0
 
 
 def _parse_slots(text):
@@ -256,13 +260,18 @@ def battle_spawn_pos(mapno, side, index=0, rows=None):
 
 def squad_spawn_positions(mapno, pilot_side, n, rows=None):
     """n (x, y, z, 0.0) drop points for the enemy squad of a `pilot_side`
-    pilot: the OTHER side's squad slots (4..11), then, if the row has too few,
-    a line SPAWN_FALLBACK_GAP apart behind its point. None without a row."""
+    pilot: the OTHER side's squad slots (4..11), then that side's spare pilot
+    slots from the last (a pilot takes the lowest free one), then, if the row
+    is still short, a line SPAWN_FALLBACK_GAP apart behind its point (not
+    checked against the ground). None without a row."""
     row = spawn_row(mapno, rows)
     if row is None:
         return None
     k = "a" if spawn_side_key(pilot_side) == "b" else "b"
     slots = list(row[k + "_slots"][SPAWN_PILOT_SLOTS:])
+    if len(slots) < n:
+        spare = row[k + "_slots"][1:SPAWN_PILOT_SLOTS][::-1]
+        slots += spare[:n - len(slots)]
     if len(slots) < n:
         px, pz = row[k]
         ox, oz = row["a" if k == "b" else "b"]
