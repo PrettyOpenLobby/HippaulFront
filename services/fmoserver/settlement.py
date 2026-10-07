@@ -237,6 +237,7 @@ class SessionSettlement:
                     f"H$ {pay['kill_bonus_hs']} (update 050628 22-24)")
             end["join_pct"] = jp
         self.platoon_end = end
+        self.platoon_n = pl["n"] if pl else None   # training.py: PCs on the side
         return money, rows
 
     def loot_battle_settle(self, won, now=None, rnd=None):
@@ -687,7 +688,8 @@ class SessionSettlement:
                                           exp_rows=rows, won=_won,
                                           victory=_won and bool(st["contribution"]),
                                           next_battle=next_battle, no_screen=_empty,
-                                          **(getattr(self, "platoon_end", None) or {}))
+                                          **(getattr(self, "platoon_end", None) or {}),
+                                          **training.battle_end_fields(self, st))
         log(f"{self.peer}   -> 0x{battleend.MSG_BATTLE_END:04X} BATTLE END push, "
             f"{battleend.S14C_LEN}B on queue seq 0x{pushes.QUEUE_SEQ:08X}, trigger: {why}: "
             f"{'WON' if _won else 'LOST'} "
@@ -816,3 +818,4 @@ from . import hangar  # noqa: E402  (hangar rank at the battle end)
 from . import penalty  # noqa: E402  (the friendly-fire report and vote)
 from . import loot, squad  # noqa: E402  (loot_battle_settle)
 from . import pvproom  # noqa: E402  (the PvP room's war settle)
+from . import training  # noqa: E402  (the training result ranking feed)

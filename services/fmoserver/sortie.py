@@ -621,6 +621,9 @@ class SessionSortie:
             _fr = progress.progress_frontier(_pc) if _pc else []
             log(f"{self.peer}   progression armed for the return: frontier = "
                 + (" | ".join(m["title"] for m in _fr) if _fr else "(nothing)"))
+        # TRAINING (training.py): note a training sortie; FMO_TRAINING_KIND=1
+        # marks its block kind 1 so the Training Result window opens after it
+        body = training.on_sortie_granted(self, q, body, R13A_BLOCK)
         outs = [packet.build(MSG_SORTIE_REPLY, body, self.reply_seq(), p["conn"])]
         # PLATOON: the B.G.Bonus debit and the group battle record. Never
         # costs the pilot the sortie it was just granted.
@@ -744,3 +747,4 @@ from . import penalty  # noqa: E402  (the penalty refusal hook)
 from . import solo  # noqa: E402  (the solo area)
 from . import coliseum  # noqa: E402  (Coliseum spectators)
 from . import pvproom  # noqa: E402  (Frontline matching rooms)
+from . import training  # noqa: E402  (the training sortie and its ranking)

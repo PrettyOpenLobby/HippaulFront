@@ -88,6 +88,9 @@
                       streak board), official and player-hosted arenas, the waiting window.
     pvproom.py        Frontline matching battles: WAITING FOR OPPONENTS, the start, the room
                       judge and the war settle.
+    training.py       The training ground's result: the 0x014C fields that feed the client's own
+                      "Training result ranking" file, and the server's copy per pilot.
+    events.py         SE's timed events kept in client data: the commemorative service medal.
     pilotrecord.py    Session's pilot record: money, class experience, flags, passes, salary,
                       the ceasefire bonus and the officer review.
     settlement.py     Session's battle settlement: kill bonuses, mission and war results, the

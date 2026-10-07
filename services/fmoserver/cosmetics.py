@@ -156,16 +156,19 @@ except ValueError as _e:
     raise SystemExit(str(_e))
 
 
-def price_for(kind):
+def price_for(kind, rid=None):
     """The H$ a row of `kind` costs. OURS, never SE's (see the WARNING above):
-    FMO_COSMETIC_PRICES per kind, else FMO_COSMETIC_PRICE."""
+    FMO_COSMETIC_PRICES per kind, else FMO_COSMETIC_PRICE. The service medal
+    is SE's own H$10 (events.py)."""
+    if rid is not None and events.is_medal(kind, rid):
+        return events.MEDAL_PRICE
     return max(0, int(COSMETIC_PRICES.get(kind, COSMETIC_PRICE)))
 
 
 def in_stock(kind, rid):
     """True when the paint shop sells (kind, rid). Kinds 0/1 (the pilot
     locker) are not paint and are never filtered here."""
-    if kind not in BUY_KIND_CAT:
+    if kind not in BUY_KIND_CAT or events.is_medal(kind, rid):
         return True
     if kind not in COSMETIC_STOCK:
         return False
@@ -191,7 +194,7 @@ def buy_verdict(rid, kind, nation, money, owned_ids):
     if cat is None:
         v["why"] = f"kind {kind} is not a paint kind (2 camo, 3 colour, 4 insignia)"
         return v
-    row = next((r for r in COSMETICS.get(kind, ()) if r[0] == rid), None)
+    row = next((r for r in events.with_medal(COSMETICS).get(kind, ()) if r[0] == rid), None)
     if row is None:
         v["why"] = f"kind {kind} id {rid} is not in the catalogue (fmo-cosmetics.tsv)"
         return v
@@ -206,7 +209,7 @@ def buy_verdict(rid, kind, nation, money, owned_ids):
     if not in_stock(kind, rid):
         v["why"] = f"{row[2]!r} is not stocked (FMO_COSMETIC_STOCK)"
         return v
-    price = price_for(kind)
+    price = price_for(kind, rid)
     v["price"] = price
     if money < price:
         v["why"] = f"{row[2]!r} costs {price} H$ and the pilot has {money}"
@@ -297,7 +300,7 @@ def cosmetics_for(screen, nation):
     nation -- the client's own rule for insignia. Capped at A3_ROW_MAX."""
     rows = []
     for kind in A2_KINDS.get(screen, ()):
-        for rid, flag, en in COSMETICS.get(kind, ()):
+        for rid, flag, en in events.with_medal(COSMETICS).get(kind, ()):
             if flag in (0, nation) and in_stock(kind, rid):
                 rows.append((kind, rid, en))
     return rows[:A3_ROW_MAX]
@@ -315,5 +318,8 @@ def reply_01a3(need, req, nation):
     struct.pack_into("<I", b, A3_COUNT_OFF, len(rows))
     for i, (kind, rid, _en) in enumerate(rows):
         struct.pack_into("<HBBI", b, A3_ROW_OFF + i * A3_ROW_LEN,
-                         rid & 0xFFFF, kind & 0xFF, 0, price_for(kind))
+                         rid & 0xFFFF, kind & 0xFF, 0, price_for(kind, rid))
     return bytes(b)
+
+
+from . import events  # noqa: E402  (the service medal rows and price)

@@ -14219,6 +14219,7 @@ def _selftest_run(test_db):
     ok &= _war_phase_pins()         # a whole war phase offline: judge, reset, reward, restart (fmowar)
     ok &= _shop_acquire_pins()      # item shop buy 0x0168 -> 0x016B: gate at packet+0x28 (shop.py)
     ok &= _part_fit_pins()          # part buy = fit of pending+8: real record, stock, owned (shop.py)
+    ok &= _training_events_pins()   # training ranking feed (0x014C +0x110) + service medal
     ok &= _community_ps2_pins()     # PS2 community dialect (op 1 HELLO) + mission nation rules
 
     print("SELFTEST", "PASS" if ok else "FAIL")
@@ -14628,3 +14629,119 @@ from . import (  # noqa: E402
 )
 from . import loot, settlement  # noqa: E402  (the spoils / order pins)
 from . import missiongroups  # noqa: E402  (the mission group pins)
+
+
+def _training_events_pins():
+    """TRAINING RANKING + SERVICE MEDAL (training.py, events.py, 2026-10-07),
+    no client: the 0x014C ranking feed read back the way 0x610D1580 reads it,
+    the client's insert order, the 0xE4 file, the sortie hooks, and the medal
+    on the paint shop's catalogue, price and verdict."""
+    from . import battleend as _be, cosmetics as _co, events as _ev, referee as _rf
+    from . import training as _tr
+    ok = True
+    # 1. the feed: both nations, platoon fields written over do not disturb it
+    for _nat in (1, 2):
+        _f = _tr.end_fields(_nat, 3, 2, 800, 400.0)
+        _b = _be.battle_end_body(won=True, platoon_money=5, platoon_payer=7, **_f)
+        ok &= _tr.client_row(_b, _nat) == (800, 400, 3, 2)
+        ok &= struct.unpack_from("<I", _b, _be.S14C_REPLAY)[0] == 1
+        ok &= struct.unpack_from("<I", _b, _be.S14C_PLATOON_MONEY)[0] == 5
+    ok &= _tr.client_row(_be.battle_end_body(), 1) is None
+    ok &= _tr.TRAINING_FLAG == _be.S14C_REPLAY and _be.S14C_TAIL + _tr.TAIL_SCORE == 0x2E0
+    _c1 = ok
+    # 2. the client's insert: higher score first, equal score keeps the
+    # higher per-minute first, an equal pair goes in front, the 11th drops
+    _rows = []
+    for _r in [(500, 100, 1, 1, 1), (800, 50, 1, 1, 2), (500, 200, 1, 1, 3), (500, 100, 2, 1, 4)]:
+        _rows, _ = _tr.insert(_rows, _r)
+    ok &= [r[4] for r in _rows] == [2, 3, 4, 1]
+    for _i in range(10):
+        _rows, _ = _tr.insert(_rows, (900, 1, 0, 1, 10 + _i))
+    _rows, _at = _tr.insert(_rows, (1, 0, 0, 1, 99))
+    ok &= len(_rows) == 10 and _at is None and _tr.insert([], (0, 0, 0, 1, 5))[1] == 0
+    _fb = _tr.file_body((800, 400, 3, 2, 7), [(900, 1, 0, 1, 10)])
+    ok &= (len(_fb) == 0xE4 and struct.unpack_from("<i", _fb, 0x08)[0] == 800
+           and struct.unpack_from("<i", _fb, 0x1C)[0] == 900)
+    _c2 = ok
+    # 3. our score and the board
+    ok &= _tr.score_for(3, True, 120) == (3 * _tr.KILL_SCORE + _tr.WIN_SCORE,
+                                         (3 * _tr.KILL_SCORE + _tr.WIN_SCORE) / 2)
+    ok &= _tr.score_for(0, False, 10) == (0, 0.0)
+    _chars = [{"id": 1, "first": "A", "last": "B", "training_scores": [[300, 50, 0, 1, 0]]},
+              {"id": 2, "first": "C", "last": "D", "training_scores": [[700, 10, 0, 1, 0]]},
+              {"id": 3, "first": "E", "last": "F"}]
+    ok &= ([r[3] for r in _tr.leaderboard(_chars)] == [2, 1] and _tr.own_rank(_chars, 1) == 2
+           and _tr.own_rank(_chars, 3) is None)
+    _c3 = ok
+
+    # 4. the hooks: the flag lives in the battle state; kind 1 only when armed
+    class _S:
+        peer = "train:0"
+        account = "train:0"
+
+        def battle_key(self):
+            return self.account
+
+        def playing_char(self):
+            return self._pc
+
+        def commit(self, why):
+            self.commits.append(why)
+    _s = _S()
+    _s._pc, _s.commits = {"id": 9, "nation_byte": 1}, []
+    _rf.battle_state(_s.account, reset=True)
+    _body = bytes(0x2C + 0x100)
+    _kind_was, _sv = _tr.KIND, charstore.CHAR_STORE
+    try:
+        _tr.KIND = False
+        _out = _tr.on_sortie_granted(_s, {"create": 3}, _body, 0x2C)
+        ok &= _out == _body and _rf.BATTLE_STATE[_s.account]["training"] is True
+        _tr.KIND = True
+        _out = _tr.on_sortie_granted(_s, {"create": 2}, _body, 0x2C)
+        ok &= struct.unpack_from("<I", _out, 0x2C + 0x6C)[0] == 1
+        _out = _tr.on_sortie_granted(_s, {"create": 0}, _body, 0x2C)
+        ok &= _out == _body and _rf.BATTLE_STATE[_s.account]["training"] is False
+        ok &= _tr.battle_end_fields(_s, {"kills": [1, 2], "won": True}) == {}
+        _rf.BATTLE_STATE[_s.account]["training"] = True
+        flat_globals()["CHAR_STORE"] = "selftest-stub"
+        _bf = _tr.battle_end_fields(_s, {"kills": [1, 2], "won": True})
+        ok &= (set(_bf) == {"block", "tail"} and len(_s.commits) == 1
+               and _s._pc["training_scores"][0][0] == 2 * _tr.KILL_SCORE + _tr.WIN_SCORE)
+        _rf.battle_state(_s.account, reset=True)          # a new sortie forgets it
+        ok &= _tr.battle_end_fields(_s, {"kills": [], "won": True}) == {}
+    finally:
+        _tr.KIND = _kind_was
+        flat_globals()["CHAR_STORE"] = _sv
+        _rf.BATTLE_STATE.pop(_s.account, None)
+    _c4 = ok
+
+    # 5. the service medal: off by default; on, nation-true, H$10, verdict
+    _spec_was = _ev.MEDAL_SPEC
+    try:
+        _ev.MEDAL_SPEC = ""
+        ok &= (_ev.with_medal(_co.COSMETICS) is _co.COSMETICS
+               and (4, 142) not in [(k, i) for k, i, _n in _co.cosmetics_for(_co.A2_WANZER, 1)])
+        ok &= _ev.medal_window("05-15..06-05", 1147651200)        # 2006-05-15
+        ok &= not _ev.medal_window("05-15..06-05", 1149552000)    # 2006-06-06
+        ok &= _ev.medal_window("12-20..01-05", 1167609600)        # 2007-01-01 wraps
+        _ev.MEDAL_SPEC = "1"
+        _offer = [(k, i) for k, i, _n in _co.cosmetics_for(_co.A2_WANZER, 1)]
+        ok &= (4, 142) in _offer and (4, 447) not in _offer
+        _need = _co.A3_ROW_OFF + _co.A3_ROW_LEN * _co.A3_ROW_MAX
+        _a3 = _co.reply_01a3(_need, [_co.A2_WANZER], 1)
+        _n = struct.unpack_from("<I", _a3, _co.A3_COUNT_OFF)[0]
+        _px = {struct.unpack_from("<H", _a3, _co.A3_ROW_OFF + i * 8)[0]:
+               struct.unpack_from("<I", _a3, _co.A3_ROW_OFF + i * 8 + 4)[0]
+               for i in range(_n) if _a3[_co.A3_ROW_OFF + i * 8 + 2] == 4}
+        ok &= _px.get(142) == _ev.MEDAL_PRICE
+        _v = _co.buy_verdict(142, 4, 1, 10, {})
+        ok &= _v["ok"] and _v["new"] and _v["price"] == 10
+        ok &= not _co.buy_verdict(142, 4, 1, 9, {})["ok"]
+        ok &= not _co.buy_verdict(447, 4, 1, 100, {})["ok"]
+    finally:
+        _ev.MEDAL_SPEC = _spec_was
+    print(f"  training ranking: 0x014C feed read back as 0x610D1580 does {'OK' if _c1 else 'FAIL'}, "
+          f"client insert + 0xE4 file {'OK' if _c2 else 'FAIL'}, score + board "
+          f"{'OK' if _c3 else 'FAIL'}, sortie/end hooks {'OK' if _c4 else 'FAIL'}; "
+          f"service medal (142/447, H$10, window) {'OK' if ok else 'FAIL'}")
+    return ok
