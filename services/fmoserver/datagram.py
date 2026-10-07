@@ -308,6 +308,9 @@ def _serve_datagram(sock, peers, dg, addr):
             n = chan.cmd_seen.get(cmd, 0) + 1
             chan.cmd_seen[cmd] = n
             referee._note_battle_record(chan, addr, cmd, body)
+            if rooms._is_battle_chan(chan):
+                # Start Battle (cmd 137) and every UNKNOWN battle command
+                pvproom.note_cmd(chan, addr, cmd, body)
             _a8 = struct.unpack_from("<I", got["plain"], off + 8)[0] \
                 if off + 12 <= len(got["plain"]) else None
             if rooms._is_battle_chan(chan):
@@ -922,6 +925,11 @@ def _serve_datagram(sock, peers, dg, addr):
                     f"SECOND unit, model class {_dutype}, with NON-ZERO part "
                     f"slots. It is not drivable and is not meant to be.")
 
+    # KEY: FRONTLINE MATCHING (pvproom.py): start a waiting room on a hostile
+    # pilot's arrival or the wait running out, and send this channel its cmd
+    # 138 (cmd 148 for a late joiner) once the self-POP is out
+    if chan.popped and rooms._is_battle_chan(chan):
+        pvproom.tick_chan(chan, addr)
     # VERIFIED:KEY: THE ENEMY SQUAD (FMO_BATTLE_DUMMY_AI + FMO_BATTLE_ENEMIES): see
     # battle_squad_for. Popped once per battle channel, after the self-POP.
     # A Coliseum battle is pilots only (Playing Manual p.45): live 2026-10-06
@@ -938,7 +946,8 @@ def _serve_datagram(sock, peers, dg, addr):
                 f"is pilots only)")
     if (battlepop.BATTLE_DUMMY and battlepop.BATTLE_DUMMY_AI and chan.popped
             and not getattr(chan, "squad_popped", False)
-            and rooms._is_battle_chan(chan)):
+            and rooms._is_battle_chan(chan)
+            and pvproom.squad_allowed(chan)):   # never while a room waits
         chan.squad_popped = True
         if squad._BATTLE_ENEMIES_ERR:
             log(f"[udp {addr[0]}:{addr[1]}] WARNING: {squad._BATTLE_ENEMIES_ERR} -- one enemy")
@@ -1090,6 +1099,7 @@ def _serve_datagram(sock, peers, dg, addr):
     # the banner lands. See fmoworld.record_battle_start.
     if (battleend.BATTLE_START and chan.popped and chan.key
             and chan.key.endswith(b"battle")
+            and not pvproom.in_matching_room(chan)     # the room starts it
             and not referee.battle_state(referee.bkey(addr[0]))["start_sent"]):
         _bst = referee.battle_state(referee.bkey(addr[0]))
         _bst["start_sent"] = True
@@ -1438,3 +1448,4 @@ from . import (  # noqa: E402
     popnames, popnation, popparts, popself, popsweep, referee, room, roomrelay, rooms,
     settlement, solo, squad, udpconfig, warmap, worldchannel,
 )
+from . import pvproom  # noqa: E402  (Frontline matching rooms)

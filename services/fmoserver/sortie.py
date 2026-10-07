@@ -326,7 +326,12 @@ class SessionSortie:
                 f"already has pilots of this side (2:99)")
         if side not in (0, 1):
             return None
-        code, why, pct = join_verdict(fighters, side, gid, time.time())
+        # KEY: A MATCHING ROOM (pvproom.py, Frontline PvP): open to both sides
+        # while it waits; the 5-minute window runs from the START
+        _pv = pvproom.join_verdict(getattr(self, "sector_zone", None), mapno, side + 1,
+                                   gid, time.time())
+        code, why, pct = _pv if _pv is not None else join_verdict(
+            fighters, side, gid, time.time())
         log(f"{self.peer}   JOIN-IN: map {mapno}, side {side}, "
             f"{len(fighters)} other pilot(s) on it: {why}"
             + (f" -> bonus {pct}%" if pct is not None else ""))
@@ -478,10 +483,20 @@ class SessionSortie:
             _side = zoneentry.nation_for_session(self.playing_char() if charstore.CHAR_STORE
                                                  else None, status.STATUS_NATION,
                                                  "FMO_STATUS_NATION")[0]
-            _t0 = int(time.time())          # ONE stamp: block+0x48 AND cmd 138
+            # FRONTLINE MATCHING (pvproom.py): the room this sortie would
+            # enter decides block+0x7C (WAITING / started) and +0x50
+            try:
+                _pv_map = int(sortie_mapno(_mn)[0])
+            except (TypeError, ValueError):
+                _pv_map = None
+            _pv_role, _pv_room = (pvproom.peek(getattr(self, "sector_zone", None), _pv_map)
+                                  if self.sector else (None, None))
+            _pv_knobs = pvproom.block_knobs(_pv_role, _pv_room)
+            # ONE stamp: block+0x48 AND cmd 138 (a late joiner: the room's start)
+            _t0 = pvproom.start_stamp(_pv_role, _pv_room) or int(time.time())
             body = reply_013a(mapno=_mn, host=addressing.host_for(
                 SORTIE_HOST or addressing.BATTLE_HOST, self.ip), side=_side,
-                start_time=(_t0 if missionblock.BATTLE_START_TIME else 0))
+                start_time=(_t0 if missionblock.BATTLE_START_TIME else 0), **_pv_knobs)
             if body is None:
                 why = next(s for l, _o, r, s in sortie_fields(mapno=_mn)
                            if l == "MapNo")
@@ -513,7 +528,8 @@ class SessionSortie:
             return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(), charselect.FAIL_CODE)]
         fields = sortie_fields(mapno=_mn, side=locals().get("_side"),
                                start_time=(locals().get("_t0") or 0)
-                               if missionblock.BATTLE_START_TIME else 0)
+                               if missionblock.BATTLE_START_TIME else 0,
+                               **(locals().get("_pv_knobs") or {}))
         if self.sector:
             log(f"{self.peer}   sortie map comes from the SECTOR this "
                 f"connection picked: selector {zoneentry.MAPKIND} sector "
@@ -580,6 +596,18 @@ class SessionSortie:
         # SOLO AREA (solo.py, SE's Festa 2006 rules): a sortie to the solo
         # sector (FMO_SOLO_AREA, default O.C.U. 統制区10 セクター14 =
         # selector 109 tile 74149) runs the solo squad in this battle
+        # FRONTLINE MATCHING: into the room (created when this sortie makes the map)
+        if locals().get("_pv_role"):
+            try:
+                _pv_got, _ = pvproom.join(
+                    self.battle_key(), self.account, getattr(self, "sector_zone", None),
+                    _bsr0["mapno"], int(self.sector[0]), _side, time.time(),
+                    gid=groupchannel.GROUP_OF.get(self.account))
+                if _pv_got != _pv_role:
+                    log(f"{self.peer}   WARNING: PVP ROOM: served as '{_pv_role}' but "
+                        f"joined as '{_pv_got}' (another sortie landed in between)")
+            except Exception as e:      # bookkeeping must never cost the sortie
+                log(f"{self.peer}   WARNING: PVP ROOM join failed ({e!r})")
         _bsr0["solo"] = solo.solo_for(getattr(self, "sector_zone", None),
                                       self.sector[0] if self.sector else None)
         if _bsr0["solo"]:
@@ -697,6 +725,8 @@ class SessionSortie:
             coliseum.coliseum().leave_spectate(self.account)
             log(f"{self.peer}   COLISEUM: a spectator left the arena battle -- no pay")
             return outs
+        # a matching room counts this pilot out (pvproom.py)
+        pvproom.withdrew(self.battle_key())
         # a withdraw is never a win: sortie pay only, whatever was destroyed
         push = self.battle_result_push(p["conn"], "the battle withdraw", won=False)
         if push is not None:
@@ -713,3 +743,4 @@ from . import battlegroups, charlist, popnation, warstate  # noqa: E402  (the jo
 from . import penalty  # noqa: E402  (the penalty refusal hook)
 from . import solo  # noqa: E402  (the solo area)
 from . import coliseum  # noqa: E402  (Coliseum spectators)
+from . import pvproom  # noqa: E402  (Frontline matching rooms)

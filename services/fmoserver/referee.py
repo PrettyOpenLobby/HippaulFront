@@ -200,8 +200,10 @@ def battle_end_trigger(st, triggers, now, limit_secs):
         return (f"the client's EMERGENCY ESCAPE (cmd {fmoworld.CLI_ESCAPE}, reason "
                 f"0x{code:08X} = {name})",
                 battleend.BATTLE_END_WON if battleend.BATTLE_END_WON_SET else False)
+    # a Frontline matching room's clock starts at the BATTLE START, not the
+    # sortie grant (pvproom.start sets started_at)
     if "limit" in triggers and limit_secs > 0 \
-            and now - st["granted_at"] >= limit_secs:
+            and now - (st.get("started_at") or st["granted_at"]) >= limit_secs:
         return (f"the mission time limit ({limit_secs}s, block +0x4C) elapsed",
                 battleend.BATTLE_END_WON if battleend.BATTLE_END_WON_SET else False)
     secs = [t for t in triggers if isinstance(t, int)]
@@ -258,7 +260,13 @@ def _note_battle_record(chan, addr, cmd, body):
             f"{chan.dummy_id:#x} -- the client's brain "
             f"{battlepop.BATTLE_DUMMY_AI} drives it. Logged "
             f"once per battle.")
-    if cmd in (fmoworld.CLI_ESCAPE, fmoworld.CLI_ESCAPE_B):
+    if cmd == pvproom.CLI_START_BATTLE:
+        # KEY: cmd 137 is the client's START BATTLE (static 2026-10-07): menu
+        # item 0:130 (command 0x1055) -> 0x611601C6 -> 0x611D36B0, its only
+        # caller, sent only while the battle is NOT running (0x61004300). It
+        # is not an escape; pvproom.note_cmd starts a waiting room on it.
+        return
+    if cmd == fmoworld.CLI_ESCAPE:
         # WARNING: THE TWO BATTLE-MAP MENU ITEMS ARE NOT ONE ACTION (static
         # 2026-09-30, menu table 0x613952F0). "Leave the Front" (0:13, menu
         # command 0x1002, handler 0x6115FAA5) calls 0x61173F90 and leaves by the
@@ -404,5 +412,5 @@ def _relay_battle_record(chan, addr, cmd, body, alias_stream):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    battleend, battlepop, groupchannel, identity, rooms, solo, squad, worldchannel,
+    battleend, battlepop, groupchannel, identity, pvproom, rooms, solo, squad, worldchannel,
 )

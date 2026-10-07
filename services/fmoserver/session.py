@@ -5,7 +5,7 @@ import struct
 import time
 from .deps import contentauth, fmomsn, fmostore
 from .wirelog import hexdump, log
-from . import coliseum, pilotrecord, resume, settlement, sortie, trade, wirelog
+from . import coliseum, pilotrecord, pvproom, resume, settlement, sortie, trade, wirelog
 
 
 # --------------------------------------------------------------------------- #
@@ -2763,9 +2763,16 @@ class Session(
             # THE COLISEUM: an arena match ends on its verdict (both teams
             # judged together), never on this pilot's own death or a timer
             outs += self.arena_end_due(p["conn"])
+            # FRONTLINE PvP (pvproom.py): a matching room ends every pilot in
+            # it on the ROOM's verdict, not on its own death or timer
+            try:
+                outs += pvproom.end_due(self, p["conn"])
+            except Exception as e:          # a judge bug must not cost the keepalive
+                log(f"{self.peer}   WARNING: PVP ROOM end check failed ({e!r})")
             if (battleend.BATTLE_END and _bst is not None
                     and not getattr(self, "battle_end_done", False)
-                    and not self.in_arena_match()):
+                    and not self.in_arena_match()
+                    and not pvproom.judged(self.battle_key())):
                 _trig = referee.pilot_death_trigger(
                     battleend.PILOT_DEATHS.get(self.account),
                     getattr(self, "sortie_granted_at", None), time.time(),

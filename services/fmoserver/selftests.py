@@ -3023,6 +3023,302 @@ def selftest():
         charstore._db_ready[0] = _db_was[1]
 
 
+def _pvp_room_pins():
+    """FRONTLINE PvP (pvproom.py, 2026-10-07), no client: P1 the WAITING block
+    on a creating sortie in a PvP selector (and nowhere else), the start on a
+    hostile pilot's arrival, on Start Battle (cmd 137) and on the timeout, the
+    late joiner's cmd 148; P2 the room judge (pilots and NPC units, the time
+    limit draw, a dead pilot waits for the room); P3 one war settle per battle
+    for both sides. Every global it touches is restored."""
+    from . import pvproom as _pv
+    ok = True
+    T0 = 1_900_000_000.0
+    _knobs = ("MATCHING", "JUDGE", "WAR", "PVP_WAIT", "PVP_SELECTORS", "OBJECTIVE_KIND",
+              "DEATH_WAIT", "NPC_VS_PILOTS")
+    _sv = {k: getattr(_pv, k) for k in _knobs}
+    _sv_bs = dict(referee.BATTLE_STATE)
+    _sv_mt = missionblock.MISSION_TIME
+    _sv_ws = (warstate.war_state, warstate._war_tick, warstate.WAR)
+
+    class _Ch:
+        def __init__(self, acct, port):
+            self.addr, self.account, self.key = ("198.51.100.7", port), acct, b"1234battle"
+            self.popped, self.pending = True, []
+
+    def _recs(ch):
+        return [(struct.unpack_from("<I", r, 4)[0], r[0x10:]) for r in ch.pending]
+
+    class _Sess:
+        def __init__(self, acct):
+            self.account, self.peer, self.battle_end_done, self.ends = acct, acct, False, []
+
+        def battle_key(self):
+            return self.account
+
+        def battle_result_push(self, conn, occasion, won=None):
+            return None
+
+        def penalty_report_push(self, conn):
+            return None
+
+        def battle_end_push(self, conn, why="", won=None):
+            self.ends.append(won)
+            return b"014c"
+
+    class _War:
+        def __init__(self):
+            self.calls = []
+
+        def settle(self, tile, nation, won=True, pvp=False, now=None):
+            self.calls.append((tile, nation, won, pvp))
+            return {"nation": nation, "control": 50}, "pinned"
+
+    on = lambda a: True
+    try:
+        _pv.MATCHING = _pv.JUDGE = _pv.WAR = True
+        _pv.PVP_WAIT, _pv.PVP_SELECTORS, _pv.OBJECTIVE_KIND = 1200, {505, 509, 513}, 5
+        _pv.DEATH_WAIT, _pv.NPC_VS_PILOTS = 300, False
+        missionblock.MISSION_TIME = 1800
+        _pv.reset()
+
+        # --- P1a: the creating sortie in 509 is served WAITING + Team Deathmatch;
+        # the same map in selector 200 is served neither
+        _role, _room = _pv.peek(509, 418, T0)
+        _b509 = sortie.reply_013a(mapno="418", ep_enable=False, start_time=0,
+                                  **_pv.block_knobs(_role, _room))
+        _r200 = _pv.peek(200, 418, T0)
+        _b200 = sortie.reply_013a(mapno="418", ep_enable=False, start_time=0,
+                                  **_pv.block_knobs(*_r200))
+        _bb = sortie.R13A_BLOCK
+        _u = lambda b, o: struct.unpack_from("<I", b, _bb + o)[0]
+        _p1a = (_role == "create" and _r200 == (None, None)
+                and _u(_b509, missionblock.MB_MATCH_FLAGS) == _pv.FLAG_WAITING
+                and _u(_b509, missionblock.MB_OBJECTIVE_KIND) == 5
+                and _u(_b200, missionblock.MB_MATCH_FLAGS) == 0
+                and _u(_b200, missionblock.MB_OBJECTIVE_KIND) == 0
+                and _b200 == sortie.reply_013a(mapno="418", ep_enable=False, start_time=0))
+        print(f"  pvp room P1: a creating sortie on selector 509 map 418 is served "
+              f"block+0x7C = 0x200 (WAITING) and +0x50 = 5; selector 200 is served "
+              f"neither (byte-identical to before): {'OK' if _p1a else 'FAIL'}")
+        ok &= _p1a
+
+        # --- P1b: start when the first HOSTILE pilot pops in; same-side does not
+        _pv.join("pvp:lex", "pvp:lex", 509, 418, 94101, 1, T0)
+        _pv.join("pvp:cid", "pvp:cid", 509, 418, 94101, 1, T0 + 5)
+        _jv = _pv.join_verdict(509, 418, 2, None, T0 + 10)
+        _pv.join("pvp:dan", "pvp:dan", 509, 418, 94101, 2, T0 + 10)
+        lex, cid, dan = _Ch("pvp:lex", 5001), _Ch("pvp:cid", 5002), _Ch("pvp:dan", 5003)
+        _pv.tick_chan(lex, lex.addr, T0 + 11)
+        _pv.tick_chan(cid, cid.addr, T0 + 12)
+        _waited = (_pv.room_of("pvp:lex")["started"] is None and not lex.pending
+                   and not _pv.squad_allowed(lex) and _pv.in_matching_room(lex))
+        _pv.tick_chan(dan, dan.addr, T0 + 20)
+        _pv.tick_chan(lex, lex.addr, T0 + 21)
+        _r = _pv.room_of("pvp:lex")
+        _rd, _rc = _recs(dan), _recs(lex)
+        _p1b = (_waited and _jv[0] is None and _jv[2] == 100
+                and _r["started"] == int(T0 + 20) and _r["reason"] == 1 and _r["pvp"]
+                and _rd == _rc and len(_rd) == 1 and _rd[0][0] == 138
+                and struct.unpack_from("<II", _rd[0][1], 0) == (int(T0 + 20), 1)
+                and not _pv.squad_allowed(lex)
+                and referee.BATTLE_STATE.get("pvp:lex", {}).get("started_at") in (None, int(T0 + 20)))
+        _pv.tick_chan(lex, lex.addr, T0 + 22)
+        _p1b &= len(lex.pending) == 1          # once per channel
+        print(f"  pvp room P1: the room waits while same-side pilots pop in (no cmd "
+              f"138, no NPC squad); the first U.S.N. pilot's pop starts it, reason 1, "
+              f"and every member gets ONE cmd 138 with the start stamp; no squad "
+              f"(pilots only): {'OK' if _p1b else 'FAIL'}")
+        ok &= _p1b
+
+        # --- P1c: the late joiner: 0x600 + the room's start, then cmd 148
+        _role_l, _room_l = _pv.peek(509, 418, T0 + 100)
+        _kl = _pv.block_knobs(_role_l, _room_l)
+        _jl = _pv.join_verdict(509, 418, 2, None, T0 + 100)
+        _jlate = _pv.join_verdict(509, 418, 2, None, T0 + 20 + sortie.JOIN_WINDOW + 1)
+        _pv.join("pvp:eve", "pvp:eve", 509, 418, 94101, 2, T0 + 100)
+        eve = _Ch("pvp:eve", 5004)
+        _pv.tick_chan(eve, eve.addr, T0 + 101)
+        _re = _recs(eve)
+        _p1c = (_role_l == "late" and _kl.get("match_flags") == 0x600
+                and _pv.start_stamp(_role_l, _room_l) == int(T0 + 20)
+                and _jl[0] is None and _jlate[0] == sortie.JOIN_CODE_LATE
+                and len(_re) == 1 and _re[0][0] == 148 and len(_re[0][1]) == _pv.RESYNC_LEN
+                and struct.unpack_from("<II", _re[0][1], 0) == (3, int(T0 + 20))
+                and not any(_re[0][1][8:]))
+        print(f"  pvp room P1: a pilot joining after the start is served 0x600 and the "
+              f"room's start, then cmd 148 (bits 3, +4 start, 0xB4 B); the join window "
+              f"runs from the START ({sortie.JOIN_WINDOW} s): {'OK' if _p1c else 'FAIL'}")
+        ok &= _p1c
+
+        # --- P1d: the timeout (reason 3, NPCs fight) and Start Battle (cmd 137,
+        # reason 2); an unknown battle cmd is logged once
+        _pv.join("pvp:tom", "pvp:tom", 509, 471, 94102, 1, T0)
+        tom = _Ch("pvp:tom", 5005)
+        _pv.tick_chan(tom, tom.addr, T0 + 1199)
+        _not_yet = not tom.pending and not _pv.squad_allowed(tom)
+        _pv.tick_chan(tom, tom.addr, T0 + 1200)
+        _rt = _recs(tom)
+        _pv.join("pvp:sam", "pvp:sam", 505, 232, 90001, 2, T0)
+        sam = _Ch("pvp:sam", 5006)
+        _pv.note_cmd(sam, sam.addr, 137, bytes(64), T0 + 30)
+        _pv.tick_chan(sam, sam.addr, T0 + 31)
+        _rs = _recs(sam)
+        _pv.note_cmd(sam, sam.addr, 250, b"\x01\x02", T0 + 32)
+        _pv.note_cmd(sam, sam.addr, 240, b"\x01\x02", T0 + 32)
+        _p1d = (_not_yet and len(_rt) == 1 and _rt[0][0] == 138
+                and struct.unpack_from("<I", _rt[0][1], 4)[0] == 3 and _pv.squad_allowed(tom)
+                and len(_rs) == 1 and struct.unpack_from("<I", _rs[0][1], 4)[0] == 2
+                and _pv.squad_allowed(sam) and sam._pvp_unknown == {250})
+        print(f"  pvp room P1: nobody came in 1200 s -> reason 3 and the NPC squad; "
+              f"Start Battle (cmd 137) -> reason 2; an unknown battle cmd is logged "
+              f"once, a known one not: {'OK' if _p1d else 'FAIL'}")
+        ok &= _p1d
+
+        # --- P2: the judge, pure
+        _jc = _pv.judge_counts
+        _p2 = (_jc({1: 1, 2: 0}, {1, 2}, T0, T0 + 5, 1800)[0] == 1
+               and _jc({1: 0, 2: 2}, {1, 2}, T0, T0 + 5, 1800)[0] == 2
+               and _jc({1: 0, 2: 0}, {1, 2}, T0, T0 + 5, 1800)[0] == 0
+               and _jc({1: 2, 2: 2}, {1, 2}, T0, T0 + 5, 1800) is None
+               and _jc({1: 2, 2: 2}, {1, 2}, T0, T0 + 1800, 1800)[0] == 0
+               and _jc({1: 3, 2: 2}, {1, 2}, T0, T0 + 1800, 1800)[0] == 1
+               and _jc({1: 1, 2: 0}, {1}, T0, T0 + 5, 1800) is None
+               and _jc({1: 1, 2: 0}, {1, 2}, None, T0 + 5, 1800) is None)
+        print(f"  pvp room P2: judge: a side with nothing standing loses, both out = "
+              f"draw, at the limit more standing wins and a tie draws (OUR rule), a "
+              f"side that never fielded a unit cannot lose, a waiting room is not "
+              f"judged: {'OK' if _p2 else 'FAIL'}")
+        ok &= _p2
+
+        # --- P2: AI units count for their side (room of tom, reason 3)
+        referee.BATTLE_STATE["pvp:tom"] = {"granted_at": T0, "squad": {
+            "nation": 2, "ids": [0x2222, 0x2223, 0x2224], "dead": {0x2222}}}
+        _c, _d, _f = _pv.units_standing(_pv.room_of("pvp:tom"), T0 + 1300, on, {})
+        _alive = _c == {1: 1, 2: 2} and _f == {1, 2}
+        referee.BATTLE_STATE["pvp:tom"]["squad"]["dead"] = {0x2222, 0x2223, 0x2224}
+        _ws = _War()
+        warstate.war_state, warstate._war_tick, warstate.WAR = (lambda: _ws), (lambda st: None), "1"
+        _pv.tick(T0 + 1301, on, {})
+        _vt = (_pv.room_of("pvp:tom") or {}).get("verdict") or {}
+        _ts = _Sess("pvp:tom")
+        _tend = _pv.end_due(_ts, 1, T0 + 1302, on, {})
+        _p2b = (_alive and _vt.get("winner") == 1 and _ts.ends == [True] and _tend
+                and _ws.calls == [(94102, 1, True, False)] and _pv.room_of("pvp:tom") is None)
+        print(f"  pvp room P2/P3: the NPC squad's live units count for U.S.N.; when the "
+              f"last falls O.C.U. wins, the pilot's 0x014C says so, the war is settled "
+              f"once (PvE, weight 1) and the room is forgotten: {'OK' if _p2b else 'FAIL'}")
+        ok &= _p2b
+
+        # --- P2: a dead pilot waits for the ROOM; the verdict follows the room.
+        # Room 418: lex, cid (O.C.U.) vs dan, eve (U.S.N.)
+        _ws.calls.clear()
+        dead = {"pvp:lex": T0 + 200}
+        _cs, _ds, _es, _cids = (_Sess("pvp:lex"), _Sess("pvp:dan"), _Sess("pvp:eve"),
+                                _Sess("pvp:cid"))
+        _w1 = _pv.end_due(_cs, 1, T0 + 210, on, dead)          # lex dead, cid fights on
+        dead.update({"pvp:dan": T0 + 300, "pvp:eve": T0 + 310})
+        _w2 = _pv.end_due(_cs, 1, T0 + 320, on, dead)           # U.S.N. wiped
+        _pv.end_due(_ds, 1, T0 + 321, on, dead)
+        _pv.end_due(_es, 1, T0 + 322, on, dead)
+        _pv.end_due(_cids, 1, T0 + 323, on, dead)
+        _calls_once = list(_ws.calls)
+        _pv.tick(T0 + 400, on, dead)
+        _p2c = (_w1 == [] and _cs.ends == [True] and _ds.ends == [False]
+                and _es.ends == [False] and _cids.ends == [True] and _w2
+                and _calls_once == [(94101, 1, True, True), (94101, 2, False, True)]
+                and _ws.calls == _calls_once and _pv.room_of("pvp:lex") is None)
+        print(f"  pvp room P2/P3: a destroyed pilot is NOT ended while its side still "
+              f"stands; when U.S.N. is wiped every pilot's 0x014C follows the room (the "
+              f"dead O.C.U. pilot WINS); fmowar.settle runs ONCE per side (PvP, weight "
+              f"2), not per pilot: {'OK' if _p2c else 'FAIL'}")
+        ok &= _p2c
+
+        # --- P2: the death wait, a time-limit draw, and the per-pilot war
+        # settle standing down
+        _pv.reset()
+        _pv.join("pvp:a", "pvp:a", 513, 66, 1, 1, T0)
+        _pv.join("pvp:b", "pvp:b", 513, 66, 1, 1, T0)
+        _pv.join("pvp:c", "pvp:c", 513, 66, 1, 2, T0)
+        _pv.start(_pv.room_of("pvp:a"), 1, T0 + 10)
+        _sa = _Sess("pvp:a")
+        _early = _pv.end_due(_sa, 1, T0 + 100, on, {"pvp:a": T0 + 50})
+        _late = _pv.end_due(_sa, 1, T0 + 100 + _pv.DEATH_WAIT, on, {"pvp:a": T0 + 50})
+
+        class _WS:
+            sector, peer, war_settled = (1, 1, 66), "pvp:b", None
+
+            def battle_key(self):
+                return "pvp:b"
+
+            def in_arena(self):
+                return False
+        _st_none = settlement.SessionSettlement.war_settle(_WS(), True)
+        _ws.calls.clear()
+        _sb, _sc = _Sess("pvp:b"), _Sess("pvp:c")
+        _pv.end_due(_sb, 1, T0 + 10 + 1800, on, {"pvp:a": T0 + 50})
+        _pv.end_due(_sc, 1, T0 + 10 + 1800, on, {"pvp:a": T0 + 50})
+        _p2d = (_early == [] and _sa.ends == [False] and _st_none is None
+                and _sb.ends == [False] and _sc.ends == [False] and _ws.calls == [])
+        print(f"  pvp room P2: a destroyed pilot whose side fights on ends as a loss "
+              f"after FMO_PVP_DEATH_WAIT ({_pv.DEATH_WAIT} s); 1 vs 1 standing at the "
+              f"limit is a draw (both see a loss, no war move); the pilot's own "
+              f"war_settle stands down for the room: {'OK' if _p2d else 'FAIL'}")
+        ok &= _p2d
+
+        # --- the wiring: a real Session's 0x0139 on a 509 sector is served the
+        # WAITING block and lands in a room; the same sector asked from
+        # selector 200 is not (the war map's selector decides)
+        _pv.reset()
+        _sv_ss = sortie.SERVE_SORTIE
+        _sv_sm = dict(rooms.SORTIE_MAP)
+        try:
+            flat_globals()["SERVE_SORTIE"] = True
+            _wire = {}
+            for _z in (509, 200):
+                _ss = session.Session("selftest-pvp:0")
+                _ss._account = "pvp:session"
+                _ss.pilot_trained = lambda: True
+                _ss.sector, _ss.sector_zone = (94101, 4, 418), _z
+                _ro = [packet.parse(o) for o in _ss.on_packet(packet.parse(packet.build(
+                    sortie.MSG_SORTIE_REQ, bytes(sortie.REQ_0139_LEN), seq=0x7001,
+                    conn_id=1)))]
+                _pl = _ro[0]["payload"] if _ro and _ro[0]["msg"] == sortie.MSG_SORTIE_REPLY else b""
+                _wire[_z] = ((struct.unpack_from("<I", _pl, _bb + missionblock.MB_MATCH_FLAGS)[0],
+                              struct.unpack_from("<I", _pl, _bb + missionblock.MB_OBJECTIVE_KIND)[0])
+                             if _pl else None, _pv.room_of(_ss.battle_key()) is not None)
+                _pv.reset()
+        finally:
+            flat_globals()["SERVE_SORTIE"] = _sv_ss
+            rooms.SORTIE_MAP.clear()
+            rooms.SORTIE_MAP.update(_sv_sm)
+        _p1w = _wire.get(509) == ((0x200, 5), True) and _wire.get(200) == ((0, 0), False)
+        print(f"  pvp room P1: through Session.on_sortie, a 509 sector's 0x013A carries "
+              f"+0x7C 0x200 / +0x50 5 and the pilot is in a room; selector 200 neither "
+              f"{_wire}: {'OK' if _p1w else 'FAIL'}")
+        ok &= _p1w
+
+        # --- knobs off: nothing is a room, the block is as before
+        _pv.reset()
+        _pv.MATCHING = _pv.JUDGE = _pv.WAR = False
+        _off = (_pv.peek(509, 418, T0) == (None, None) and _pv.block_knobs(None) == {}
+                and _pv.join("pvp:x", "pvp:x", 509, 418, 1, 1, T0) == (None, None)
+                and _pv.squad_allowed(_Ch("pvp:x", 5009))
+                and not _pv.in_matching_room(_Ch("pvp:x", 5009))
+                and not _pv.judged("pvp:x") and not _pv.war_by_room("pvp:x"))
+        print(f"  pvp room: FMO_PVP_MATCHING / _JUDGE / _WAR = 0 -> no room, no "
+              f"waiting, the squad and the old start as before: {'OK' if _off else 'FAIL'}")
+        ok &= _off
+    finally:
+        for k, v in _sv.items():
+            setattr(_pv, k, v)
+        _pv.reset()
+        referee.BATTLE_STATE.clear()
+        referee.BATTLE_STATE.update(_sv_bs)
+        missionblock.MISSION_TIME = _sv_mt
+        warstate.war_state, warstate._war_tick, warstate.WAR = _sv_ws
+    return ok
+
+
 def _selftest_run(test_db):
     # WARNING: NEVER the real sector-win ledger: several checks run a WON battle
     # through the live ledger, and on prod that is the real one (the 09-08
@@ -13008,6 +13304,7 @@ def _selftest_run(test_db):
     ok &= _battle_spawn_pins()      # per-map battle spawn points (battlepop.BATTLE_SPAWNS)
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
+    ok &= _pvp_room_pins()          # Frontline PvP rooms: waiting, start, judge, war (pvproom.py)
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1

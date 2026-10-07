@@ -86,6 +86,8 @@
                       two pilots.
     coliseum.py       The Coliseum: the arena desks (list, register, cancel, host, the bracket and
                       streak board), official and player-hosted arenas, the waiting window.
+    pvproom.py        Frontline matching battles: WAITING FOR OPPONENTS, the start, the room
+                      judge and the war settle.
     pilotrecord.py    Session's pilot record: money, class experience, flags, passes, salary,
                       the ceasefire bonus and the officer review.
     settlement.py     Session's battle settlement: kill bonuses, mission and war results, the

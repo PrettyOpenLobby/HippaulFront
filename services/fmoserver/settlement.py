@@ -623,6 +623,13 @@ class SessionSettlement:
             return None
         if getattr(self, "war_settled", None) == sector:
             return None
+        if pvproom.war_by_room(self.battle_key()):
+            # P3: a Frontline matching room settles the war ONCE with its own
+            # verdict for both sides (pvproom.settle_war), never per pilot
+            self.war_settled = sector
+            log(f"{self.peer}   WAR STATE: this pilot's PvP room settles tile "
+                f"{sector[0]} once with its verdict; not settled per pilot")
+            return None
         # SE (Map Selector help, AH/F98/D64 86): 「統制区は、戦局が安定しているため
         # セクターの制圧状況は変化しません」 -- in a Controlled Zone (zone kinds 1
         # and 3, selectors 1xx / 3xx) sector control never changes. Tiles are
@@ -808,3 +815,4 @@ from . import battlegroups, charlist  # noqa: E402  (platoon_battle_settle)
 from . import hangar  # noqa: E402  (hangar rank at the battle end)
 from . import penalty  # noqa: E402  (the friendly-fire report and vote)
 from . import loot, squad  # noqa: E402  (loot_battle_settle)
+from . import pvproom  # noqa: E402  (the PvP room's war settle)

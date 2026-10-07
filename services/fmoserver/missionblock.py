@@ -382,8 +382,16 @@ def mission_area_fields(area=None, seconds=None):
     return out
 
 
+#: KEY: THE MATCHING BITS (static 2026-10-07, pvproom.py): u32 -> lobby+0x5CFA;
+#: bit 0x200 = WAITING FOR OPPONENTS (units frozen), 0x400 = started. And the
+#: OBJECTIVE KIND, u32 -> lobby+0x5CCE: 5 = Team Deathmatch (79:25).
+MB_MATCH_FLAGS = 0x07C
+MB_OBJECTIVE_KIND = 0x050
+
+
 def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
-                   battleticket=None, side=None, start_time=None):
+                   battleticket=None, side=None, start_time=None, match_flags=None,
+                   objective_kind=None):
     """(label, block offset, raw bytes, source) for every field that is ON.
 
     Returns nothing with every knob at its default -- that is what makes the
@@ -419,6 +427,15 @@ def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
                     struct.pack("<I", int(start_time) & 0xFFFFFFFF),
                     f"Unix {int(start_time)} = the battle start -> lobby+0x5CC6; "
                     f"the Battle Review's frames are ms since it"))
+    if match_flags:
+        out.append(("MatchFlags", MB_MATCH_FLAGS, struct.pack("<I", int(match_flags)),
+                    f"{int(match_flags):#x} -> lobby+0x5CFA (0x200 = WAITING FOR "
+                    f"OPPONENTS, 0x400 = started; pvproom.py)"))
+    if objective_kind:
+        out.append(("ObjectiveKind", MB_OBJECTIVE_KIND,
+                    struct.pack("<I", int(objective_kind)),
+                    f"{int(objective_kind)} -> lobby+0x5CCE (5 = Team Deathmatch, "
+                    f"79:25; pvproom.py)"))
     if side in (1, 2):
         out.append(("BattleSide", MB_BATTLE_SIDE, bytes([side]),
                     f"the pilot's nation {side} -> lobby+0x68D3 (0x61175A90): "
