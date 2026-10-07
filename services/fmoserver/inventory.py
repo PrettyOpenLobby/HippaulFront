@@ -368,15 +368,18 @@ def merge_inventory(*lists):
     return out
 
 
-def setup_entry(parts, in_use=1, serial_base=1):
+def setup_entry(parts, in_use=1, serial_base=1, paint=None):
     """One 544-byte wanzer setup: header, then 21 equipped-item records.
 
     `parts` is [(item index, kind, id)] -- the index is honoured, so gaps are
     real gaps. Each record gets a distinct non-zero serial: the client finds an
     equipped item by its 64-bit serial (0x61174860's inner search), so two
-    records sharing one would be the same item in two places."""
+    records sharing one would be the same item in two places. `paint` is
+    {field: id} for the header's colouring (put_paint, SETUP_CAMO..)."""
     b = bytearray(SETUP_ENTRY_LEN)
     b[SETUP_IN_USE] = in_use & 0xFF
+    if paint:
+        put_paint(b, paint)
     for idx, kind, item_id in parts:
         if not 0 <= idx < SETUP_ITEMS:
             continue
@@ -419,20 +422,24 @@ def reply_0166(parts=None, slots=None, nation=None, cls=None):
     WARNING: SETUP 1 IS THE ONE THE WORLD READS. 0x610031AC passes `ebx + 1` to the
     world builder and 0x611748C0 resolves index i to `lobby + 0x3BD3 + i*0x220`
     -- and this payload lands at `lobby + 0x3DF3`, which is index 1. So the
-    FIRST 544 bytes of this reply are what the pilot wears."""
+    FIRST 544 bytes of this reply are what the pilot wears.
+
+    A filled setup also wears `nation`'s starting paint (starter_paint), so the
+    hangar shows the colours the battle self-POP sends."""
     if parts is None:
         parts, _ = setup_parts_for(nation, cls)
     b = bytearray(REPLY_0166_LEN)
     if parts:
         n = SETUP_FILL if slots is None else slots
         n = max(0, min(n, SETUP_SLOTS))
+        paint = starter_paint(nation)
         for i in range(n):
             off = i * SETUP_ENTRY_LEN
             # Distinct serial ranges per setup: the client finds an equipped
             # item by its 64-bit serial (0x61174860), so eight setups sharing
             # one serial space would be eight views of the same item.
             b[off:off + SETUP_ENTRY_LEN] = setup_entry(
-                parts, serial_base=1 + i * SETUP_ITEMS)
+                parts, serial_base=1 + i * SETUP_ITEMS, paint=paint)
     return bytes(b)
 
 
@@ -542,3 +549,195 @@ def set_jobs(char):
 #: serves the all-zero block this message served before -- see reply_0166.
 SETUP_PARTS = [e for e in os.environ.get("FMO_SETUP_PARTS", "")
                .replace(" ", "").split(",") if e]
+
+
+
+#: KEY: THE SETUP'S PAINT (static 2026-10-07). The 544-byte entry's header
+#: carries the wanzer's colouring, and the same five values reach the unit by
+#: two routes that call the same five virtuals on it:
+#:   lobby  0x61003032..0x61003092 reads them out of THIS entry;
+#:   battle 0x611F1FD0 copies the POP body to unit+4, then 0x611F59E0 reads
+#:          them back at unit+0x1BC.. = body+0x1B8.. (POP_PAINT below).
+#:     entry  POP body  call on the unit               what it is
+#:     +0x0C  +0x1B8    vtable+0x38(id)                CAMOUFLAGE, a D29 row
+#:     +0x10  +0x1BC    vtable+0x7C(1, id) 0x611F3170  ARMOUR colour, a D30 row
+#:     +0x0E  +0x1BA    vtable+0x7C(2, id)             LINE colour, a D30 row
+#:     +0x12  +0x1BE    vtable+0x40(id)                INSIGNIA, a D31 row
+#:     +0x17  +0x1C3    vtable+0x88(b) 0x611F7850      unknown byte, see below
+#: The entry accessors are 0x61174950/70 (+0x0C), 0x61174990/B0 (+0x0E),
+#: 0x611749D0/F0 (+0x10), 0x61174A10/30 (+0x12), 0x61174A90/B0 (+0x17); the
+#: hangar methods that set them are 0x6103BF70 (+0x0C), 0x6103C240 (+0x10, slot
+#: 1), 0x6103C2B0 (+0x0E, slot 2), 0x6103BF90 (+0x12), 0x6103C320 (+0x17).
+#: The +0x0C/+0x10/+0x0E picker commits run in that order (0x610336E0,
+#: 0x61033760, then slot 2) and SE's prompts run camouflage, armour, line
+#: (systext 17:59..61, 18:36..38), so the three colours are camo + slot 1 +
+#: slot 2. Which slot SE CALLED "armour" is read off that order, not a label.
+#: The camouflage IS the third colour: its picker (0x61031F80) lists owned
+#: category-4 ids, D29, whose rows are named like colours ("Grayish Red 1").
+#: +0x17 drives 0x611F5AA0 (eight attachments off table 0x6139A660); the
+#: client's own saves on prod carried 4 there. Carried through, never invented.
+#: +0x16 (0x61174A50/70) is a 1/2/4 mode byte the battle does not read.
+#:
+#: Row 0 of D29 and D30 is an EMPTY placeholder (flag 255, no name), so a zero
+#: here is never a player's choice: it is the zero our starter used to carry,
+#: and fill_paint() gives such a field the starting paint instead.
+SETUP_CAMO, SETUP_LINE, SETUP_ARMOUR, SETUP_INSIGNIA = 0x0C, 0x0E, 0x10, 0x12
+SETUP_MODE, SETUP_PAINT_B17 = 0x16, 0x17
+#: The POP body offsets the battle dresser reads (body = unit - 4).
+POP_PAINT = {"camo": 0x1B8, "line": 0x1BA, "armour": 0x1BC, "insignia": 0x1BE}
+POP_PAINT_B17 = 0x1C3
+
+#: SE's starting paint, from the client's own tables: D30 1 "Old Gray"
+#: (both nations' starting colour), 6 "Dark Gray" (the U.S.N. starting colour),
+#: 42 "Olive Green" (the O.C.U. starting colour); camo 101 is what the client
+#: itself gives an EMPTY setup (0x61002FB3 `push 0x65`). Nation colour on the
+#: armour and the shared grey on the line is OURS: no SE text says which slot
+#: each goes on.
+PAINT_CAMO_START = 101
+PAINT_LINE_START = 1
+PAINT_ARMOUR_START = {1: 42, 2: 6}
+#: `FMO_SETUP_PAINT=0` serves the zero paint fields every setup had before.
+SETUP_PAINT = os.environ.get("FMO_SETUP_PAINT", "1") not in ("0", "")
+
+
+def starter_paint(nation):
+    """{field: id} a new wanzer of `nation` is painted with, or {} for a
+    nation with no starting colour (or FMO_SETUP_PAINT=0)."""
+    col = PAINT_ARMOUR_START.get(nation)
+    if not SETUP_PAINT or col is None:
+        return {}
+    return {"camo": PAINT_CAMO_START, "armour": col, "line": PAINT_LINE_START}
+
+
+_PAINT_U16 = (("camo", SETUP_CAMO), ("line", SETUP_LINE),
+              ("armour", SETUP_ARMOUR), ("insignia", SETUP_INSIGNIA))
+
+
+def setup_paint(entry):
+    """{camo, armour, line, insignia, b17} read out of one 544-byte entry."""
+    out = {k: struct.unpack_from("<H", entry, off)[0] for k, off in _PAINT_U16}
+    out["b17"] = entry[SETUP_PAINT_B17]
+    return out
+
+
+def put_paint(entry, paint):
+    """Write `paint` ({field: id}) into a bytearray entry in place; a zero or
+    missing field is left as it is."""
+    for k, off in _PAINT_U16:
+        if paint.get(k):
+            struct.pack_into("<H", entry, off, paint[k] & 0xFFFF)
+    if paint.get("b17"):
+        entry[SETUP_PAINT_B17] = paint["b17"] & 0xFF
+
+
+def fill_paint(block, nation):
+    """(block, [setup numbers filled]) -- every IN-USE setup whose camo /
+    armour / line is zero gets the starting paint for that field; a non-zero
+    value is the player's and is never touched. Pure; the block comes back
+    unchanged (the same object) when nothing needed filling."""
+    start = starter_paint(nation)
+    if not start:
+        return block, []
+    b, filled = None, []
+    for i in range(SETUP_SLOTS):
+        off = i * SETUP_ENTRY_LEN
+        if off + SETUP_ENTRY_LEN > len(block) or not block[off + SETUP_IN_USE]:
+            continue
+        cur = setup_paint(block[off:off + SETUP_ENTRY_LEN])
+        need = {k: v for k, v in start.items() if not cur.get(k)}
+        if not need:
+            continue
+        if b is None:
+            b = bytearray(block)
+        ent = bytearray(b[off:off + SETUP_ENTRY_LEN])
+        put_paint(ent, need)
+        b[off:off + SETUP_ENTRY_LEN] = ent
+        filled.append(i + 1)
+    return (bytes(b) if b is not None else block), filled
+
+
+#: KEY: THE SELECTED SETUP. The 0x0167 save's payload+0x00 is lobby+0x3DF2
+#: (shop.py), the client's selected setup, 1-based; 0x014A +0x2B seeds it at
+#: login (status.S14A_ACTIVE_SETUP). The session stores the save's byte as
+#: char["setup_sel"] so the battle dresses the setup the pilot last had
+#: selected rather than blindly setup 1. Whether SE sortied with the selected
+#: setup is not stated anywhere; every save seen so far said 1.
+def active_setup_no(char, block=None, default=1):
+    """(setup number 1..8, source) the pilot sorties with: the stored
+    selection when that setup is in use, else `default` when in use, else the
+    first setup in use, else 1."""
+    if block is None:
+        try:
+            block = bytes.fromhex((char or {}).get("setups") or "")
+        except ValueError:
+            block = b""
+    used = [i + 1 for i in range(SETUP_SLOTS)
+            if (i + 1) * SETUP_ENTRY_LEN <= len(block)
+            and block[i * SETUP_ENTRY_LEN + SETUP_IN_USE]]
+    sel = (char or {}).get("setup_sel")
+    if isinstance(sel, int) and not isinstance(sel, bool) and sel in used:
+        return sel, "selected in the hangar (0x0167 +0x00)"
+    if default in used:
+        return default, "setup %d (no stored selection in use)" % default
+    if used:
+        return used[0], "first setup in use"
+    return 1, "no setup in use"
+
+
+#: KEY: THE COLOURING PICKERS LIST ONLY WHAT THE PILOT OWNS. Camo (0x61031F80),
+#: the two colour pickers (0x61032170 / 0x61032680) and the insignia picker
+#: (0x61032B90) skip a row unless 0x611A3950(lobby+0x8C8, category, id) is set:
+#: a bit table that 0x014A's owned block (status.S14A_OWNED) fills at login.
+#: Category layout, read off 0x611A37A0's jump table (offset, bytes, id bias):
+#:     4 camo      +0x110  0x80   id - 101     (0x61174FD0)
+#:     5 colour    +0x190  0x80   id           (0x61174FF0)
+#:    12 insignia  +0x3C0  0x80   id - 101     (0x61175010)
+#: bit (n & 7) of byte (n >> 3), LSB first (0x611A39B8 / 0x611A3A60). That
+#: block went out as zeros here, so every colouring picker was EMPTY and no
+#: pilot could choose a paint. owned_paint_bits() owns what the pilot already
+#: wears plus SE's starting paint, which a pilot holds before any purchase.
+#: A SETUP.CONSOLE purchase (0x0168 with the catalogue's kind 2/3/4) is NOT
+#: granted here yet: 0x016B's own grant (0x6117884C, bytes +0x20 category /
+#: +0x21 id) is undecoded live.
+OWNED_PAINT_CATS = {"camo": (0x110, 0x80, 101), "colour": (0x190, 0x80, 0),
+                    "insignia": (0x3C0, 0x80, 101)}
+
+
+def owned_paint_ids(char, nation):
+    """{category name: sorted ids} the pilot owns for the colouring pickers:
+    the starting paint and every non-zero paint field of a setup in use."""
+    out = {"camo": set(), "colour": set(), "insignia": set()}
+    st = starter_paint(nation)
+    if st:
+        out["camo"].add(st["camo"])
+        out["colour"].update((st["armour"], st["line"]))
+    try:
+        block = bytes.fromhex((char or {}).get("setups") or "")
+    except ValueError:
+        block = b""
+    for i in range(SETUP_SLOTS):
+        off = i * SETUP_ENTRY_LEN
+        if off + SETUP_ENTRY_LEN > len(block) or not block[off + SETUP_IN_USE]:
+            continue
+        p = setup_paint(block[off:off + SETUP_ENTRY_LEN])
+        for k, cat in (("camo", "camo"), ("armour", "colour"),
+                       ("line", "colour"), ("insignia", "insignia")):
+            if p[k]:
+                out[cat].add(p[k])
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def owned_paint_bits(char, nation):
+    """{offset within the owned block: byte} setting owned_paint_ids()'s bits.
+    An id outside its category's table is skipped, as the client would."""
+    if not SETUP_PAINT:
+        return {}
+    out = {}
+    for cat, ids in owned_paint_ids(char, nation).items():
+        base, size, bias = OWNED_PAINT_CATS[cat]
+        for n in ids:
+            n -= bias
+            if 0 <= n < size * 8:
+                o = base + (n >> 3)
+                out[o] = out.get(o, 0) | (1 << (n & 7))
+    return out

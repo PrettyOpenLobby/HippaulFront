@@ -815,16 +815,22 @@ def _serve_datagram(sock, peers, dg, addr):
                 _pen = popself.penalty_pop_extra(chan)
                 if _pen:
                     chan.pop_args.setdefault("extra", {}).update(_pen)
-                # PAINT (squad.npc_paint): no pilot has a hangar paint on file,
-                # so the starter wanzer wears its nation's starting colour (SE's
-                # D30 notes) instead of the zeros that drew every unit red; kept
-                # in pop_args so the room relay paints it on the peers too
-                _paint = squad.npc_paint(_nat, utype)
+                # PAINT (popparts.pop_paint_for): the hangar paint of the setup
+                # the pilot sorties with (camo, armour, line, insignia, +0x17),
+                # each zero field taking the nation's starting paint; a human
+                # UnitType 4 reads +0x1B8 as something else, so none there.
+                # Kept in pop_args so the room relay paints it on the peers too.
+                _paint, _psrc = ({}, "UnitType 4") if utype == 4 else \
+                    popparts.pop_paint_for(addr[0], _nat)
+                if not _paint:
+                    _paint = squad.npc_paint(_nat, utype)
+                    _psrc = f"{_psrc}; squad.npc_paint fallback"
                 if _paint:
                     chan.pop_args.setdefault("extra", {}).update(_paint)
-                    log(f"[udp {addr[0]}:{addr[1]}] PAINT: nation {_nat} starting colour "
-                        f"D30 {squad.NPC_PAINT_BY_NATION.get(_nat)}, camo {squad.NPC_CAMO} "
-                        f"(body+0x1B8..0x1BD)")
+                    log(f"[udp {addr[0]}:{addr[1]}] PAINT: "
+                        + ", ".join(f"body+{o:#05x}={int.from_bytes(v, 'little')}"
+                                    for o, v in sorted(_paint.items()))
+                        + f" from {_psrc}")
             chan.pending.append(fmoworld.record_pop(
                 uid, look=_lk_now, **chan.pop_args))
         except ValueError as e:

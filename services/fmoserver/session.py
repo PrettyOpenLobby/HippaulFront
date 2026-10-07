@@ -400,16 +400,16 @@ class Session(
         Precedence is the garage's own: a client-authored 0x0167 save beats the
         synthesized starter."""
         pc = self.playing_char() if charstore.CHAR_STORE else None
-        if pc and pc.get("setups"):
-            stored = bytes.fromhex(pc["setups"])
-            if len(stored) == inventory.REPLY_0166_LEN:
-                return stored
         char = (self.playing_char() or {}) if charstore.CHAR_STORE else {}
         nat, _src = popnation.character_nation(char)
         if charlist.NATION:
             nat = charlist.NATION
+        if pc and pc.get("setups"):
+            stored = bytes.fromhex(pc["setups"])
+            if len(stored) == inventory.REPLY_0166_LEN:
+                return inventory.fill_paint(stored, nat)[0]
         parts, _why = inventory.setup_parts_for(nat, char.get("cls"))
-        return inventory.reply_0166(parts=parts)
+        return inventory.reply_0166(parts=parts, nation=nat)
 
     @property
     def is_ps2(self):
@@ -783,11 +783,22 @@ class Session(
                 if len(stored) == inventory.REPLY_0166_LEN:
                     in_use = [i + 1 for i in range(inventory.SETUP_SLOTS)
                               if stored[i * inventory.SETUP_ENTRY_LEN + inventory.SETUP_IN_USE]]
+                    # A ZERO camo / armour / line is the zero our old starter
+                    # carried (row 0 of D29/D30 is an empty placeholder), never
+                    # a choice: it gets the nation's starting paint. Every
+                    # non-zero paint field goes back exactly as saved.
+                    _snat, _ = popnation.character_nation(_pc)
+                    if charlist.NATION:
+                        _snat = charlist.NATION
+                    stored, _pfill = inventory.fill_paint(stored, _snat)
                     log(f"{self.peer}   0x0165 -> 0x0166, {len(stored)}B "
                         f"STORED GARAGE BLOCK for id {_pc['id']} "
                         f"({_pc.get('first', '')} {_pc.get('last', '')}), "
                         f"setups in use: {in_use or 'none'} -- saved by a "
-                        f"0x0167, served back verbatim")
+                        f"0x0167, served back verbatim"
+                        + (f" except the starting paint in the zero paint "
+                           f"fields of setup(s) {_pfill} (nation {_snat})"
+                           if _pfill else ""))
                     return [packet.build(inventory.MSG_0165_REPLY, stored,
                                          self.reply_seq(), p["conn"])]
                 log(f"{self.peer}   WARNING: stored setups for id {_pc['id']} are "
@@ -836,8 +847,11 @@ class Session(
                     f"{_filled} of {inventory.WORLD_PART_SLOTS} (0x6138A2A0 maps slot -> "
                     f"item). The observable is the render node's AABB: "
                     f"anything other than (-5,-1,-5)/(5,5,5) is a real mesh.")
+            if _parts:
+                log(f"{self.peer}   paint: {inventory.starter_paint(_nat) or 'none'} "
+                    f"(nation {_nat} starting paint, inventory.starter_paint)")
             return [packet.build(inventory.MSG_0165_REPLY,
-                                 inventory.reply_0166(parts=_parts),
+                                 inventory.reply_0166(parts=_parts, nation=_nat),
                                  self.reply_seq(), p["conn"])]
 
         if p["msg"] == shop.MSG_SETUP_SAVE:
@@ -856,6 +870,15 @@ class Session(
                     return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(), charselect.FAIL_CODE)]
                 block = pl[8:8 + inventory.REPLY_0166_LEN]
                 c["setups"] = block.hex()
+                # +0x00 = lobby+0x3DF2, the SELECTED setup (1-based): the one
+                # the battle dresses and paints (inventory.active_setup_no).
+                if 1 <= pl[0] <= inventory.SETUP_SLOTS:
+                    c["setup_sel"] = pl[0]
+                _sel = c.get("setup_sel") or 1
+                if 1 <= _sel <= inventory.SETUP_SLOTS:
+                    _sb = (_sel - 1) * inventory.SETUP_ENTRY_LEN
+                    log(f"{self.peer}   selected setup {_sel} (+0x00); its paint: "
+                        f"{inventory.setup_paint(block[_sb:_sb + inventory.SETUP_ENTRY_LEN])}")
                 in_use = [i + 1 for i in range(inventory.SETUP_SLOTS)
                           if block[i * inventory.SETUP_ENTRY_LEN + inventory.SETUP_IN_USE]]
                 self.commit(f"setups saved for id {c['id']} "

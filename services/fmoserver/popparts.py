@@ -43,11 +43,19 @@ def stored_setup1_parts(block):
 
     Returns [] for a block that is not in use, so a caller can tell "the player
     has no saved loadout" from "the player saved an empty one"."""
-    if len(block) < inventory.SETUP_ENTRY_LEN or not block[inventory.SETUP_IN_USE]:
+    return stored_setup_parts(block, 1)
+
+
+def stored_setup_parts(block, setup_no=1):
+    """stored_setup1_parts for setup `setup_no` (1..8) of a stored block."""
+    base = (setup_no - 1) * inventory.SETUP_ENTRY_LEN
+    if (not 1 <= setup_no <= inventory.SETUP_SLOTS
+            or len(block) < base + inventory.SETUP_ENTRY_LEN
+            or not block[base + inventory.SETUP_IN_USE]):
         return []
     out = []
     for idx in range(fmoworld.POP_PART_COUNT):
-        off = inventory.SETUP_ITEM_OFF + idx * inventory.INV_ENTRY_LEN
+        off = base + inventory.SETUP_ITEM_OFF + idx * inventory.INV_ENTRY_LEN
         item_id = struct.unpack_from("<H", block, off + inventory.ITEM_ID)[0]
         kind = block[off + inventory.ITEM_KIND]
         if item_id and kind:
@@ -88,9 +96,13 @@ def pop_parts_for(host_ip):
         except ValueError:
             blk = b""
         if len(blk) == inventory.REPLY_0166_LEN:
-            parts = stored_setup1_parts(blk)
+            # The setup the pilot sorties with: the hangar selection when it
+            # is in use, else setup 1 (inventory.active_setup_no) -- the same
+            # pick pop_paint_for makes, so parts and paint come from one setup.
+            _n, _nsrc = inventory.active_setup_no(char, blk)
+            parts = stored_setup_parts(blk, _n)
             if parts:
-                src = "store:%s saved setup 1 (0x0167)" % (acct[:8],)
+                src = "store:%s saved setup %d (0x0167; %s)" % (acct[:8], _n, _nsrc)
     if not parts:
         nat, _natsrc = popnation.character_nation(char)
         parts, why = inventory.setup_parts_for(nat, char.get("cls"))
@@ -113,6 +125,60 @@ def pop_parts_for(host_ip):
     if dropped:
         src += " -- DROPPED, not sent: " + "; ".join(dropped)
     return keep, src
+
+
+def paint_for_char(char, nation):
+    """({field: id}, source) the battle self-POP paints this pilot's wanzer
+    with: the active stored setup's paint (inventory.active_setup_no, the same
+    setup pop_parts_for dresses from), each zero field taking the nation's
+    starting paint (inventory.starter_paint). Pure."""
+    start = inventory.starter_paint(nation)
+    try:
+        blk = bytes.fromhex((char or {}).get("setups") or "")
+    except ValueError:
+        blk = b""
+    if len(blk) == inventory.REPLY_0166_LEN:
+        n, nsrc = inventory.active_setup_no(char, blk)
+        base = (n - 1) * inventory.SETUP_ENTRY_LEN
+        if blk[base + inventory.SETUP_IN_USE]:
+            saved = inventory.setup_paint(blk[base:base + inventory.SETUP_ENTRY_LEN])
+            paint = {k: v for k, v in saved.items() if v}
+            filled = sorted(k for k, v in start.items() if k not in paint)
+            for k in filled:
+                paint[k] = start[k]
+            return paint, ("saved setup %d (%s)%s" % (
+                n, nsrc, "; starting paint for " + ",".join(filled)
+                if filled else ""))
+    if start:
+        return dict(start), "nation %s starting paint (no saved setup)" % nation
+    return {}, "no saved setup and nation %r has no starting paint" % (nation,)
+
+
+def paint_pop_extra(paint):
+    """{POP body offset: bytes} for record_pop's `extra`: the u16 camo /
+    line / armour / insignia at body+0x1B8..0x1BF and the +0x17 byte at
+    body+0x1C3 (inventory.POP_PAINT). Zero fields are left out."""
+    out = {}
+    for k, off in inventory.POP_PAINT.items():
+        if paint.get(k):
+            out[off] = struct.pack("<H", paint[k] & 0xFFFF)
+    if paint.get("b17"):
+        out[inventory.POP_PAINT_B17] = bytes([paint["b17"] & 0xFF])
+    return out
+
+
+def pop_paint_for(host_ip, nation):
+    """(extra, source) painting the battle self-POP of the pilot at
+    `host_ip`, the same character pop_parts_for dresses."""
+    if not inventory.SETUP_PAINT:
+        return {}, "FMO_SETUP_PAINT=0"
+    acct = identity.account_for(host_ip)
+    char = None
+    for c in charstore.load_roster(acct):
+        char = c
+        break
+    paint, src = paint_for_char(char or {}, nation)
+    return paint_pop_extra(paint), "store:%s %s" % (acct[:8], src)
 
 
 # Called at run time only; imported last so that import cycles resolve.

@@ -314,11 +314,16 @@ def pilot_bg_cost(char, setup_no=None):
                          (struct.unpack_from("<H", rec, inventory.ITEM_ID)[0],
                           rec[inventory.ITEM_KIND]))
     from . import status          # here: a module-level import is a cycle
-    n = status.STATUS_ACTIVE_SETUP if setup_no is None else setup_no
-    used = [i + 1 for i in range(inventory.SETUP_SLOTS)
-            if block[i * inventory.SETUP_ENTRY_LEN + inventory.SETUP_IN_USE]]
-    if n not in used and used:
-        n = used[0]
+    if setup_no is None:
+        # the hangar selection when stored (0x0167 +0x00), the same setup the
+        # battle self-POP dresses and paints (popparts.pop_parts_for)
+        n, _ = inventory.active_setup_no(char, block, status.STATUS_ACTIVE_SETUP or 1)
+    else:
+        n = setup_no
+        used = [i + 1 for i in range(inventory.SETUP_SLOTS)
+                if block[i * inventory.SETUP_ENTRY_LEN + inventory.SETUP_IN_USE]]
+        if n not in used and used:
+            n = used[0]
     return setup_bg_cost(block, n or 1, owned)
 
 

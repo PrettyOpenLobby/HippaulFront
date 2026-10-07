@@ -492,6 +492,24 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
                             S14A_OWNED + permits.AREA_OPEN_OFF + _bi, bytes([_bv]),
                             "character store [areas_open]"))
 
+    # KEY: THE PAINT THE PILOT OWNS (inventory.owned_paint_bits): the camo,
+    # colour and insignia pickers list only owned ids, read from this block.
+    # Above the stored-flags early return for the same reason the permits are.
+    _pnat = nation or STATUS_NATION
+    if not _pnat and char:
+        from . import popnation          # here: a module-level import is a cycle
+        _pnat = popnation.character_nation(char)[0]
+    _pbits = inventory.owned_paint_bits(char, _pnat)
+    if _pbits:
+        _pids = inventory.owned_paint_ids(char, _pnat)
+        for _po in sorted(_pbits):
+            out.append(("owned paint byte owned+0x%03X = %#04x (camo %s, colours "
+                        "%s, insignia %s; the colouring pickers list owned ids only)"
+                        % (_po, _pbits[_po], _pids["camo"], _pids["colour"],
+                           _pids["insignia"]),
+                        S14A_OWNED + _po, bytes([_pbits[_po]]),
+                        "nation %s starting paint + the stored setups' paint" % _pnat))
+
     # PROGRESS FLAGS -- the kind-11 block at lobby+0xB88 (payload +0x304).
     #
     # KEY: STORED PER CHARACTER as of 2026-09-08, and this one mattered most.

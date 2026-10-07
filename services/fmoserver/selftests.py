@@ -2681,8 +2681,8 @@ def _wanzer_paint_pins():
                  and inv.POP_PAINT["camo"] == squad.POP_CAMO
                  and inv.POP_PAINT["line"] == squad.POP_COLOUR_A
                  and inv.POP_PAINT["armour"] == squad.POP_COLOUR_B
-                 and inv.POP_PAINT_B17 != popself.POP_PENALTY_LEVEL
-                 if hasattr(popself, "POP_PENALTY_LEVEL") else True)
+                 # the penalty byte is the neighbour, not this one
+                 and inv.POP_PAINT_B17 == penalty.POP_PENALTY_LEVEL + 1)
         # (2) the starter setup wears the nation's starting paint
         st = inv.starter_setup(1, 1)
         b1 = inv.reply_0166(parts=st, nation=1)
@@ -3954,6 +3954,8 @@ def _selftest_run(test_db):
                     (status.S14A_ACTIVE_SETUP, 1),
                     # the acknowledged rank rides with rank (the E316 gate)
                     (status.S14A_BE1A, 1),
+                    # the nation's starting paint, owned (inventory.owned_paint_bits)
+                    (status.S14A_OWNED + 0x110, 0x100), (status.S14A_OWNED + 0x3C0, 0x80),
                     (status.S14A_FIRST, status.S14A_NAME_LEN), (status.S14A_LAST, status.S14A_NAME_LEN)):
         scratch[off:off + ln] = bytes(ln)
     rest_zero = scratch == bytearray(status.REPLY_014A_LEN)
@@ -12899,6 +12901,7 @@ def _selftest_run(test_db):
     ok &= _battle_end_title_pins()  # 0x014C end banner + EXP Gain window flags
     ok &= _battle_spawn_pins()      # per-map battle spawn points (battlepop.BATTLE_SPAWNS)
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
+    ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
