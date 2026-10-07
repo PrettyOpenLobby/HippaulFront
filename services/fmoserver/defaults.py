@@ -135,6 +135,10 @@ RELEASE_DEFAULTS = {
     # one Controlled Zone (HQ) pass on promotion to Private First Class, rank
     # byte 4 (manual p.44); each pass is granted once per pilot
     "FMO_SALARY": "1", "FMO_PERMIT": "0", "FMO_PERMIT_RANKS": "4:hq",
+    # the paint shop (0x01A4): SE's cosmetic prices are not in any data we
+    # hold; ours, sized against a ~2500 H$ sortie and the 1000/2000 H$ passes:
+    # camouflage 3000, a colour 1500, an insignia 1000
+    "FMO_COSMETIC_PRICES": "2:3000,3:1500,4:1000",
     # battle exp: about 10 wins a Pilot level in the easiest sectors, twice as
     # fast at NPC rank 5, the Frontline a quarter more again (battleend's
     # note; SE's shape, our numbers). With 70% wins that is roughly 75 battles
