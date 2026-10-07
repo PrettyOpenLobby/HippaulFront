@@ -2867,6 +2867,123 @@ def _wanzer_paint_pins():
     return ok
 
 
+def _paint_shop_pins():
+    """THE PAINT SHOP BUY (cosmetics.on_buy, 0x01A4, 2026-10-07), no client.
+    (1) knobs parse; (2) the live 09-11 wire bytes parse; (3) a pilot with the
+    money buys camo: 0x015A (money -price, the new owned bit) then message 1,
+    debit + id banked, 0x014A serves the bit; (4) the twins that must FAIL a
+    broken verdict: short of money, another nation's row, an unstocked row
+    each get message 2 and keep their money; (5) already owned = free re-grant;
+    (6) a pilot-locker kind falls through to the plain ack; (7) bought bits
+    survive FMO_SETUP_PAINT=0; (8) stock filters the 0x01A3 catalogue."""
+    import tempfile as _tf
+    ok = True
+    fails = []
+    H = 0x14
+    cz = cosmetics
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    def _ids(outs):
+        return [struct.unpack_from("<H", x, 6)[0] for x in outs or []]
+
+    def _buy(char, rid, kind, price=0):
+        _s = session.Session("selftest-paint-shop")
+        _s._roster = [char]
+        _s.playing_char = lambda: char
+        _s.commit = lambda what: None
+        return _s.on_packet(packet.parse(packet.build(
+            cz.MSG_COSMETIC_BUY, struct.pack("<HBBI", rid, kind, 0, price) + bytes(16),
+            0x1A4)))
+
+    _was = (charstore.CHAR_STORE, status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER,
+            status.SERVE_START_STATUS, resultpush.RESULT_PUSH, cz.COSMETIC_STOCK,
+            cz.COSMETIC_PRICES, cz.COSMETIC_BUY, inventory.SETUP_PAINT)
+    with _tf.TemporaryDirectory() as _td:
+        try:
+            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+            status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER = 1, False
+            status.SERVE_START_STATUS, resultpush.RESULT_PUSH = True, True
+            cz.COSMETIC_BUY, inventory.SETUP_PAINT = True, True
+            # (1) knobs
+            try:
+                cz.parse_stock("9")
+                _bad = False
+            except ValueError:
+                _bad = True
+            ok &= _c(1, cz.parse_stock("") == {2: None, 3: None, 4: None}
+                     and cz.parse_stock("none") == {}
+                     and cz.parse_stock("2:105-107,4") == {2: {105, 106, 107}, 4: None}
+                     and cz.parse_prices("2:500, 4:0") == {2: 500, 4: 0} and _bad)
+            # (2) prod fmo.log 2026-09-11 23:57:03Z, the first 0x01A4 ever seen
+            ok &= _c(2, cz.parse_buy(bytes.fromhex("830004000000000000")) == (131, 4, 0)
+                     and cz.BUY_KIND_CAT == {2: "camo", 3: "colour", 4: "insignia"})
+            cz.COSMETIC_STOCK = cz.parse_stock("")
+            cz.COSMETIC_PRICES = {2: 500, 3: 300, 4: 200}
+            # (3) camo 105 "Grayish Red 1" is nation 1's, bit 105-101 = 4 at +0x110
+            rich = {"id": 31, "first": "Pai", "last": "Nter", "money": 5000}
+            o = _buy(rich, 105, 2, 500)
+            pk = o[0] if o else b""
+            mon = (struct.unpack_from("<i", pk, H + resultpush.S15A_MONEY)[0]
+                   if len(pk) > H + resultpush.S15A_MONEY + 4 else None)
+            ob = (pk[H + resultpush.S15A_OWNED + 0x110]
+                  if len(pk) > H + resultpush.S15A_OWNED + 0x110 else None)
+            b14a = status.reply_014a(char=rich)
+            ok &= _c(3, _ids(o) == [resultpush.MSG_RESULT_PUSH, handshake.MSG_SESSION_START]
+                     and mon == -500 and ob == 0x11 and rich["money"] == 4500
+                     and rich.get("paint_owned") == {"camo": [105]}
+                     and b14a[status.S14A_OWNED + 0x110] == 0x11)
+            # (4) the twins: short, wrong nation (102 Geometric 1 is nation 2's), unstocked
+            poor = {"id": 32, "first": "No", "last": "Cash", "money": 299}
+            o4a = _buy(poor, 7, 3, 300)                       # colour 7 Smalt, nation 1
+            o4b = _buy(dict(rich), 102, 2)
+            cz.COSMETIC_STOCK = cz.parse_stock("3,4")
+            o4c = _buy(rich, 107, 2)                          # camo 107 Jungle 1, nation 1
+            cz.COSMETIC_STOCK = cz.parse_stock("")
+            ok &= _c(4, _ids(o4a) == [2] and poor["money"] == 299
+                     and not poor.get("paint_owned")
+                     and _ids(o4b) == [2] and _ids(o4c) == [2] and rich["money"] == 4500
+                     and rich.get("paint_owned") == {"camo": [105]})
+            # (5) already owned -> message 1 again, nothing charged
+            o5 = _buy(rich, 105, 2, 500)
+            ok &= _c(5, _ids(o5) == [resultpush.MSG_RESULT_PUSH, handshake.MSG_SESSION_START]
+                     and rich["money"] == 4500
+                     and struct.unpack_from("<i", o5[0], H + resultpush.S15A_MONEY)[0] == 0)
+            # (6) kind 1 (a pilot suit) is not paint: the generic ack, no verdict
+            o6 = _buy(rich, 1, 1)
+            ok &= _c(6, _ids(o6) == [handshake.MSG_SESSION_START] and rich["money"] == 4500)
+            # (7) FMO_SETUP_PAINT=0 drops starter/worn paint, never a purchase
+            inventory.SETUP_PAINT = False
+            ok &= _c(7, inventory.owned_paint_bits(rich, 1) == {0x110: 0x10}
+                     and inventory.owned_paint_bits({"money": 1}, 1) == {})
+            inventory.SETUP_PAINT = True
+            # (8) the catalogue: stock filters paint kinds only, price is ours
+            n_all = len(cz.cosmetics_for(cz.A2_WANZER, 1))
+            cz.COSMETIC_STOCK = cz.parse_stock("3")
+            rows = cz.cosmetics_for(cz.A2_WANZER, 1)
+            body = cz.reply_01a3(lobapi.LOBAPI[0x01A2][1], b"\x02", 1)
+            r0 = struct.unpack_from("<HBBI", body, cz.A3_ROW_OFF) if body else None
+            ok &= _c(8, n_all > len(rows) > 0 and {k for k, _i, _e in rows} == {3}
+                     and r0 is not None and r0[1] == 3 and r0[3] == 300
+                     and len(cz.cosmetics_for(cz.A2_PILOT, 1)) > 0)
+        except Exception as e:
+            print(f"  paint shop: EXC {e!r}")
+            ok = False
+        finally:
+            flat_globals()["CHAR_STORE"] = _was[0]
+            (status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER,
+             status.SERVE_START_STATUS, resultpush.RESULT_PUSH, cz.COSMETIC_STOCK,
+             cz.COSMETIC_PRICES, cz.COSMETIC_BUY, inventory.SETUP_PAINT) = _was[1:]
+    print(f"  paint shop (0x01A4): knobs, live wire bytes, camo bought -> 0x015A "
+          f"owned bit + debit then message 1, refusals keep the money, re-grant "
+          f"free, locker kinds untouched, stock filters 0x01A3: "
+          f"{'OK' if ok else 'FAIL at ' + str(fails)}")
+    return ok
+
+
 def _change_room_pins():
     """CHANGE ROOM maps and casts (move.ROOM_MAPS, roomcast.py, 2026-10-06):
     Room = 121, Briefing 122 / 123 by nation, Room B / C = 124, Hangar 141;
@@ -13455,6 +13572,7 @@ def _selftest_run(test_db):
     ok &= _battle_spawn_pins()      # per-map battle spawn points (battlepop.BATTLE_SPAWNS)
     ok &= _change_room_pins()       # Change Room maps and per-zone room casts (roomcast.py)
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
+    ok &= _paint_shop_pins()        # paint shop buy 0x01A4: verdict, debit, owned bit (cosmetics.py)
     ok &= _pvp_room_pins()          # Frontline PvP rooms: waiting, start, judge, war (pvproom.py)
     ok &= _btlreview_token_pins()   # field A = character wire id (Battle Review folder)
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged

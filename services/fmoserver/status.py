@@ -508,7 +508,8 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
                         % (_po, _pbits[_po], _pids["camo"], _pids["colour"],
                            _pids["insignia"]),
                         S14A_OWNED + _po, bytes([_pbits[_po]]),
-                        "nation %s starting paint + the stored setups' paint" % _pnat))
+                        "nation %s starting paint + the stored setups' paint + paint "
+                        "bought at the shop (0x01A4)" % _pnat))
 
     # PROGRESS FLAGS -- the kind-11 block at lobby+0xB88 (payload +0x304).
     #

@@ -3762,6 +3762,13 @@ class Session(
             # return. FMO_COLISEUM=0 leaves them to the zero stubs below.
             return self.on_coliseum(p)
 
+        if p["msg"] == cosmetics.MSG_COSMETIC_BUY and charselect.ANSWER_LOBAPI:
+            # THE PAINT SHOP's buy (cosmetics.on_buy): camo / colour / insignia
+            # get a verdict, a debit and a grant; other kinds fall through.
+            _cb = cosmetics.on_buy(self, p)
+            if _cb is not None:
+                return _cb
+
         if p["msg"] in lobapi.LOBAPI:
             reply, need = lobapi.LOBAPI[p["msg"]]
             # WARNING: THE MISSION BOARD KILLS THE CLIENT (LIVE 2026-09-06, 2/2).

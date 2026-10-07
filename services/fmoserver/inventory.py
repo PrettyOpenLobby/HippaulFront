@@ -696,9 +696,10 @@ def active_setup_no(char, block=None, default=1):
 #: block went out as zeros here, so every colouring picker was EMPTY and no
 #: pilot could choose a paint. owned_paint_bits() owns what the pilot already
 #: wears plus SE's starting paint, which a pilot holds before any purchase.
-#: A SETUP.CONSOLE purchase (0x0168 with the catalogue's kind 2/3/4) is NOT
-#: granted here yet: 0x016B's own grant (0x6117884C, bytes +0x20 category /
-#: +0x21 id) is undecoded live.
+#: A SETUP.CONSOLE purchase is NOT 0x0168 (static 2026-10-07): every paint
+#: shop buy goes out as lobby-API 0x01A4 (cosmetics.MSG_COSMETIC_BUY) and the
+#: client sets no owned bit itself, so a bought id is banked on the pilot as
+#: char["paint_owned"] (add_owned_paint) and served here like the rest.
 OWNED_PAINT_CATS = {"camo": (0x110, 0x80, 101), "colour": (0x190, 0x80, 0),
                     "insignia": (0x3C0, 0x80, 101)}
 
@@ -724,16 +725,48 @@ def owned_paint_ids(char, nation):
                        ("line", "colour"), ("insignia", "insignia")):
             if p[k]:
                 out[cat].add(p[k])
+    for cat, ids in bought_paint_ids(char).items():
+        out[cat].update(ids)
     return {k: sorted(v) for k, v in out.items()}
+
+
+def bought_paint_ids(char):
+    """{category name: set of ids} the pilot BOUGHT at the paint shop
+    (char["paint_owned"], written by add_owned_paint). Junk is skipped."""
+    out = {k: set() for k in OWNED_PAINT_CATS}
+    raw = (char or {}).get("paint_owned") or {}
+    if not isinstance(raw, dict):
+        return out
+    for cat, ids in raw.items():
+        if cat not in out or not isinstance(ids, (list, tuple)):
+            continue
+        for n in ids:
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                out[cat].add(n)
+    return out
+
+
+def add_owned_paint(char, cat, pid):
+    """Bank a bought paint id on the pilot. True when it was new, False when
+    the pilot already had it bought (or the category is not a paint one)."""
+    if cat not in OWNED_PAINT_CATS or char is None:
+        return False
+    have = bought_paint_ids(char)
+    if pid in have[cat]:
+        return False
+    have[cat].add(int(pid))
+    char["paint_owned"] = {k: sorted(v) for k, v in have.items() if v}
+    return True
 
 
 def owned_paint_bits(char, nation):
     """{offset within the owned block: byte} setting owned_paint_ids()'s bits.
     An id outside its category's table is skipped, as the client would."""
-    if not SETUP_PAINT:
-        return {}
+    # FMO_SETUP_PAINT=0 drops the starting / worn paint, never what was paid for
+    owned = (owned_paint_ids(char, nation) if SETUP_PAINT else
+             {k: sorted(v) for k, v in bought_paint_ids(char).items()})
     out = {}
-    for cat, ids in owned_paint_ids(char, nation).items():
+    for cat, ids in owned.items():
         base, size, bias = OWNED_PAINT_CATS[cat]
         for n in ids:
             n -= bias
