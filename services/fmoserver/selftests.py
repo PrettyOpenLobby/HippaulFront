@@ -13956,10 +13956,10 @@ def _group_persist_pins():
         gc.GROUP_RULES = False
         _clear()
         # --- G1 ids never repeat
-        g1 = _make("10.0.0.1:1", "gp:a", "A.One")
-        g2 = _make("10.0.0.2:1", "gp:b", "B.Two")
+        g1 = _make("198.51.100.1:1", "gp:a", "A.One")
+        g2 = _make("198.51.100.2:1", "gp:b", "B.Two")
         bg.group_disband(g1, "selftest")
-        g3 = _make("10.0.0.3:1", "gp:c", "C.Three")
+        g3 = _make("198.51.100.3:1", "gp:c", "C.Three")
         _g1_ok = (g1, g2, g3) == (1, 2, 3)
         print(f"  groups: GroupIDs never repeat after a disband (the old len+1 "
               f"handed out 2 twice): {g1},{g2},{g3}: {'OK' if _g1_ok else 'FAIL'}")
@@ -13967,7 +13967,7 @@ def _group_persist_pins():
 
         # --- G2 round trip through the document
         _clear()
-        g = _make("10.0.0.1:1", "gp:lead", "Lead.Er", comment="vets only")
+        g = _make("198.51.100.1:1", "gp:lead", "Lead.Er", comment="vets only")
         gc.group_join(g, "gp:m1")
         gc.group_join(g, "gp:m2")
         gc.GROUP_READY["gp:m1"] = (1, 2)
@@ -14034,9 +14034,9 @@ def _group_persist_pins():
 
         # --- G4 lifetime rules
         _clear()
-        ga = _make("10.0.0.1:1", "gp:la", "L.A")
+        ga = _make("198.51.100.1:1", "gp:la", "L.A")
         gc.group_join(ga, "gp:ma")
-        gb = _make("10.0.0.2:1", "gp:lb", "L.B")
+        gb = _make("198.51.100.2:1", "gp:lb", "L.B")
         gc.group_join(gb, "gp:la")        # a stale leader moves (rules off)
         _left_ga = ga not in gc.GROUP_MEMBERS and "gp:ma" not in gc.GROUP_OF
         gc.group_leave("gp:la")

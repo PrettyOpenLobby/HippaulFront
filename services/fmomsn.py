@@ -787,8 +787,8 @@ PS2_SECTOR_MAP = (
 )
 PS2_SECTOR_RUNS = ((0x04, 0x07, 0x20), (0x24, 0x34, 0x20))
 
-#: A real PS2 HELLO, prod logs/captures/fmo-20261006T062302Z.bin (from
-#: 203.0.113.37, 2026-10-06T06:23:02Z). One of the 14 that went unanswered.
+#: A real PS2 HELLO, captured on our server
+#: (2026-10-06). One of the 14 that went unanswered.
 PS2_HELLO_CAPTURE = bytes.fromhex(
     "280000006deedb2722252bdec1f0b8b40022f9e0e2a33d795351d2789ad8b445"
     "17f6a70901000000")
