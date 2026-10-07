@@ -180,7 +180,7 @@ OP_PAGE = 0x1D
 #: NOT the record size (fmo.py's community-op note called it "0xDD B" and that
 #: is wrong): the walker's `add ebx, 0x134` and the callback's own
 #: `rep movsd 0x4D` both say 308, and the field offsets below run to +0x130,
-#: which 221 could not hold. an earlier note
+#: which 221 could not hold.
 GROUP_RECORD_LEN = 0x134   #: 308; 0x611AFB0C `add ebx,0x134`, callback rep movsd 0x4D
 OP_GROUPS = 0x17           #: arm 0x611AFAC1 -- byte count at +0x0C, records at +0x10
 
@@ -389,8 +389,7 @@ class ListQuery(object):
     +0x1C8 byte 3, and the view DROPS every record whose byte does not match
     (0x611C98E1) -- so serving rows under the wrong category would have drawn
     an empty list that looked exactly like serving no rows at all. A decode
-    that selftests clean against a body this file invented is not a decode.
-    an earlier note"""
+    that selftests clean against a body this file invented is not a decode."""
 
     __slots__ = ("submode", "max_rows", "nation", "mapkind", "category", "arg")
 

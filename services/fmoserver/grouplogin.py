@@ -72,7 +72,7 @@ def group_entry(group_id, host, port, gtype=0):
     # WARNING: NETWORK ORDER, like the 0x0153's (EP_0153_NET). LIVE 2026-09-05 22:52Z
     # with the little-endian `endpoint()` here: the client's own log said
     # "LoginGroup GroupID=2 Type=1 Addr=0.0.0.0:61300" and its FmoGroup dialed
-    # the byte-reversed 1.0.0.127:29935 -- nothing ever reached us and the
+    # the byte-reversed host address, port 29935 -- nothing ever reached us and the
     # group timed out. The group channel is CFmoConnectCliSys, the same UDP
     # datagram client as the battle map, whose sender copies [ep+2]/[ep+4]
     # verbatim into the sockaddr (endpoint_net's docstring). FMO-13111 again.
