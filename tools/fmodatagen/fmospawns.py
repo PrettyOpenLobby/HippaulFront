@@ -2,7 +2,7 @@
 """fmospawns.py -- per-map BATTLE SPAWN POINTS, out of each battle map's
 placement table and collision meshes.
 
-    python fmospawns.py --client <install or mirror Direct/> [--out DIR] [--check]
+    python fmospawns.py --client <install or mirror Direct/> [--out DIR] [--check] [--jobs N]
     python fmospawns.py --client ... --show 471 418 86      # one map's rows and why
     python fmospawns.py --client ... --ground 471 64 0      # the surfaces under a point
 
@@ -62,8 +62,8 @@ floors at 25.3 and 27.2 below), so a point is usable only where that highest
 surface is the ground. Collision is one-sided: every triangle is a floor
 (normal up) or a wall; none faces down.
 
-WHAT A POINT MUST BE. On a 4-unit grid over +/-364 the tool rasterises the top
-surface and the highest surface more than 8 below it. A cell is RAISED when
+WHAT A POINT MUST BE. On a 4-unit grid over the whole map box (+/-BOUNDS) the
+tool rasterises the top surface and the highest surface more than 8 below it. A cell is RAISED when
 that second surface is within 60 of the top: a roof, a bridge, a crate over
 the ground (live 471: every sample on ground (y 32) read not raised, every
 sample on a structure (41..48) read raised). A slot needs, within SLOT_CLEAR:
@@ -79,10 +79,25 @@ wanzer's height). So 40 apart is not enough; slots are SLOT_APART (56) apart.
 Y. One y per row: the lowest ground of any slot minus Y_DROP. Every slot's
 top surface is its ground, and the client lifts a low pop to the top surface.
 
-EXTENT. fmoworld.record_pop refuses any coordinate outside +/-327.67 (the
-LOBBY move channel, cmd 240, is int16 hundredths); the POP body itself carries
-floats and battle movement reaches x 1346, z 1479 on 471. Points stay inside
-+/-EXTENT until record_pop's guard is split for battle POPs.
+EXTENT (2026-10-07: the whole map). The battle POP position is four plain
+floats (0x611EB08F -> 0x6110F4B0 / 0x610FF0C0: 16-byte copies to char+0x44 /
++0x54, no compare), and fmoworld.record_pop now holds a battle POP (UnitType
+!= 4) only to x/y/z +/-POP_BATTLE_POS_MAX (2048, the client's own map box,
+resmgr+0x224); the +/-327.67 is the LOBBY move channel's (cmd 240, int16
+hundredths). The play boundary we serve (missionblock BattleArea,
+FMO_BATTLE_BOUNDS) is -2048..2048 on prod. So the ground is rasterised over
++/-BOUNDS and every point stays BOUND_MARGIN inside it; where the map has no
+geometry the raster has no surface and nothing can stand there, so the
+collision itself sets each map's real extent.
+
+THE SIDES. Retail teams started at opposite ends of the field. The tool finds
+the map's LONGEST OPEN AXIS: of AXIS_DIRS directions, the one along which the
+open (slot-clear) ground spans furthest (2nd..98th percentile of the
+projection). Side A comes from the open ground in the first POOL_FRAC of that
+span, side B from the last, both in one WALKABLE component (4-adjacent cells
+whose tops differ by at most CLIMB), so neither starts on a ledge or in a pen
+the other cannot reach. A pair scores its weaker point plus SEP_WEIGHT per
+unit of separation (up to SEP_CAP) less a quarter of the ground difference.
 
 ROW SHAPE (tab separated, fmo-battle-spawns.tsv):
   map      battle map id (type-1)
@@ -117,13 +132,19 @@ SENTINEL = 0xFFFFFFFF
 TABLE_SLOTS = 8192
 SEC_LIBRARY, SEC_COLLISION, SEC_PLACEMENT = 2, 3, 4
 
-#: every point and slot stays inside this box (record_pop's guard is +/-327.67)
-EXTENT = 300.0
-#: the rasterised ground reaches past EXTENT by the widest disc tested
-HALF = 364.0
+#: the battle map box: record_pop's battle guard (fmoworld.POP_BATTLE_POS_MAX)
+#: and the play boundary served (FMO_BATTLE_BOUNDS -2048,-2048,2048,2048)
+BOUNDS = 2048.0
+#: every point and slot stays this far inside BOUNDS
+BOUND_MARGIN = 64.0
+EXTENT = BOUNDS - BOUND_MARGIN
+#: the rasterised ground covers the whole box
+HALF = BOUNDS
 STEP = 4.0
 #: candidate side points sit on this grid
-GRID = 8.0
+GRID = 16.0
+#: POP y stays inside record_pop's battle bound (fmoworld.POP_BATTLE_POS_MAX)
+Y_MAX = BOUNDS - BOUND_MARGIN
 #: a cell is RAISED when another surface lies between 8 and 60 below its top
 LAYER_GAP, LAYER_SPAN = 8.0, 60.0
 #: the disc a slot needs clear, and what "clear" allows above / below its ground
@@ -144,8 +165,21 @@ SLOT_NUDGE = 0.25
 SIDE_LEVEL = 24.0
 #: score lost per unit a side point stands above the map's low ground
 LOW_WEIGHT = 0.1
-#: the separation the two sides aim for, and the band it must fall in
-SEP_AIM, SEP_MIN, SEP_MAX = 280.0, 200.0, 400.0
+#: the longest open axis is chosen from this many directions over 180 degrees
+AXIS_DIRS = 12
+#: each side's candidates come from this fraction of the axis span at its end
+POOL_FRAC = 0.35
+#: per pool, this many best candidates are paired
+POOL_KEEP = 250
+#: score per unit of separation, counted up to SEP_CAP
+SEP_WEIGHT, SEP_CAP = 0.004, 2400.0
+#: the sides are at least this far apart (and at least half the axis span)
+SEP_MIN = 200.0
+#: one side point is offered in at most this many pairs (the slot test then
+#: sees other points, not the same one with every partner)
+PAIR_REUSE = 6
+#: walkable: 4-adjacent cells whose tops differ by at most this
+CLIMB = 4.0
 Y_DROP = 4.0
 #: the "no battle here" placeholders (fmosectors.py) and the arena selector
 PLACEHOLDER_MAPS = (0, 2, 3, 4, 5)
@@ -423,55 +457,150 @@ class MapInfo:
         c = self.ground.cell(x, z)
         return c is not None and bool(self.slot_ok[c])
 
+    def labels(self):
+        """Per cell: its WALKABLE component (1..), 0 where there is no
+        surface. Two 4-adjacent cells join when their tops differ by at most
+        CLIMB, so a cliff, a wall or a roof edge separates; a ramp does not."""
+        if getattr(self, "_labels", None) is not None:
+            return self._labels
+        np = _np()
+        g = self.ground
+        n = g.n
+        fin = np.isfinite(g.top).ravel().tolist()
+        top = np.where(np.isfinite(g.top), g.top, 0.0).ravel().tolist()
+        lab = [0] * (n * n)
+        cur = 0
+        for start in range(n * n):
+            if not fin[start] or lab[start]:
+                continue
+            cur += 1
+            lab[start] = cur
+            stack = [start]
+            while stack:
+                c = stack.pop()
+                t = top[c]
+                i, j = divmod(c, n)
+                for d, inside in ((c - n, i > 0), (c + n, i < n - 1),
+                                  (c - 1, j > 0), (c + 1, j < n - 1)):
+                    if inside and fin[d] and not lab[d] and abs(top[d] - t) <= CLIMB:
+                        lab[d] = cur
+                        stack.append(d)
+        self._labels = np.array(lab, dtype=np.int32).reshape(n, n)
+        return self._labels
+
+    def in_box(self):
+        """Cells inside +/-EXTENT."""
+        np = _np()
+        g = self.ground
+        c = np.abs(-g.half + g.step * np.arange(g.n)) <= EXTENT + 1e-6
+        return c[:, None] & c[None, :]
+
+    def axis(self):
+        """(span, ux, uz, lo, hi): THE LONGEST OPEN AXIS. Of AXIS_DIRS
+        directions, the one along which the open (slot-clear) ground of the
+        largest walkable component spans furthest, 2nd..98th percentile of
+        the projection (lo..hi). None when nothing is open."""
+        cache = self.__dict__.setdefault("_axis", {})
+        if self.relaxed in cache:
+            return cache[self.relaxed]
+        np = _np()
+        g = self.ground
+        lab = self.labels()
+        open_ = self.slot_ok & (lab > 0) & self.in_box()
+        out = None
+        if open_.any():
+            main = int(np.bincount(lab[open_]).argmax())
+            I, J = np.nonzero(open_ & (lab == main))
+            x = -g.half + g.step * I
+            z = -g.half + g.step * J
+            for k in range(AXIS_DIRS):
+                a = math.pi * k / AXIS_DIRS
+                ux, uz = round(math.cos(a), 12), round(math.sin(a), 12)
+                lo, hi = (float(v) for v in np.percentile(x * ux + z * uz, [2, 98]))
+                if out is None or hi - lo > out[0] + 1e-6:
+                    out = (hi - lo, ux, uz, lo, hi)
+        cache[self.relaxed] = out
+        return out
+
 
 def candidates(mi, tier):
-    """[(x, z, ground, relief)] for GRID points inside +/-EXTENT that pass
-    the side test of `tier` (disc radius, step up, drop)."""
+    """{x, z, g, relief, above, lab: arrays} for GRID points inside +/-EXTENT
+    that pass the side test of `tier` (disc radius, step up, drop)."""
+    np = _np()
+    cache = mi.__dict__.setdefault("_cands", {})
+    key = (tier, mi.relaxed)
+    if key in cache:
+        return cache[key]
     ok, relief = mi.ground.clear_mask(*tier, allow_raised=mi.relaxed)
-    low = mi.low_ground()
-    out = []
-    n = int(EXTENT // GRID)
-    for i in range(-n, n + 1):
-        for j in range(-n, n + 1):
-            x, z = i * GRID, j * GRID
-            c = mi.ground.cell(x, z)
-            if c is None or not ok[c] or not mi.slot_ok[c]:
-                continue
-            g = float(mi.ground.top[c])
-            out.append((x, z, g, float(relief[c]), max(0.0, g - low)))
-    return out
+    g = mi.ground
+    coord = -g.half + g.step * np.arange(g.n)
+    on = (np.abs(np.mod(coord, GRID)) < 1e-6) & (np.abs(coord) <= EXTENT + 1e-6)
+    ok = ok & mi.slot_ok & on[:, None] & on[None, :]
+    I, J = np.nonzero(ok)
+    if getattr(mi, "_low", None) is None:
+        mi._low = mi.low_ground()
+    gr = g.top[I, J]
+    cache[key] = {"x": coord[I], "z": coord[J], "g": gr, "relief": relief[I, J],
+                  "above": np.maximum(0.0, gr - mi._low), "lab": mi.labels()[I, J]}
+    return cache[key]
 
 
 def _cand_score(c):
-    """Bigger is better: flat (low relief over the disc), low (c[4] is the
-    height above the map's low ground), not out at the edge."""
-    return -2.0 * c[3] - LOW_WEIGHT * c[4] - 0.05 * max(abs(c[0]), abs(c[1]))
+    """Bigger is better: flat (low relief over the disc) and low (height
+    above the map's low ground)."""
+    return -2.0 * c["relief"] - LOW_WEIGHT * c["above"]
 
 
-def pick_pairs(cands, level=None, keep=40):
-    """[(A, B)] best first: the weaker side's score, near SEP_AIM apart, on
-    similar ground (within `level` when given), A the one with the smaller z
-    (then x). Empty when no pair fits the band."""
-    coarse = [c for c in cands if c[0] % 16 == 0 and c[1] % 16 == 0] or cands
-    top = sorted(coarse, key=lambda c: -_cand_score(c))[:500]
-    scored = []
-    for i, a in enumerate(top):
-        sa = _cand_score(a)
-        for b in top[i + 1:]:
-            d = math.hypot(a[0] - b[0], a[1] - b[1])
-            if not SEP_MIN <= d <= SEP_MAX:
-                continue
-            if level is not None and abs(a[2] - b[2]) > level:
-                continue
-            mid = math.hypot((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-            scored.append((min(sa, _cand_score(b)) - abs(d - SEP_AIM) * 0.05 - mid * 0.05
-                           - 0.25 * abs(a[2] - b[2]), a, b))
-    scored.sort(key=lambda t: -t[0])
-    out = []
-    for _s, a, b in scored[:keep]:
-        if (b[1], b[0]) < (a[1], a[0]):
-            a, b = b, a
-        out.append((a, b))
+def pick_pairs(mi, c, level=None, same_walk=True, keep=200):
+    """[(A, B)] best first, each (x, z, ground, relief): A from the low end
+    of the longest open axis, B from the high end (POOL_FRAC of the span
+    each), at least max(SEP_MIN, half the span) apart, in one walkable
+    component when `same_walk`, on similar ground (within `level` when
+    given). Score: the weaker side's, plus SEP_WEIGHT per unit apart (to
+    SEP_CAP), less a quarter of the ground difference. No point is offered
+    in more than PAIR_REUSE pairs."""
+    np = _np()
+    ax = mi.axis()
+    if ax is None or not len(c["x"]):
+        return []
+    span, ux, uz, lo, hi = ax
+    t = c["x"] * ux + c["z"] * uz
+    sc = _cand_score(c)
+    pools = []
+    for sel in (t <= lo + POOL_FRAC * span, t >= hi - POOL_FRAC * span):
+        idx = np.nonzero(sel)[0]
+        idx = idx[np.argsort(-sc[idx], kind="stable")][:POOL_KEEP]
+        pools.append(idx)
+    ia, ib = pools
+    if not len(ia) or not len(ib):
+        return []
+    d = np.hypot(c["x"][ia][:, None] - c["x"][ib][None, :],
+                 c["z"][ia][:, None] - c["z"][ib][None, :])
+    dg = np.abs(c["g"][ia][:, None] - c["g"][ib][None, :])
+    ok = d >= max(SEP_MIN, 0.5 * span)
+    if same_walk:
+        ok &= c["lab"][ia][:, None] == c["lab"][ib][None, :]
+    if level is not None:
+        ok &= dg <= level
+    ps = (np.minimum(sc[ia][:, None], sc[ib][None, :])
+          + SEP_WEIGHT * np.minimum(d, SEP_CAP) - 0.25 * dg)
+    P, Q = np.nonzero(ok)
+    if not len(P):
+        return []
+    order = np.argsort(-ps[P, Q], kind="stable")
+
+    def pt(k):
+        return (float(c["x"][k]), float(c["z"][k]), float(c["g"][k]), float(c["relief"][k]))
+    out, used = [], {}
+    for o in order:
+        p, q = int(ia[P[o]]), int(ib[Q[o]])
+        if used.get(("a", p), 0) >= PAIR_REUSE or used.get(("b", q), 0) >= PAIR_REUSE:
+            continue
+        used[("a", p)] = used.get(("a", p), 0) + 1
+        used[("b", q)] = used.get(("b", q), 0) + 1
+        out.append((pt(p), pt(q)))
+        if len(out) >= keep:
+            break
     return out
 
 
@@ -534,18 +663,31 @@ def load_map(root, mapno):
 
 
 def _search(mi):
-    """(a, b, slots a, slots b, level, tier) for the first pass that yields
-    a pair with MIN_SLOTS each, or None. Passes: open ground before a raised
-    layer, sides on one level before any, the strict disc before the loose."""
+    """(a, b, slots a, slots b, level, tier, same_walk) for the first pass
+    that yields a pair with MIN_SLOTS each, or None. Passes: open ground
+    before a raised layer, one walkable component before any, sides on one
+    level before any. Within a pass the best-scored pair with all SLOTS on
+    both sides wins, the strict disc before the looser tiers; failing that,
+    the pair (any tier) with the most slots on its shorter side, since a
+    squad off the table stands on unchecked ground."""
     for relaxed in (False, True):
         mi.relax(relaxed)
-        for level in (SIDE_LEVEL, None):
-            for tier in SIDE_TIERS:
-                for a, b in pick_pairs(candidates(mi, tier), level):
-                    sa = front_slots(mi, a[:2], b[:2])
-                    sb = front_slots(mi, b[:2], a[:2])
-                    if len(sa) >= MIN_SLOTS and len(sb) >= MIN_SLOTS:
-                        return a, b, sa, sb, level, tier
+        for same_walk in (True, False):
+            for level in (SIDE_LEVEL, None):
+                best = None
+                for tier in SIDE_TIERS:
+                    for a, b in pick_pairs(mi, candidates(mi, tier), level, same_walk):
+                        sa = front_slots(mi, a[:2], b[:2])
+                        sb = front_slots(mi, b[:2], a[:2])
+                        n = min(len(sa), len(sb))
+                        if n >= MIN_SLOTS and (best is None or n > best[0]):
+                            best = (n, (a, b, sa, sb, level, tier, same_walk))
+                            if n >= SLOTS:
+                                break
+                    if best is not None and best[0] >= SLOTS:
+                        break
+                if best is not None:
+                    return best[1]
     mi.relax(False)
     return None
 
@@ -554,16 +696,20 @@ def build_row(mi):
     """The TSV row dict for one map, or (None, why)."""
     found = _search(mi)
     if found is None:
-        return None, "no two flat, clear points %g-%g apart inside +/-%g with %d slots each" % (
-            SEP_MIN, SEP_MAX, EXTENT, MIN_SLOTS)
-    a, b, sa, sb, level, tier = found
+        return None, "no two flat, clear points >= %g apart inside +/-%g with %d slots each" % (
+            SEP_MIN, EXTENT, MIN_SLOTS)
+    a, b, sa, sb, level, tier, same_walk = found
     relaxed = mi.relaxed
+    span, ux, uz = mi.axis()[:3]
     grounds = [mi.ground.at(x, z)[0] for x, z in sa + sb]
-    y = round(min(min(grounds) - Y_DROP, EXTENT), 1)
+    y = round(min(min(grounds) - Y_DROP, Y_MAX), 1)
     notes = []
     if relaxed:
         notes.append("LAST RESORT, on a raised layer: no open ground; the points stand on "
                      "a top surface with another floor 8..60 under it (roof or deck, unproved)")
+    if not same_walk:
+        notes.append("the sides are not in one walkable component (steps over %g); "
+                     "a path between them is unproved" % CLIMB)
     if level is None:
         notes.append("the sides' ground differs by %.0f" % abs(a[2] - b[2]))
     if tier is not SIDE_TIERS[0]:
@@ -580,8 +726,10 @@ def build_row(mi):
         "map": mi.mapno, "ax": a[0], "az": a[1], "bx": b[0], "bz": b[1], "y": y,
         "a_slots": " ".join("%g:%g" % s for s in sa),
         "b_slots": " ".join("%g:%g" % s for s in sb),
-        "source": "collision: %d placed/%d meshed in +/-%g; ground A %.1f B %.1f; relief %.1f/%.1f (disc %g)" % (
-            len(mi.recs), mi.ground.meshed, HALF, a[2], b[2], a[3], b[3], tier[0]),
+        "source": ("collision: %d placed/%d meshed in +/-%g; axis %.0f deg, open span %.0f; "
+                   "sides %.0f apart; ground A %.1f B %.1f; relief %.1f/%.1f (disc %g)") % (
+            len(mi.recs), mi.ground.meshed, HALF, math.degrees(math.atan2(uz, ux)), span,
+            math.hypot(a[0] - b[0], a[1] - b[1]), a[2], b[2], a[3], b[3], tier[0]),
         "notes": "; ".join(notes),
     }, None
 
@@ -606,13 +754,70 @@ def build(root, maps=None, keep=False):
     return rows, skipped, infos
 
 
-def check(rows, root, infos=None):
-    """Re-derive every row from the file; [] when all hold. Every slot must
-    stand on clear ground (unraised unless the row says LAST RESORT), inside
+def check_row(r, mi):
+    """(fails, twin) for one row against its map. Every slot must stand on
+    clear ground (unraised unless the row says LAST RESORT), inside
     +/-EXTENT, SLOT_APART from its side's other slots, with y under its
-    ground. The twins, on the first row's map: a raised cell, and a cell with
-    a rise of more than twice SLOT_STEP_UP within SLOT_CLEAR (found here by
-    a plain square scan, not by the mask), must FAIL the slot test."""
+    ground. `twin` is None when the map offers no raised cell and no wall to
+    test, else the twin failures: a raised cell, and a cell with a rise of
+    more than twice SLOT_STEP_UP within SLOT_CLEAR (found by a plain square
+    scan, not by the mask), must FAIL the slot test."""
+    fails = []
+    loose = "LAST RESORT" in r["notes"]
+    mi.relax(loose)
+    for side in "ab":
+        pts = [tuple(float(v) for v in s.split(":")) for s in r[side + "_slots"].split()]
+        if pts[0] != (r[side + "x"], r[side + "z"]):
+            fails.append("map %d side %s slot 0 is not the side point" % (r["map"], side))
+        for i, (x, z) in enumerate(pts):
+            if abs(x) > EXTENT or abs(z) > EXTENT:
+                fails.append("map %d slot %s%d outside +/-%g" % (r["map"], side, i, EXTENT))
+            if not mi.slot_clear(x, z):
+                fails.append("map %d slot %s%d (%g,%g) not on clear ground" % (r["map"], side, i, x, z))
+            g, raised = mi.ground.at(x, z)
+            if g is None or (raised and not loose) or r["y"] > min(g - Y_DROP, Y_MAX) + 0.05:
+                fails.append("map %d slot %s%d ground %s raised %s vs y %g"
+                             % (r["map"], side, i, g, raised, r["y"]))
+            for j in range(i):
+                if math.hypot(x - pts[j][0], z - pts[j][1]) < SLOT_APART - 0.01:
+                    fails.append("map %d slots %s%d/%s%d too close" % (r["map"], side, i, side, j))
+    twin = None
+    if not loose:
+        gr = mi.ground
+        k = int((HALF - EXTENT) / STEP)
+        w = int(SLOT_CLEAR // STEP) // 2
+        raised_seen = wall_seen = False
+        tf = []
+        for i in range(k, gr.n - k, 3):
+            for j in range(k, gr.n - k, 3):
+                t = gr.top[i, j]
+                if not math.isfinite(t):
+                    continue
+                x, z = -HALF + i * STEP, -HALF + j * STEP
+                if gr.raised[i, j] and not raised_seen:
+                    raised_seen = True
+                    if mi.slot_clear(x, z):
+                        tf.append("TWIN: raised cell (%g,%g) on map %d passed" % (x, z, r["map"]))
+                if not wall_seen:
+                    win = gr.top[i - w:i + w + 1, j - w:j + w + 1]
+                    if float(win.max()) - t > 2 * SLOT_STEP_UP:
+                        wall_seen = True
+                        if mi.slot_clear(x, z):
+                            tf.append("TWIN: cell (%g,%g) by a %.0f rise on map %d passed"
+                                      % (x, z, float(win.max()) - t, r["map"]))
+                if raised_seen and wall_seen:
+                    break
+            if raised_seen and wall_seen:
+                break
+        if raised_seen and wall_seen:
+            twin = tf
+    mi.relax(False)
+    return fails, twin
+
+
+def check(rows, root, infos=None):
+    """Re-derive every row from the file; [] when all hold (check_row), with
+    the twins on the first row's map that offers them."""
     fails = []
     twin_done = False
     for r in rows:
@@ -622,53 +827,53 @@ def check(rows, root, infos=None):
             if mi is None:
                 fails.append("map %d: %s on re-read" % (r["map"], why))
                 continue
-        loose = "LAST RESORT" in r["notes"]
-        mi.relax(loose)
-        for side in "ab":
-            pts = [tuple(float(v) for v in s.split(":")) for s in r[side + "_slots"].split()]
-            if pts[0] != (r[side + "x"], r[side + "z"]):
-                fails.append("map %d side %s slot 0 is not the side point" % (r["map"], side))
-            for i, (x, z) in enumerate(pts):
-                if abs(x) > EXTENT or abs(z) > EXTENT:
-                    fails.append("map %d slot %s%d outside +/-%g" % (r["map"], side, i, EXTENT))
-                if not mi.slot_clear(x, z):
-                    fails.append("map %d slot %s%d (%g,%g) not on clear ground" % (r["map"], side, i, x, z))
-                g, raised = mi.ground.at(x, z)
-                if g is None or (raised and not loose) or r["y"] > min(g - Y_DROP, EXTENT) + 0.05:
-                    fails.append("map %d slot %s%d ground %s raised %s vs y %g"
-                                 % (r["map"], side, i, g, raised, r["y"]))
-                for j in range(i):
-                    if math.hypot(x - pts[j][0], z - pts[j][1]) < SLOT_APART - 0.01:
-                        fails.append("map %d slots %s%d/%s%d too close" % (r["map"], side, i, side, j))
-        if not twin_done and not loose:
-            gr = mi.ground
-            k = int((HALF - EXTENT) / STEP)
-            w = int(SLOT_CLEAR // STEP) // 2
-            raised_seen = wall_seen = False
-            for i in range(k, gr.n - k, 3):
-                for j in range(k, gr.n - k, 3):
-                    t = gr.top[i, j]
-                    if not math.isfinite(t):
-                        continue
-                    x, z = -HALF + i * STEP, -HALF + j * STEP
-                    if gr.raised[i, j] and not raised_seen:
-                        raised_seen = True
-                        if mi.slot_clear(x, z):
-                            fails.append("TWIN: raised cell (%g,%g) on map %d passed" % (x, z, r["map"]))
-                    if not wall_seen:
-                        win = gr.top[i - w:i + w + 1, j - w:j + w + 1]
-                        if float(win.max()) - t > 2 * SLOT_STEP_UP:
-                            wall_seen = True
-                            if mi.slot_clear(x, z):
-                                fails.append("TWIN: cell (%g,%g) by a %.0f rise on map %d passed"
-                                             % (x, z, float(win.max()) - t, r["map"]))
-            if not (raised_seen and wall_seen):
-                continue                      # try the twins on the next map
+        f, twin = check_row(r, mi)
+        fails += f
+        if not twin_done and twin is not None:
+            fails += twin
             twin_done = True
-        mi.relax(False)
     if rows and not twin_done:
         fails.append("TWIN: no map offered a raised cell and a wall to test")
     return fails
+
+
+def _work(job):
+    """One map, built and checked in a worker: (map, row, why, fails, twin)."""
+    root, m = job
+    mi, why = load_map(root, m)
+    if mi is None:
+        return m, None, why, [], None
+    row, why = build_row(mi)
+    if row is None:
+        return m, None, why, [], None
+    fails, twin = check_row(row, mi)
+    return m, row, None, fails, twin
+
+
+def build_checked(root, maps, jobs=1):
+    """(rows, skipped, fails) for `maps`, each built and checked, `jobs` maps
+    at a time; the twins come from the first map (in map order) offering them."""
+    work = [(root, m) for m in maps]
+    if jobs > 1:
+        import multiprocessing
+        with multiprocessing.Pool(jobs) as pool:
+            done = pool.map(_work, work, chunksize=1)
+    else:
+        done = [_work(w) for w in work]
+    rows, skipped, fails = [], [], []
+    twin_done = False
+    for m, row, why, f, twin in sorted(done, key=lambda d: d[0]):
+        if row is None:
+            skipped.append((m, why))
+            continue
+        rows.append(row)
+        fails += f
+        if not twin_done and twin is not None:
+            fails += twin
+            twin_done = True
+    if rows and not twin_done:
+        fails.append("TWIN: no map offered a raised cell and a wall to test")
+    return rows, skipped, fails
 
 
 def write_tsv(rows, path):
@@ -688,6 +893,8 @@ def main():
     ap.add_argument("--show", type=int, nargs="*", help="print these maps' rows only")
     ap.add_argument("--ground", type=float, nargs=3, metavar=("MAP", "X", "Z"),
                     help="print every collision surface under one point")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                    help="maps built at a time (default half the CPUs)")
     a = ap.parse_args()
     if a.ground:
         mi, why = load_map(a.client, int(a.ground[0]))
@@ -707,11 +914,10 @@ def main():
             print("map %d: no row (%s)" % (m, why))
         return 0
     maps = battle_maps()
-    rows, skipped, infos = build(a.client, maps, keep=True)
+    rows, skipped, fails = build_checked(a.client, maps, a.jobs)
     print("battle maps %d: %d rows, %d without" % (len(maps), len(rows), len(skipped)))
     for m, why in skipped:
         print("  map %d: %s" % (m, why))
-    fails = check(rows, a.client, infos)
     for f in fails:
         print("CHECK FAIL:", f)
     print("self-check: %s" % ("PASS" if not fails else "%d FAIL" % len(fails)))

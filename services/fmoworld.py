@@ -680,10 +680,14 @@ POP_POSES = range(1, 8)
 #: (`0x611031ED` flds `blk+0x1C`, `0x611031F2` flds `blk+0x20`), so they are
 #: x, y, z and a fourth component -- the same shape as the 0x0153 PilotPos.
 #:
-#: WARNING: THE WORLD IS ONLY ±327.67 UNITS ON EACH AXIS. cmd 240 carries positions as
-#: int16 hundredths (`0x611E6BB0`, K1 = 0.01), so that is a hard bound on what
-#: the wire can express -- a unit parked at 1000 is outside the representable
-#: world, not merely far away.
+#: WARNING: THE LOBBY WORLD IS ONLY ±327.67 UNITS ON EACH AXIS. cmd 240 carries
+#: positions as int16 hundredths (`0x611E6BB0`, K1 = 0.01), so in a lobby a unit
+#: parked at 1000 is outside the representable world, not merely far away.
+#: A BATTLE is not bound by it (2026-10-07): the POP position is four plain
+#: floats (0x611EB08F `lea esi,[ebx+0x1C]` -> 0x6110F4B0 and 0x610FF0C0, each a
+#: 16-byte dword copy to char+0x44 / char+0x54 with w zeroed, no compare, no
+#: conversion), battle movement is cmd 23/24 (int16 / 3.75, ±8738), and live
+#: pilots walked x -101..1343, z -148..1477 on map 471. See POP_BATTLE_POS_MAX.
 POP_POS = 0x1C          # 4 floats -> char+0x44 via 0x6110F4B0
 POP_NAME1 = 0x58        # 17B, memcpy'd to entity+0x10C (0x611EB0CF)
 POP_NAME2 = 0x69        # 17B, memcpy'd to entity+0x11D (0x611EB0E1)
@@ -1279,12 +1283,37 @@ POP_UNITTYPES_SPECIAL = (4, 30)
 POP_UNITTYPES_OK = tuple(sorted(POP_UNITTYPES_MAIN + POP_UNITTYPES_SPECIAL))
 
 
+#: KEY: THE BATTLE POP'S BOUND (2026-10-07). The POP position is plain floats
+#: (see POP_POS); the only box the battle client tests is the map's own,
+#: [[resmgr+0x224]] (0x6111E560), measured x/z -2048..2048 on map 267
+#: (missionblock FMO_BATTLE_BOUNDS, served as the play boundary on prod).
+#: y gets the same bound: its box is per map (0..256 on 267) and the canyon
+#: maps' ground stands at 280..344 (fmospawns collision raster).
+POP_BATTLE_POS_MAX = 2048.0
+
+
+def pop_is_battle(unit_type):
+    """True when a POP of `unit_type` is a battle unit for the position guard.
+    UnitType 4 is the lobby human (0x6105AAE0 never possesses it, it carries
+    no parts) and is what every lobby self-POP and lobby room relay sends;
+    the battle self-POP (FMO_UDP_POP_BATTLE, prod 1:0), battle room relay,
+    squads and allies are wanzer types 0/1/2/3/5/6. A lobby bay wanzer
+    (npcroster) is also non-4 but stands on lobby coordinates, inside ±327.67
+    either way; a caller that knows better passes battle= explicitly."""
+    return unit_type != 4
+
+
 def record_pop(unit_id, unit_type=0, kind=0, name1="", name2="",
                pos=(0.0, 0.0, 0.0, 0.0), extra=None,
                model_flags=None, model_sub=None, client_kind=0,
                type4_model=None, client_key=None, look=None, nation=None,
-               parts=None, side=None, client_addr=None, client_tag=None):
+               parts=None, side=None, client_addr=None, client_tag=None,
+               battle=None):
     """One cmd-7 record: create unit `unit_id` in the client's entity map.
+
+    `battle` picks the position guard: True = a battle POP (x/y/z to
+    ±POP_BATTLE_POS_MAX), False = a lobby POP (±327.67), None = by UnitType
+    (pop_is_battle).
 
     WARNING: EVERY FIELD NOT LISTED IN THE POP_* CONSTANTS IS SENT AS ZERO, and that is
     a guess, not a decode. 0x1C8 bytes reach the client and only nine of them
@@ -1316,15 +1345,29 @@ def record_pop(unit_id, unit_type=0, kind=0, name1="", name2="",
         raise ValueError("UnitID 0 is indistinguishable from an empty slot")
     if len(pos) != 4:
         raise ValueError("pos is four floats (x, y, z, w); got %d" % len(pos))
-    # WARNING: Refuse the unrepresentable rather than sending it. The world channel
-    # cannot express a coordinate outside ±327.67, so a unit placed there could
-    # never be moved or reported afterwards -- and "it did not appear" would be
-    # indistinguishable from the record having been rejected.
+    # WARNING: Refuse the unrepresentable rather than sending it. The LOBBY world
+    # channel cannot express a coordinate outside ±327.67, so a unit placed
+    # there could never be moved or reported afterwards -- and "it did not
+    # appear" would be indistinguishable from the record having been rejected.
+    # A BATTLE pop (see pop_is_battle) may put x, y and z anywhere in
+    # ±POP_BATTLE_POS_MAX (canyon maps 169/445 stand at y 280..344); w keeps the
+    # lobby bound (the client zeroes it, char+0x50).
+    if battle is None:
+        battle = pop_is_battle(unit_type)
     for axis, v in zip("xyzw", pos):
-        if not -327.67 <= v <= 327.67:
+        if battle and axis in "xyz":
+            if not -POP_BATTLE_POS_MAX <= v <= POP_BATTLE_POS_MAX:
+                raise ValueError(
+                    "%s=%g is outside the battle bound ±%g (the map box "
+                    "resmgr+0x224, x/z measured on map 267 2026-09-08)"
+                    % (axis, v, POP_BATTLE_POS_MAX))
+        elif not -327.67 <= v <= 327.67:
             raise ValueError(
                 "%s=%g is outside the ±327.67 the wire can express "
-                "(cmd 240 is int16 hundredths, 0x611E6BB0)" % (axis, v))
+                "(cmd 240 is int16 hundredths, 0x611E6BB0)%s"
+                % (axis, v, "" if battle else
+                   "; a battle pop (UnitType != 4 or battle=True) may use "
+                   "x/y/z to ±%g" % POP_BATTLE_POS_MAX))
     body = bytearray(POP_BODY_LEN)
     struct.pack_into("<I", body, POP_UNITID, unit_id & 0xFFFFFFFF)
     struct.pack_into("<ffff", body, POP_POS, *pos)

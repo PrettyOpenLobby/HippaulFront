@@ -218,10 +218,13 @@ def spawn_enemy(sq, rows=None, rnd=None):
 
 
 def ally_position(base):
-    """ALLY_BEHIND units back along -x from the drop point, on the wire's
-    +-327.67 (record_pop refuses anything outside it)."""
+    """ALLY_BEHIND units back along -x from the drop point, inside the battle
+    box record_pop accepts for a battle unit (x/y/z to +-POP_BATTLE_POS_MAX; the
+    drop point may stand anywhere on the map since the spawn table reached
+    past +-327.67, 2026-10-07)."""
     p = list(base) + [0.0] * (4 - len(base))
-    p[0] = max(-327.0, min(327.0, float(p[0]) - ALLY_BEHIND))
+    _lim = fmoworld.POP_BATTLE_POS_MAX - 1.0
+    p[0] = max(-_lim, min(_lim, float(p[0]) - ALLY_BEHIND))
     return tuple(float(v) for v in p[:4])
 
 

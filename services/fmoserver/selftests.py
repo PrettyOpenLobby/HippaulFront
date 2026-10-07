@@ -2639,6 +2639,34 @@ def _battle_spawn_pins():
           f"only without it: {'OK' if _z_ok else 'FAIL'}")
     ok &= _z_ok
 
+    # (5b) THE SPLIT GUARD (2026-10-07): a battle POP (UnitType != 4) carries
+    # its position as plain floats (0x611EB08F -> 0x6110F4B0, a 16-byte copy)
+    # and may stand anywhere in the map box; a lobby POP (type 4, or
+    # battle=False) keeps cmd 240's +/-327.67. Twins: the same far point is
+    # refused for the lobby, and a point past the box for the battle.
+    def _refused(**kw):
+        try:
+            fmoworld.record_pop(0x2222, **kw)
+        except ValueError:
+            return True
+        return False
+    _far = (1500.0, 344.0, -1900.0, 0.0)
+    _fb = fmoworld.record_pop(0x2222, unit_type=0, pos=_far)
+    _lim = fmoworld.POP_BATTLE_POS_MAX
+    _g_ok = (struct.unpack_from("<4f", _fb, fmoworld.REC_HDR + fmoworld.POP_POS) == _far
+             and fmoworld.pop_is_battle(0) and not fmoworld.pop_is_battle(4)
+             and not _refused(unit_type=4, pos=(327.0, 5.0, -327.0, 0.0))
+             and _refused(unit_type=4, pos=_far)
+             and _refused(unit_type=0, battle=False, pos=_far)
+             and not _refused(unit_type=4, battle=True, pos=_far)
+             and _refused(unit_type=0, pos=(_lim + 1.0, 32.0, 0.0, 0.0))
+             and _refused(unit_type=0, pos=(0.0, 32.0, -_lim - 1.0, 0.0))
+             and _refused(unit_type=0, pos=(0.0, 32.0, 0.0, 400.0)))
+    print(f"  spawns: record_pop's guard is split -- a battle unit pops at {_far[:3]} "
+          f"(floats, to +/-{_lim:g}), a lobby unit there is refused, and so is a "
+          f"battle unit past the box: {'OK' if _g_ok else 'FAIL'}")
+    ok &= _g_ok
+
     # (6) the knob: on unless the env says otherwise; off -> no row at all
     _k_ok = (battlepop.BATTLE_SPAWNS
              or os.environ.get("FMO_BATTLE_SPAWNS", "").strip() not in ("", "1"))
@@ -2648,24 +2676,44 @@ def _battle_spawn_pins():
           f"map ({'on' if battlepop.BATTLE_SPAWNS else 'off'}): {'OK' if _k_ok else 'FAIL'}")
     ok &= _k_ok
 
-    # (7) the shipped table, when it was built: every row's points inside the
-    # POP guard, the sides apart, every side's slots >= 12 apart
+    # (7) the shipped table, when it was built: every slot inside the play
+    # boundary we serve (missionblock BattleArea, FMO_BATTLE_BOUNDS) and
+    # accepted by record_pop as a battle POP, every side's slots >= 12 apart,
+    # the sides >= 200 apart; since 2026-10-07 the whole map is used, so the
+    # median pair is >= 1000 apart and 471's (where live pilots walked
+    # x -107..1346, z -158..1479) too. A table cut inside +/-300 fails both.
     if not battlepop.BATTLE_SPAWN_ROWS:
         print("  spawns: shipped table SKIP (fmodata/fmo-battle-spawns.tsv missing; "
               "tools/fmodatagen/fmospawns.py builds it)")
     else:
-        _bad = []
+        from . import defaults
+        _bb = missionblock.BATTLE_BOUNDS or tuple(
+            int(v) for v in defaults.RELEASE_DEFAULTS["FMO_BATTLE_BOUNDS"].split(","))
+        _bad, _seps = [], []
         for _m, _r in battlepop.BATTLE_SPAWN_ROWS.items():
             for _k in ("a", "b"):
                 _pts = [(x, 0.0, z) for x, z in _r[_k + "_slots"]]
-                if not _apart(_pts) or any(max(abs(p[0]), abs(p[2])) > 300 for p in _pts):
+                if not _apart(_pts) or not all(
+                        _bb[0] < p[0] < _bb[2] and _bb[1] < p[2] < _bb[3] for p in _pts):
                     _bad.append((_m, _k))
-            if math.hypot(_r["a"][0] - _r["b"][0], _r["a"][1] - _r["b"][1]) < 100:
+                for _x, _z in _r[_k + "_slots"]:
+                    if _refused(unit_type=0, pos=(_x, _r["y"], _z, 0.0)):
+                        _bad.append((_m, _k + " guard"))
+                        break
+            _sep = math.hypot(_r["a"][0] - _r["b"][0], _r["a"][1] - _r["b"][1])
+            _seps.append(_sep)
+            if _sep < 200:
                 _bad.append((_m, "sep"))
-        _t_ok = not _bad and 471 in battlepop.BATTLE_SPAWN_ROWS
+        _seps.sort()
+        _med = _seps[len(_seps) // 2]
+        _r471 = battlepop.BATTLE_SPAWN_ROWS.get(471)
+        _s471 = (math.hypot(_r471["a"][0] - _r471["b"][0], _r471["a"][1] - _r471["b"][1])
+                 if _r471 else 0.0)
+        _t_ok = not _bad and _med >= 1000 and _s471 >= 1000
         print(f"  spawns: shipped table, {len(battlepop.BATTLE_SPAWN_ROWS)} maps, "
-              f"slots inside +/-300 and >= 12 apart, sides >= 100 apart, map 471 "
-              f"present: {'OK' if _t_ok else 'FAIL ' + str(_bad[:5])}")
+              f"slots inside the served boundary {_bb} and record_pop's battle guard, "
+              f">= 12 apart, sides >= 200 apart (median {_med:.0f}, 471 {_s471:.0f}, "
+              f"both >= 1000): {'OK' if _t_ok else 'FAIL ' + str(_bad[:5])}")
         ok &= _t_ok
         ok &= _battle_spawn_ground_pins(_apart)
     return ok
@@ -2686,7 +2734,7 @@ def _battle_spawn_ground_pins(_apart):
         for k in ("a", "b"):
             if not _apart([(x, 0.0, z) for x, z in r[k + "_slots"]], 50.0):
                 bad.append((m, k + " spacing"))
-        if not -327.67 <= r["y"] <= 300.0:
+        if not -fmoworld.POP_BATTLE_POS_MAX <= r["y"] <= fmoworld.POP_BATTLE_POS_MAX:
             bad.append((m, "y"))
     # the five maps the placement-only reader could not serve now have rows
     for m in (122, 169, 445, 446, 448):

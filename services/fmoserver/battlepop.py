@@ -124,7 +124,9 @@ from . import popsweep
 #: is where SE puts the spawn points.
 #: WARNING: y is a guess in every map: the client has no spawn table and the maps do
 #: not share an origin. Too low and the pilot is under the terrain, too high
-#: and he falls. ±327.67 is the hard wire limit (int16 hundredths, 0x611E6BB0).
+#: and he falls. ±327.67 is the LOBBY wire limit (cmd 240, int16 hundredths,
+#: 0x611E6BB0); a battle POP's x/y/z are floats and record_pop takes them to
+#: ±fmoworld.POP_BATTLE_POS_MAX (2026-10-07).
 BATTLE_POS_SPEC = os.environ.get("FMO_BATTLE_POS", "").strip()
 if BATTLE_POS_SPEC:
     try:
@@ -177,6 +179,9 @@ else:
 #: under it (map 86: popped at 5, settled at 32.2 over floors at 25 and 27).
 #: WARNING: units 40 apart stacked (map 86, 16:16Z), so slots are 56 apart; the
 #: spacing is not proved to be enough.
+#: Since 2026-10-07 the points use the whole battle map (record_pop's guard
+#: was split: a battle POP's x/y/z may reach the map box), with the two sides
+#: at opposite ends of the map's longest open axis, as retail teams started.
 BATTLE_SPAWNS = _env_int("FMO_BATTLE_SPAWNS", "1") != 0
 BATTLE_SPAWNS_TSV = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fmodata",
