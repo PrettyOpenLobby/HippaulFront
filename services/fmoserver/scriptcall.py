@@ -3,6 +3,7 @@ import os
 import re
 import struct
 from .deps import fmostore
+from .knobs import _env_int
 
 
 #: KEY: `0x0159` -- THE MESSAGE THAT HANGS THE SCRIPT-98 CUTSCENE.
@@ -174,11 +175,97 @@ def _event_term(term, ps, flags):
     return int(t, 0)
 
 
+#: KEY: THE MISSION STEPS (2026-09-30, static; code offsets of fmogates' SCP
+#: decoder). What the scripts prove about 104 and 105:
+#:   * srv_104(byte) (D87 0x6e4, D89 0x6ee) and srv_105(byte) (D89 0x122c)
+#:     return the answered p1, and NO caller reads it: every CALL of a 104/105
+#:     wrapper in the 48 scripts that have one is followed by an instruction
+#:     that overwrites R0 or ignores it (the LobbySally at D87 0xd822 loads its
+#:     own var 0x460 = 2 over it and debug-prints that as "<-event status").
+#:   * srv_105 itself reads answered p2 (var 0x364, debug-printed at D89
+#:     0x129a as "reward flag"); p2 != 0 runs the mission's reward lines
+#:     (0x824(byte): D90 messages 0xd9/0xda "Obtained the armor color ...",
+#:     0xdb "Earned 300H$") and, if the contribution (E06F) rose across the
+#:     call, 0xd8 "Contribution points earned." The old "p2 compared to
+#:     0x169321 before 0xD800" was inline debug text read as code.
+#:   * WHEN they are called: 104 on a mission byte == 0 after the offer scene
+#:     (D89 0x3a48 for byte 130, 0x53e2 for 137) and from LobbySally on byte
+#:     == 1 with the sortie on one of the mission's tiles; 105 on byte == 3
+#:     after the clear scene (D89 0x3b9e, 0x53f4).
+#: So the ANSWER barely matters and the SIDE EFFECT is the point. INFERRED
+#: (progress.py has the full reading): `@step` = 104: 0 -> 1 (accepted),
+#: 1 -> 2 (sortied on it); `@report` = 105: 3 -> 99 (reported). Both only on
+#: a catalogue mission's own byte (never byte 128, which the registration
+#: scripts also pass to 104/105), both answer p1 = the byte's value after the
+#: step, and `@report` answers p2 = 1 when the byte has a reward (see
+#: MISSION_REWARD), else 0. FMO_MISSION_SCRIPT_STEPS=0 turns both actions into
+#: no-ops.
+#:
+#: KEY: BYTE 128 IS A MISSION TOO (2026-10-01, static, SCP 0x8074 + 0x8084).
+#: The First Sergeant switches on byte 128 == 0 / 1 / 2 / 99 only (0x4ffe..
+#: 0x5016): 0 = greeting, then 201 [job] and 104 [128] (the training sortie);
+#: 1 = "that training run was a failure... one more chance"; 2 = "You're
+#: back... cleared to sortie", the base insignia, then 105 [128]; 99 = "go talk
+#: to the operator". The training-success scene 0x8084 (kind 4, key 0x2710)
+#: calls 104 [128] once more. So 104 steps 128 like any mission (0 -> 1 -> 2)
+#: and 105 reports it from 2, not 3. Until 2026-10-01 fmo-events.tsv wrote the
+#: 201 job number into byte 128 and nothing ever set 99, so no new pilot could
+#: register (FMO_TRAINING_GATE refuses sorties below 99).
+MISSION_SCRIPT_STEPS = _env_int("FMO_MISSION_SCRIPT_STEPS", 1) != 0
+REGISTRATION_BYTE = 128
+REGISTRATION_CLEARED = 2
+#: KEY: MISSION REWARDS (2026-10-01): srv_105 shows the byte's reward lines when
+#: the answered p2 != 0 (the library's 0x824 switch; fmo-gates.json `rewards`,
+#: decoded by fmogates.mission_rewards). The lines only SHOW; the server pays
+#: the money (session: the 0x015A answer's money delta + the stored wallet) and
+#: mints the OC transit pass of bytes 139/140. Armor colours, camo and insignia
+#: need no grant: every cosmetic is already in the open catalogue (cosmetics.py).
+#: FMO_MISSION_REWARD=0 answers p2 = 0 and pays nothing, the pre-10-01 behaviour.
+MISSION_REWARD = _env_int("FMO_MISSION_REWARD", 1) != 0
+
+
+def _mission_action(name, ps, flags, out, what):
+    """Apply one `@action` of a rule: MUTATES flags / out / what."""
+    idx = int(ps[0]) if ps else -1
+    reg = idx == REGISTRATION_BYTE
+    if not MISSION_SCRIPT_STEPS or not (reg or idx in progress.story_bytes()):
+        return
+    was = flags[idx]
+    to = was
+    if name == "step" and was in (0, 1):
+        to = was + 1
+    elif name == "report" and was == (REGISTRATION_CLEARED if reg else progress.CLEARED):
+        to = progress.DONE
+    elif name not in ("step", "report"):
+        raise ValueError("unknown fmo-events.tsv action @%s" % name)
+    if to != was:
+        flags[idx] = to
+        what.append(f"flag byte {idx} {was} -> {to} (@{name})")
+    if out[0] != to:
+        what.append(f"answer p1 {out[0]} -> {to}")
+        out[0] = to
+    if name == "report" and len(out) > 1:
+        pay = 1 if (MISSION_REWARD and to != was and not reg
+                    and progress.mission_reward(idx)) else 0
+        if out[1] != pay:
+            what.append(f"answer p2 {out[1]} -> {pay}"
+                        + (" (the reward lines play)" if pay else ""))
+            out[1] = pay
+
+
 def apply_event_rule(rule, ps, flags):
-    """(answer params, new flags bytes, [what changed]) for one rule. Pure."""
+    """(answer params, new flags bytes, [what changed]) for one rule. Pure.
+
+    A `set` term `@step` / `@report` is a mission step (see
+    MISSION_SCRIPT_STEPS); it runs FIRST, so an `answer` term in the same row
+    reads the flags after the step."""
     flags = bytearray(flags if flags else bytes(fmostore.FLAGS_LEN if fmostore else 256))
     out = list(ps)
     what = []
+    sets = [s.strip() for s in (rule.get("set") or "").split(";") if s.strip()]
+    for s in sets:
+        if s.startswith("@"):
+            _mission_action(s[1:], ps, flags, out, what)
     for a in filter(None, (rule.get("answer") or "").split(";")):
         lhs, _, rhs = a.partition("=")
         n = int(lhs.strip()[1:])
@@ -186,7 +273,9 @@ def apply_event_rule(rule, ps, flags):
         if out[n - 1] != v:
             what.append(f"answer p{n} {out[n - 1]} -> {v}")
         out[n - 1] = v
-    for s in filter(None, (rule.get("set") or "").split(";")):
+    for s in sets:
+        if s.startswith("@"):
+            continue
         if "=" in s:
             lhs, _, rhs = s.partition("=")
             idx = _event_term(lhs, ps, flags)
@@ -200,6 +289,23 @@ def apply_event_rule(rule, ps, flags):
                 what.append(f"flag bit {fid} set")
                 flags[fid >> 3] |= 1 << (fid & 7)
     return out, bytes(flags), what
+
+
+def flags_push_packet(sess, conn_id, char):
+    """A 0x015A that only refreshes the owned table with `char`'s flag block:
+    no record (+0xAD8 = 1), no money, and the three script bytes +0x418..
+    = `char`'s CURRENT penalty bytes (penalty.penalty_bytes; they used to echo
+    the last 0x0159's +0x418.., a script record, not the pilot's state) -- the
+    push gatetool.gate_ops_due sends for a story-gates edit, a penalty change,
+    and a server-side flag change outside a script call (a mission accepted
+    on the board)."""
+    owned = bytearray(status.reply_014a(char=char)[
+        status.S14A_OWNED:status.S14A_OWNED + resultpush.S15A_OWNED_LEN])
+    fl = fmostore.flags_bytes(char.get("flags")).ljust(status.S14A_FLAGS11_LEN, b"\0")
+    o = status.S14A_FLAGS11 - status.S14A_OWNED
+    owned[o:o + status.S14A_FLAGS11_LEN] = fl[:status.S14A_FLAGS11_LEN]
+    return resultpush.result_push_packet(conn_id, record=b"", money=0, contribution=0,
+                                         owned=bytes(owned), pilot=char)
 
 
 def answered_0159(payload, params):
@@ -232,4 +338,4 @@ REGRANT_0159 = os.environ.get("FMO_0159_REGRANT", "").strip() not in ("", "0")
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import progress  # noqa: E402
+from . import progress, resultpush, status  # noqa: E402

@@ -4,7 +4,7 @@ import datetime
 import os
 import struct
 import time
-from .knobs import _env_int
+from .knobs import _env_float, _env_int
 
 
 #: 0x0176 body (payload+0x20..): the 476-B block the mission-result machine
@@ -295,15 +295,89 @@ def paydays_owed(char, now=None, max_days=None):
     return days, stamps, today
 
 
-def paybook_rows(char, rank, now=None):
+#: KEY: FMO_CITY_PAY -- ECONOMIC CITIES SCALE THE SALARY (default 1; 0 = base
+#: pay only, the old book). SE, in game (AI/F00/D08 126, 128): 「数多くの経済都市を
+#: 制圧することにより、軍から支給される給料が増えます」 and 「また、経済都市が敵軍に
+#: 制圧されてしまうと、軍から支給される給料が減ってしまいます」; news/frontline/city:
+#: 「経済都市を制圧している数が多いほど、自軍全体の給料が増加します」. The one table
+#: SE published (topics0906mission, a Second Lieutenant): 「通常の状態」 100% =
+#: H$ 47,000, 「後方都市をひとつ制圧」 112% = H$ 52,640, 「ふたつ」 122% = H$ 56,400,
+#: and 「敵軍後方の経済都市を自軍領土にすることで、フリーダム近辺の経済都市よりも大きく
+#: 給料を上昇させることができます」 -- a rear city is worth more than one near
+#: Freedom, which is exactly fmowar.CITIES' points (Freedom 2, rear 4).
+#: The paybook has the line for it: kind 7, systext 11:12 「都市制圧補正(%+2d%%)」,
+#: the percent in the row's `sub` byte.
+#:
+#: THE RULE IS OURS, FITTED TO SE'S ROW: SE never published the formula. We
+#: take d = (own city points - enemy city points) / 2, so 0 is "the normal
+#: state" (an even split, or nobody holding any), and taking one of the
+#: enemy's rear (4-point) cities makes d = 4, two make d = 8. The adjustment
+#: is PER_POINT*|d| - FALLOFF*d^2 with the sign of d: 3.25*4 - 4/16 = 12 and
+#: 3.25*8 - 64/16 = 22 reproduce SE's 112% / 122% exactly (SE's own H$
+#: column disagrees for two cities: 56,400 is 120% of 47,000; we fit the
+#: percent column, which is what the 11:12 line prints), the falloff is
+#: the upkeep SE describes (「数が多ければ維持費もかかる」), and |d| stops at the
+#: peak (26 points, +/-42%) so more cities never pay less. A city the enemy
+#: takes moves d down, so pay falls below 100%. H$ only: SE's table is the
+#: 給料金額, and says nothing of the MP.
+#: WARNING: The holders are read from the war state WHEN THE BOOK IS PAID; the
+#: war keeps no history, so every owed day is paid at today's percentage.
+CITY_PAY = _env_int("FMO_CITY_PAY", 1) != 0
+CITY_PAY_PER_POINT = _env_float("FMO_CITY_PAY_PER_POINT", 3.25)   #: ours, to tune
+CITY_PAY_FALLOFF = _env_float("FMO_CITY_PAY_FALLOFF", 0.0625)     #: ours, to tune
+
+
+def city_pay_pct(own, enemy, per_point=None, falloff=None):
+    """The salary adjustment in whole percent (+12 = 112%) for a nation holding
+    `own` economic-city points against the enemy's `enemy`. Pure."""
+    k = CITY_PAY_PER_POINT if per_point is None else float(per_point)
+    f = CITY_PAY_FALLOFF if falloff is None else float(falloff)
+    d = (int(own) - int(enemy)) / 2.0
+    a = abs(d)
+    if f > 0:
+        a = min(a, k / (2 * f))         # the peak: past it more would pay less
+    pct = int(round(k * a - f * a * a))
+    return pct if d >= 0 else -pct
+
+
+def city_pay_for(char):
+    """(percent, why) this pilot's salary is adjusted by, from the economic
+    cities its nation and the enemy hold in the war state now. (0, why) when
+    FMO_CITY_PAY=0, there is no war state, or the pilot has no nation."""
+    if not CITY_PAY:
+        return 0, "FMO_CITY_PAY=0"
+    if warstate.WAR == "0":
+        return 0, "no war (FMO_WAR=0)"
+    war = warstate.war_state()
+    if war is None:
+        return 0, "no war state"
+    nat = zoneentry.nation_for_session(char or {}, status.STATUS_NATION,
+                                       "FMO_STATUS_NATION")[0]
+    if nat not in (1, 2):
+        return 0, f"nation {nat!r} holds no cities"
+    pts = war.score()
+    own, enemy = pts.get(nat, 0), pts.get(3 - nat, 0)
+    pct = city_pay_pct(own, enemy)
+    return pct, (f"nation {nat} holds {own} economic-city point(s) against "
+                 f"{enemy} -> {pct:+d}% (FMO_CITY_PAY)")
+
+
+def paybook_rows(char, rank, now=None, city_pct=None):
     """([(kind, sub, time_t, H$, MP)], today): a day header + a Base pay line
-    per payday owed, paid at the rank's own figures (fmo-ranks.tsv pay/mp)."""
+    per payday owed, paid at the rank's own figures (fmo-ranks.tsv pay/mp),
+    and -- when the nation's economic cities move it (FMO_CITY_PAY) -- a
+    kind-7 "City control adjustment (%+2d%%)" line per day for the H$
+    difference. `city_pct` overrides the war-state reading (tests)."""
     days, stamps, today = paydays_owed(char, now)
     pay, mp = ranks.rank_pay(rank)
+    pct = city_pay_for(char)[0] if city_pct is None and stamps else int(city_pct or 0)
+    pct = max(-99, min(99, pct))         # `sub` is an s8 drawn as %+2d
     rows = []
     for st in stamps:
         rows.append((PAY_HEADER, 0, st, 0, 0))
         rows.append((PAY_BASE, 0, st, pay, mp))
+        if pct and pay:
+            rows.append((PAY_CITY, pct, st, int(round(pay * pct / 100.0)), 0))
     return rows, today
 
 
@@ -356,4 +430,4 @@ SALARY_MAX_DAYS = _env_int("FMO_SALARY_MAX_DAYS", "5")
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import economy, ranks, status  # noqa: E402
+from . import economy, ranks, status, warstate, zoneentry  # noqa: E402

@@ -1,6 +1,7 @@
 """The parts-stock push (0x016A): which parts the shop has in stock."""
 import os
 import struct
+from .knobs import _env_int
 
 
 #: KEY: `0x016A` -- **THE SHOP'S AVAILABILITY BITMAP**, and the reason the wanzer
@@ -165,16 +166,98 @@ except ValueError as _e:
     raise SystemExit(str(_e))
 
 
-def parts_stock_push(conn_id):
-    """The 0x016A push, or None when FMO_PARTS_STOCK is unset.
+#: KEY: FMO_VICTORY_PARTS -- THE PHASE VICTORY REWARD (default 1; 0 = the stock
+#: is FMO_PARTS_STOCK alone, the old behaviour). SE, guide/phase: 「勝利すると、
+#: それまで購入できなかった相手陣営のヴァンツァー1シリーズが、ハンガーから購入できる
+#: ようになります」, 「※勝利報酬のヴァンツァーは、以降のフェイズでも継続的に販売され
+#: ます」, 「※制圧ポイントの合計が同点の場合は、両陣営に勝利報酬が与えられます」.
+#: topics060306 names the series (「敵陣営パーツ販売開始」, by Level 10/20/30/40):
+#: O.C.U. wins -> Igel Eins / Igel Sechs / Grille Eins / Grille Zwei, U.S.N.
+#: wins -> Tiran / Tiran II / Tiran III / Tiran IV. The Level column is the
+#: parts' own level: the client's level window (0x61033BFE) already applies it.
+#: IDS read out of the client's own master tables (Data\AG\F21\D97.DAT via
+#: 2026-09-30): body 0x11, arms 0x21, legs
+#: 0x31 each hold Tiran..Tiran IV at 176..179 (the legs are named "Tiran M"
+#: .. "Tiran IV M") and Igel Eins, Igel Sechs, Grille Eins, Grille Zwei at
+#: 181..184. The "H" variants (551..555) and Tiran V / 180 are not SE's
+#: reward list and are left alone.
+#: THE UNLOCK PERSISTS because it is DERIVED from the war's judged phases
+#: (fmowar phases {n: {"winner"}}, stored in the war state), never cached:
+#: a nation that has won any phase, or tied one, keeps its series.
+VICTORY_PARTS = _env_int("FMO_VICTORY_PARTS", 1) != 0
+#: winning nation -> the ENEMY series its shop starts selling
+VICTORY_SERIES = {1: (181, 182, 183, 184),     # O.C.U. win: Igel / Grille
+                  2: (176, 177, 178, 179)}     # U.S.N. win: Tiran I..IV
+VICTORY_KINDS = (0x11, 0x21, 0x31)             # body, arms, legs: the series
+
+
+def victory_unlocked(phases):
+    """The nations whose victory series is unlocked by the judged `phases`
+    ({n: {"winner": 0/1/2}}): every winner, and both nations for a tie
+    (winner 0). Pure."""
+    out = set()
+    for rec in (phases or {}).values():
+        if not isinstance(rec, dict) or "winner" not in rec:
+            continue
+        w = int(rec.get("winner") or 0)
+        out |= {w} if w in VICTORY_SERIES else set(VICTORY_SERIES)
+    return out
+
+
+def parts_stock_for(stock, nation, unlocked):
+    """{kind: frozenset(ids)}: `stock` (FMO_PARTS_STOCK, may be None) with the
+    victory series applied. A known nation (1/2) gets its reward series when
+    it is `unlocked`, and has it REMOVED when not -- SE: 「それまで購入できなかった
+    相手陣営のヴァンツァー」, the enemy series was not on sale before the win.
+    `nation` None (no pilot to ask) adds every unlocked series and removes
+    nothing. None when the result is empty. Pure."""
+    out = {k: set(v) for k, v in (stock or {}).items()}
+    series = ([nation] if nation in VICTORY_SERIES
+              else sorted(n for n in unlocked if n in VICTORY_SERIES))
+    for n in series:
+        ids = set(VICTORY_SERIES[n])
+        for kind in VICTORY_KINDS:
+            if n in unlocked:
+                out.setdefault(kind, set()).update(ids)
+            elif kind in out:
+                out[kind] -= ids
+    out = {k: frozenset(v) for k, v in out.items() if v}
+    return out or None
+
+
+def victory_stock(nation=None):
+    """(stock to serve, why): FMO_PARTS_STOCK with the war's victory rewards
+    applied for `nation` (FMO_VICTORY_PARTS)."""
+    if not VICTORY_PARTS:
+        return PARTS_STOCK, "FMO_VICTORY_PARTS=0"
+    if PARTS_STOCK is None:
+        # unset = no push at all (the empty shop); a block holding ONLY the
+        # reward series would be a different shop, not a reward
+        return None, "FMO_PARTS_STOCK unset"
+    war = warstate.war_state() if warstate.WAR != "0" else None
+    phases = (war.data.get("phases") if war is not None else None) or {}
+    unl = victory_unlocked(phases)
+    got = parts_stock_for(PARTS_STOCK, nation, unl)
+    return got, (f"victory series unlocked for nation(s) {sorted(unl) or 'none'} "
+                 f"after {len(phases)} judged phase(s); served for nation {nation}")
+
+
+def parts_stock_push(conn_id, nation=None):
+    """The 0x016A push, or None when there is nothing in stock.
 
     A pure push (nothing in the image requests it), so it rides the queue
-    sequence like 0x016C and 0x019F."""
-    if not PARTS_STOCK:
+    sequence like 0x016C and 0x019F. `nation` = the pilot's, so the victory
+    reward can be exact (see parts_stock_for); without it every unlocked
+    series is added."""
+    stock, why = victory_stock(nation)
+    if not stock:
         return None
-    return packet.build(MSG_PARTS_STOCK, parts_stock_payload(PARTS_STOCK),
+    if stock != PARTS_STOCK:
+        log(f"   0x{MSG_PARTS_STOCK:04X} stock differs from FMO_PARTS_STOCK: {why}")
+    return packet.build(MSG_PARTS_STOCK, parts_stock_payload(stock),
                         pushes.QUEUE_SEQ, conn_id)
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import packet, pushes  # noqa: E402
+from . import packet, pushes, warstate  # noqa: E402
+from .wirelog import log  # noqa: E402

@@ -76,7 +76,7 @@ CLIENT_REQUESTS = {
     0x015E: 0x14, 0x0160: 0x1C, 0x0162: 0x14, 0x0165: 16, 0x0167: 4428,
     0x0168: 24, 0x0169: 40, 0x016D: 72, 0x016E: 16, 0x0170: 228,
     0x0171: 0x14, 0x0172: 0x14, 0x0173: 0xD, 0x0175: 0, 0x0177: 56,
-    0x0179: 0x10, 0x017E: 40, 0x0181: 0x41A, 0x0182: 0, 0x018A: 124,
+    0x0179: 0x10, 0x017C: 20, 0x017E: 40, 0x0181: 0x41A, 0x0182: 0, 0x018A: 124,
     0x018D: 32, 0x0190: 0x14, 0x0192: 0xC8, 0x0194: 364, 0x0196: 36,
     0x019C: 0, 0x01A0: 0x18, 0x01A2: 8, 0x01A4: 24, 0x01A6: 508, 0x01A8: 12,
     0x01AA: 56, 0x01AB: 20, 0x01AC: 80, 0x01AE: 24, 0x01B0: 24, 0x01B2: 20,
@@ -179,8 +179,10 @@ def item_announce_body(unit_id, item_id, kind, first, last):
 #:   4 AUTO-DISBANDED  8:57 "The battle group was automatically disbanded."
 #:   5 AUTO-REMOVED    8:59 "You were automatically removed from the battle group."
 #: then the window's vtable slot 1 is called with 1 (close) and the slot is
-#: cleared. WARNING: The window id space is the CLIENT's; we have never seen one on
-#: the wire, so there is nothing to put at +0x00 yet. Builder only.
+#: cleared. KEY: [slot+0xE0] is the GroupID: the group window's own requests
+#: send it as theirs (0x0173/0x01A0 +0x00, 0x0171/0x0179 +0x04), so +0x00 is
+#: the GroupID (2026-09-30). Sent by battlegroups.notify_removed for a kick
+#: (2) and the sortie auto-removal (5); not yet seen on a screen.
 MSG_GROUP_ENDED = 0x0178
 S178_LEN = 0x08
 GROUP_ENDED_REASONS = {0: "LEFT", 1: "DISBANDED", 2: "KICKED", 3: "(silent)",
@@ -280,10 +282,12 @@ PUSH_NOTES = {
             "0x611E5B2B, unread.",
     0x01C7: "arm 0x6117F66D, no gate: 0x18 dwords (96 B) from +0x00 -> "
             "lobby+0x6DDA. No other reader of that offset found by displacement.",
-    0x01B9: "KYTCP_COMMAND_CLI_COL_ADD_UPDATE (Coliseum): +0x00 result, the rest "
-            "from +0x04 to 0x611B70C0.",
+    0x01B9: "KYTCP_COMMAND_CLI_COL_ADD_UPDATE (Coliseum): +0x00 result, the "
+            "128-byte arena record from +0x04 to 0x611B70C0 (the waiting window). "
+            "Built and served by coliseum.py (FMO_COLISEUM).",
     0x01BA: "KYTCP_PACKET_DATA_CLI_COL_CANCEL_UPDATE: +0x00 result -> "
-            "0x611B03D0(result) when lobby+0x6E42 == 0, else clears it.",
+            "0x611B03D0(result) when lobby+0x6E42 == 0, else clears it. Built by "
+            "coliseum.py (coliseum.CANCEL_TEXT).",
     0x01BF: "KYTCP_COMMAND_CLI_COL_RET_UPDATE: +0x00 s32 result; < 0 -> 'Error "
             "occurred; stopping streak' with the systext for (u16)result.",
     0x017D: "the trade push -- see MSG_TRADE_PUSH; the trade service is unbuilt "

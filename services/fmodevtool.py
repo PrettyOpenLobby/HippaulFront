@@ -636,7 +636,9 @@ table.srv td:first-child{color:var(--ink3)}
 <script>
 const T = new URLSearchParams(location.search).get('t') || '';
 const q = s => document.querySelector(s);
-const qs = p => T ? p + (p.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(T) : p;
+// Relative, so the page works both at / and behind the admin panel's
+// /games/<title>/ proxy (which adds the token itself).
+const qs = p => { p = p.replace(/^\//, ''); return T ? p + (p.includes('?') ? '&' : '?') + 't=' + encodeURIComponent(T) : p; };
 function setHTML(el, html){ if(el.dataset.h !== html){ el.dataset.h = html; el.innerHTML = html; } }
 function note(s){ const l = q('#log'); l.textContent += '\n' + s; l.scrollTop = l.scrollHeight; }
 const SELCOL = '#ff9500';

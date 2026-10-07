@@ -44,6 +44,7 @@ def peer_link_serve(chan, rs, got, addr):
     """Consume one datagram the client sent to alias `rs`: link housekeeping
     here, everything else RELAYED to the player that alias stands for, under
     the alias THAT client knows the sender by."""
+    from . import coliseum               # late: coliseum imports half the package
     rs.rx = got["to"]
     other = groupchannel.WORLD_PEERS.get(rs.peer_addr)
     for off, size, cmd, body in got["records"]:
@@ -73,6 +74,8 @@ def peer_link_serve(chan, rs, got, addr):
             continue
         if other is None or not other.tables:
             continue
+        if coliseum.spectator_of_chan(chan) is not None:
+            continue            # a Coliseum spectator only receives
         # THE RELAY. The record is about the sender's own unit (their UnitID,
         # at rec+0x08 and inside a cmd 24 batch); the other client knows that
         # unit by the alias IT minted for the sender.
@@ -143,12 +146,35 @@ def peer_link_serve(chan, rs, got, addr):
         except ValueError:
             continue
         _rsb.pending.append(rec)
+        if coliseum.spectator_feed(chan, other):
+            spectator_copies(chan, cmd, nb, src == mine, flt, b_alias)
         rs.relayed += 1
         if rs.relayed <= 5 or rs.relayed % 500 == 0:
             log(f"[udp {addr[0]}:{addr[1]}] PEER LINK relay #{rs.relayed}: "
                 f"cmd {cmd} {len(body)}B for unit {src:#x} -> "
                 f"{other.addr[0]}:{other.addr[1]} as {new_src:#x} (their alias "
                 f"stream {b_alias:#x})")
+
+
+def spectator_copies(chan, cmd, nb, own, flt, b_alias):
+    """The one-way copy of a fighter's own-unit record for each Coliseum
+    spectator of its match, under the alias THAT spectator knows the fighter
+    by. A cmd 24 batch carries the alias inside, so it is renamed per copy."""
+    from . import coliseum
+    for sp in coliseum.spectators_of_chan(chan):
+        alias = sp.alias_for(getattr(chan, "peer_key", chan.addr))
+        _rss = sp.remotes.get(alias)
+        if _rss is None or not _rss.popped:
+            continue
+        body = bytearray(nb)
+        if cmd == 24 and len(body) >= 6 and own:
+            struct.pack_into("<I", body, 2, alias)
+        try:
+            _rss.pending.append(fmoworld.record(cmd, bytes(body),
+                                                arg8=alias if own else b_alias,
+                                                flt=flt & 0xFFFF0000))
+        except ValueError:
+            continue
 
 
 # Called at run time only; imported last so that import cycles resolve.

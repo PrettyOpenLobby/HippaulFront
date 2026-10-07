@@ -662,6 +662,38 @@ def sector_page(records):
     return build(OP_SECTOR_PAGE, body)
 
 
+#: KEY: KIND 5 -- THE ORDER TEMPLATES (op 0xE), static 2026-09-30. The job
+#: (0x611AF670: [job]=5, op 0xE, [job+0x28] count, [job+0x2C..] ids) is
+#: queued by 0x611C9850 from the Accepted Mission table's row 0 +0x08..+0x14,
+#: with callback 0x611C9160: it copies each 524-byte (0x83-dword) record into
+#: the list, keyed by record+0x00, and branches on the END's NULL
+#: (0x611C918D) -- so op 0x21 pages then 0x1B END are safe. The body has the
+#: kind-7 shape, {u32, u32 count, u32 ids}: SectorQuery parses it.
+#: The Order dialog reads the record (0x611CA301..): +0x1E4 operation time
+#: (-> order body +0x038), +0x1F4 reward MP (non-zero = an MP reward),
+#: +0x1F8 reward H$, +0x200 the base Order MP. The list's second layout
+#: (0x611CBC17) draws +0x1E2 (type), +0x04 (name), +0x1F4, +0x1F8, +0x1F0,
+#: +0x1E8.
+OP_ORDER_TEMPLATES = 0x0E
+TEMPLATE_LEN = 0x20C
+TPL_OP_TIME, TPL_REWARD_MP, TPL_REWARD_HS, TPL_BASE_MP = 0x1E4, 0x1F4, 0x1F8, 0x200
+
+
+def order_template_record(tid, name, category, op_time, reward_mp, reward_hs,
+                          base_mp):
+    """One 524-byte order template (see OP_ORDER_TEMPLATES)."""
+    rec = bytearray(TEMPLATE_LEN)
+    struct.pack_into("<I", rec, 0x000, tid & 0xFFFFFFFF)
+    struct.pack_into("<I", rec, 0x1C8, (category & 0xFF) << 24)
+    struct.pack_into("<I", rec, 0x1E0, (category & 0xFF) << 24)
+    for off, val in ((TPL_OP_TIME, op_time), (TPL_REWARD_MP, reward_mp),
+                     (TPL_REWARD_HS, reward_hs), (TPL_BASE_MP, base_mp)):
+        struct.pack_into("<I", rec, off, int(val) & 0xFFFFFFFF)
+    nm = str(name).encode("cp932", "replace")[:0x40]
+    rec[0x04:0x04 + len(nm) + 1] = nm + b"\0"
+    return bytes(rec)
+
+
 def max_sectors_per_page():
     """How many 0x20C slots fit under the client's receive buffer (7)."""
     return (CLIENT_RX - HDR - PAYLOAD_HDR - 8) // SECTOR_SLOT_LEN

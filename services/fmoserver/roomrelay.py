@@ -37,7 +37,10 @@ def room_queue(chan):
         return
     now = time.time()
     rooms.room_prune(chan, now)
+    from . import coliseum               # late: coliseum imports half the package
     for other in rooms.room_mates(chan):
+        if coliseum.spectator_of_chan(other) is not None:
+            continue            # a Coliseum spectator is popped into nobody's scene
         alias = chan.alias_for(other.addr)
         rs = chan.remotes[alias]
         if not rs.popped:
@@ -71,6 +74,10 @@ def room_queue(chan):
                 pos=tuple(other.pos[:3]) + (0.0,),
                 model_flags=_rf, model_sub=_rs,
                 type4_model=getattr(other, "type4_model", popself.POP_SEX))
+            if POP_PLAYER_TARGETABLE:
+                # listable in /target and the Trade menu (see the knob)
+                rs.pop_args["extra"] = {
+                    fmoworld.POP_TARGETABLE: bytes([fmoworld.POP_TARGETABLE_BIT])}
             _bwz = rooms.battle_room_pop_args(chan, other, n1, n2)
             if _bwz is not None:
                 # A room-mate in a BATTLE is their wanzer, not the lobby human.
@@ -228,6 +235,17 @@ GROUP_BLOB_UPDATE_CMD = 191
 #: talkers (default) = relay voice only to members that have themselves sent
 #: voice (their voice system is up); all = to every member.
 GROUP_VOICE_TO = os.environ.get("FMO_GROUP_VOICE_TO", "talkers").strip() or "talkers"
+#: KEY: FMO_UDP_POP_PLAYER_TARGETABLE=1 (default): a lobby room-mate's POP
+#: carries body+0x48 bit 0x10, the "Select target" list gate
+#: (fmoworld.POP_TARGETABLE; list builder 0x611824D6 admits an entity only
+#: with dword[entity+0x18F] & 0x10). The NPC pops have set it since 09-05
+#: (npcroster.POP_NPC_TARGETABLE); players never did, so the list (and the
+#: Trade menu, which opens it in players-only mode 1) could not offer another
+#: pilot (manual p.40: "you can target other players as well as NPCs").
+#: Only room-mates: the self POP stays clear. The name-tag bit 0x01 in the
+#: same byte is ORed in afterwards by record_pop (fmoworld.NAMETAG), so both
+#: survive. 0 = the old POP.
+POP_PLAYER_TARGETABLE = os.environ.get("FMO_UDP_POP_PLAYER_TARGETABLE", "1").strip() not in ("", "0")
 
 
 # Called at run time only; imported last so that import cycles resolve.

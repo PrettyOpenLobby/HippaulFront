@@ -1,5 +1,6 @@
 """Area passes and permits: which zones a pilot may open, and at what cost."""
 import os
+from .knobs import _env_int
 from .wirelog import log
 
 
@@ -46,9 +47,9 @@ AREA_OPEN_LEN = 0x10
 #: (anything else = 0): 0 = grey, 1 = needs a permit (unless the area's
 #: kind-1 bit is set), 2 = move freely. The ROW BYTE is our 0x016C entry's
 #: byte for the pilot's nation (0x611A3AA0: +2 O.C.U., +3 U.S.N.); the TIER is
-#: the pilot's class-12 level (0x611782B0 finds kind 0x0C in lobby+0xF08 and
-#: turns its exp into a level). We serve row byte 1, so tiers 1-2 pay a
-#: permit and tier 3+ travels free -- the client decides, we only mirror it.
+#: NOT the level itself: see AREA_TIER_BANDS below. With row byte 1 (the
+#: `all` table) tiers 1-2 pay a permit and tier 3+ travels free -- the client
+#: decides, we only mirror it.
 AREA_ACCESS = (
     (1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     (1, 1, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -62,6 +63,39 @@ AREA_ACCESS = (
     (2, 2, 2, 2, 2, 2, 0, 0, 0, 0),
 )
 AREA_PASS_TIER_CLASS = 12       # the class-table kind 0x611782B0 looks for
+
+#: KEY: THE TIER IS A PER-LEVEL BYTE, NOT THE LEVEL (static 2026-09-30). The
+#: gate 0x611794A0 calls 0x611782B0 (the class-12 LEVEL, through the exp
+#: curve 0x611E40A0) and hands that level to 0x611E4000, which returns
+#: `movsx byte[[0x613CA3E8+0x1C] + level*4 - 1]`: byte 3 of row level-1 in the
+#: 100 x 4-byte table the D15.DAT parser 0x611E4270 puts after the exp curve
+#: (file +0x4960, the "%di" tail fmoclass.py used to call unread). Only THAT
+#: byte reaches 0x611A3B00. Read off the shipped file it is a step function:
+#:     level 1-4 -> 1, 5-9 -> 2, 10-14 -> 3, 15-19 -> 4, 20-50 -> 5, 51-100 -> 6
+#: which is the manual's own ladder (p.37: Occupied Zone from Pilot level 10,
+#: the enemy's Occupied Zones from 15, Fierce Battle Zone from 20). Until this
+#: the server used the raw level as the tier, so every pilot above level 10
+#: fell off the matrix ("grey") and was never charged a pass. Kept as the
+#: band starts (level, tier) so a different client build is one line.
+AREA_TIER_BANDS = ((1, 1), (5, 2), (10, 3), (15, 4), (20, 5), (51, 6))
+
+
+def area_tier(level):
+    """The 0x611E4000 tier for a class-12 level (AREA_TIER_BANDS). A level
+    below 1 reads as 1, as 0x611E4000's own `jge` clamp does."""
+    lv = max(1, int(level))
+    tier = AREA_TIER_BANDS[0][1]
+    for start, t in AREA_TIER_BANDS:
+        if lv >= start:
+            tier = t
+    return tier
+
+
+def pilot_area_tier(char):
+    """(tier, level) of a stored pilot: the class-12 level through
+    area_tier()."""
+    lv = classes.class_level(classes.class_exp_of(char).get(AREA_PASS_TIER_CLASS, 0))
+    return area_tier(lv), lv
 
 
 def area_access(tier, row_byte):
@@ -132,15 +166,41 @@ PERMIT_ALL = PERMIT_RAW == "all"
 #: other. This knob is the "certain rank" half: "<rank>:<pass>,..." where pass
 #: is hq / oc / flz (the pilot's nation picks 25/26, 27/28, 29) or an item id
 #: 25..29; minted on the Personnel Officer's check once the pilot's rank (after
-#: this visit's promotion) is >= the threshold and the pass is not held.
-#: Rank bytes are 0-BASED D15 rows: 0 Conscript, 6 Corporal, 10 First
-#: Sergeant, 15 Warrant Officer, 18 Second Lieutenant, 21 Major. SE's own
-#: thresholds are NOT on the site. Default unset = nothing beyond FMO_PERMIT.
+#: this visit's promotion) is >= the threshold and the pass has never been
+#: granted to this pilot (GRANTED_KEY below).
+#: Rank bytes are 0-BASED D15 rows: 0 Conscript, 4 Private First Class,
+#: 6 Corporal, 10 First Sergeant, 15 Warrant Officer, 18 Second Lieutenant,
+#: 21 Major. SE's own threshold for the HQ pass IS in the retail manual
+#: (p.44, About Travel Tickets): "when you are promoted to Private First
+#: Class (上等兵) you receive one travel permit for the Control District", so
+#: the release value is 4:hq. Default unset = nothing beyond FMO_PERMIT.
 #: Example: FMO_PERMIT_RANKS=0:oc gives every pilot their nation's OC pass on
 #: the first officer visit, which is how an O.C.U. pilot reaches OC-Area 08
 #: (207) without the FMO_PERMIT=all test lever.
 PERMIT_RANKS_RAW = os.environ.get("FMO_PERMIT_RANKS", "").strip()
 PASS_KEYS = {"hq": {1: 25, 2: 26}, "oc": {1: 27, 2: 28}, "flz": {1: 29, 2: 29}}
+#: The pilot record's list of pass ids already minted for it. A pass is a
+#: one-off grant: SE's manual gives ONE HQ pass at the promotion, and the
+#: client consumes it when it opens an area. Until 2026-09-30 grant_hq_pass
+#: re-minted any pass the pilot no longer HELD, so every Personnel visit
+#: after spending one refilled it.
+GRANTED_KEY = "passes_granted"
+
+
+def granted_passes(char):
+    """The pass ids this pilot has already been given: the stored list, plus
+    any pass it holds now (a pilot from before the list existed has been
+    given at least those)."""
+    out = set()
+    for v in (char or {}).get(GRANTED_KEY) or ():
+        try:
+            out.add(int(v))
+        except (TypeError, ValueError):
+            continue
+    for it in inventory.stored_items(char or {}):
+        if int(it["kind"]) == PASS_KIND:
+            out.add(int(it["id"]))
+    return out
 
 
 def parse_permit_ranks(spec):
@@ -182,5 +242,48 @@ def permit_rank_passes(nation, rank, grants=None):
     return out
 
 
+#: KEY: THE HANGAR MECHANIC SELLS PASSES -- script server call EVENT 206
+#: (static 2026-10-02, AI/F00/D93 = scp 0x8073, hanger_event). His menu's
+#: permit list (D94 msg 99: 統制区 / 占領区 区間移動許可証の発行) calls the
+#: routine at file 0xCFAC (CALL 0x800CE70 + code base 0x13C, from 0xD42C)
+#: with the picked ROW in var 0x700 (0xD2E6 / 0xD30E): 0 = Control District
+#: (HQ), 1 = Occupied Zone. It submits event 206 with that row in p1 (E220
+#: @0xCFC6; LIVE 2026-10-02: p1=0 on the first row, p2 = stack garbage) and
+#: reads p2 back out of the answered record (0xCFF6 -> var 0x6D8): p2 == 1 prints
+#: D94 102 "This is your transit permit", anything else D94 103 所持金が足り
+#: ません "not enough money". So the plain ack this event got until today
+#: (p2 echoed as 0) told every pilot they were broke. Nothing in the script
+#: charges or grants: SE's server did both, and so do we. (The 2/3 the same
+#: list passes to 0xD074 only picks the row's description text.)
+HANGAR_SALE_EVENT = 206
+HANGAR_SALE_CHOICE = {0: "hq", 1: "oc"}
+#: SE's prices (the 2005-06-28 patch, see FMO_PERMIT_RANKS above): HQ pass
+#: 1000 H$, occupation-zone pass 2000 H$. Overridable per server.
+HANGAR_SALE_PRICE = {"hq": _env_int("FMO_PERMIT_PRICE_HQ", "1000"),
+                     "oc": _env_int("FMO_PERMIT_PRICE_OC", "2000")}
+
+
+def hangar_sale(choice, nation, money):
+    """The mechanic's verdict on a pass purchase, as a dict: ok, pass_id,
+    price, key and a `why` for the log. Refuses (ok False) an unknown menu
+    choice, a nation with no pass of that kind, or a wallet short of the
+    price -- the script has one refusal line and it says "not enough money",
+    so the log has to carry the real reason."""
+    key = HANGAR_SALE_CHOICE.get(int(choice))
+    if key is None:
+        return {"ok": False, "pass_id": None, "price": 0, "key": None,
+                "why": "menu row %d is not a pass row (0 hq / 1 oc)" % int(choice)}
+    pid = PASS_KEYS[key].get(int(nation or 0))
+    price = int(HANGAR_SALE_PRICE[key])
+    if pid is None:
+        return {"ok": False, "pass_id": None, "price": price, "key": key,
+                "why": "nation %s has no %s pass" % (nation, key)}
+    if int(money) < price:
+        return {"ok": False, "pass_id": pid, "price": price, "key": key,
+                "why": "holds %d H$, the %s pass costs %d H$" % (int(money), key, price)}
+    return {"ok": True, "pass_id": pid, "price": price, "key": key,
+            "why": "%s pass id %d for %d H$ (held %d)" % (key, pid, price, int(money))}
+
+
 # Called at run time only; imported last so that import cycles resolve.
-from . import inventory  # noqa: E402
+from . import classes, inventory  # noqa: E402

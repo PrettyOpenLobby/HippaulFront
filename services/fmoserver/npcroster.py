@@ -1,5 +1,6 @@
 """Which cast a zone pops: layout bands, per-host rosters, NPC POP records and NPC moves."""
 import os
+import struct
 from .deps import fmolayout, fmoworld
 from .wirelog import log
 
@@ -58,14 +59,20 @@ def band_rosters():
            "the Coliseum's own catalogue on the tougi script's tier marks (desk-to-mark is a labelled guess)")
     bands = {"hq": hq, "occ": occ, "fz": fz, "col": col}
     if npccast.NPC_LAYOUT is not None:
-        _ck = {}
+        _ck, _ht, _po = {}, {}, {}
         for _b in fmolayout.BAND_IDS:
             try:
                 _ck.update(npccast.NPC_LAYOUT.ckinds(_b))
+                _ht.update(npccast.NPC_LAYOUT.heights(_b))
+                _po.update(npccast.NPC_LAYOUT.poses(_b))
             except (ValueError, OSError):
                 pass
+        npccast.NPC_POSE_OVERRIDE.clear()
+        npccast.NPC_POSE_OVERRIDE.update(_po)
         npccast.NPC_CKIND_OVERRIDE.clear()
         npccast.NPC_CKIND_OVERRIDE.update(_ck)
+        npccast.NPC_HEIGHT_OVERRIDE.clear()
+        npccast.NPC_HEIGHT_OVERRIDE.update(_ht)
     for _b in bands:
         _lr = layout_band(_b)
         if _lr is not None:
@@ -222,7 +229,13 @@ def _npc_pop_record(uid, utype, npos, cat, chan, self_pos, names_map=None,
     ck = {} if POP_NPC_CLIENT_KIND is None else {"client_kind": POP_NPC_CLIENT_KIND}
     if uid in npccast.NPC_CKIND_OVERRIDE:        # the editor's per-row name-tag test
         ck = {"client_kind": npccast.NPC_CKIND_OVERRIDE[uid]}
-    extra = {}
+    # Anchored like SE's own dresser leaves them: a weight <= 0 is never moved
+    # by the client's unit separation (fmoworld.POP_WEIGHT).
+    extra = {fmoworld.POP_WEIGHT: struct.pack("<f", fmoworld.POP_WEIGHT_ANCHORED)}
+    if uid in npccast.NPC_HEIGHT_OVERRIDE:       # a layout row's `height`
+        extra[fmoworld.POP_HEIGHT] = struct.pack("<f", npccast.NPC_HEIGHT_OVERRIDE[uid])
+    if utype == 4 and npccast.NPC_POSE_OVERRIDE.get(uid) in fmoworld.POP_POSES:
+        extra[fmoworld.POP_POSE] = struct.pack("<I", npccast.NPC_POSE_OVERRIDE[uid])
     if POP_NPC_TARGETABLE:
         extra[fmoworld.POP_TARGETABLE] = bytes([fmoworld.POP_TARGETABLE_BIT])
     names = {}

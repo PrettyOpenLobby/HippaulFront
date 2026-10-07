@@ -130,6 +130,11 @@ def room_mates(chan):
                         SORTIE_MAP.get(referee.chan_bkey(other)))
             if _sm is not None and _so is not None and _sm != _so:
                 continue
+            # ...and the SAME ARENA MATCH: two matches on one arena map are
+            # two battles (coliseum.py); a pilot in none matches only none
+            from . import coliseum
+            if coliseum.match_of_chan(chan) != coliseum.match_of_chan(other):
+                continue
         theirs, theirs_zone, theirs_place = worldchannel.chan_where(other)
         if room.ROOM_SAME_MAP and theirs != mine:
             continue
@@ -284,7 +289,13 @@ def battle_room_pop_args(chan, other, name1, name2):
 
 def battle_room_hostile(chan, other):
     """True when the two pilots' battle pops carry different nations (the
-    body+0x7C -> unit+0x80 compare the join banner and the hit test use)."""
+    body+0x7C -> unit+0x80 compare the join banner and the hit test use).
+    In an arena match it is the TEAM (coliseum.side_for_key): two BGs of one
+    nation fight each other there."""
+    from . import coliseum
+    ta, tb = coliseum.side_of_chan(chan), coliseum.side_of_chan(other)
+    if ta is not None and tb is not None:
+        return ta != tb
     a = (getattr(chan, "pop_args", None) or {}).get("nation")
     b = (getattr(other, "pop_args", None) or {}).get("nation")
     return bool(a) and bool(b) and a != b
@@ -297,10 +308,13 @@ def battle_room_killer(victim, now, mates=None):
     WARNING: A HEURISTIC. Under the P2P authority model the victim's client decides
     its own death and names no shooter; with two pilots it is exact, with more
     it credits whoever shot last."""
+    from . import coliseum
     best = None
     for o in (room_mates(victim) if mates is None else mates):
         if not (_is_battle_chan(o) and battle_room_hostile(victim, o)):
             continue
+        if coliseum.spectator_of_chan(o) is not None:
+            continue                    # a Coliseum spectator kills nobody
         t = getattr(o, "last_fire", None)
         if t is None or now - t > BATTLE_KILL_WINDOW:
             continue

@@ -316,6 +316,28 @@ SE_NO = _env_int("FMO_SE_NO", "1")
 #: are the ROOM-only nation script substitution (0x61004AE0). A category-2 Move
 #: is granted with MOVE_KIND_BRIEFING instead -- see the Move flow section.
 FIELD_18 = _env_int("FMO_0153_F18", "1")
+#: KEY: THE OPENING IS A ROOM ENTRY (2026-10-01). Kind 1 (Room) is what makes
+#: 0x61005100 substitute the nation's story script 98/99 -- the new-pilot
+#: opening, which plays right in MAP 101 (seen live). It is not a
+#: lobby: the D87 lobby script does not run, so the kiosk terminals (placed from
+#: keys D87 attaches to map objects) land at the room origin. So a pilot gets
+#: kind 1 on their FIRST world entry only: no zone stored yet (`mapkind`, which
+#: remember_zone writes on every entry) and never shown it (`opening_seen`).
+#: Not flag byte 128: FMO_STATUS_FLAGS seeds every new pilot as registered
+#: (128=99), so that byte cannot tell a new pilot apart. Every other entry keeps
+#: FIELD_18. FMO_OPENING: first (default) | off.
+OPENING = (os.environ.get("FMO_OPENING", "").strip() or "first").lower()
+
+
+def opening_field18(char):
+    """1 when this world entry should play the nation's opening for `char`,
+    else None (keep FIELD_18). Call BEFORE remember_zone stores this entry's
+    zone. Pure."""
+    if OPENING != "first" or not char or char.get("opening_seen"):
+        return None
+    if char.get("mapkind") is not None:
+        return None
+    return 1
 FIELD_1C = _env_int("FMO_0153_F1C", "0")
 #: PilotPos, four floats. WARNING: Zeros are a GUESS that has never been varied, and
 #: the world origin is a plausible place to render nothing from.
@@ -546,6 +568,46 @@ def setup_block(mapno=None, pilotpos=None, csn=None, self_id=None):
 _sweep_n = [0]
 
 
+#: KEY: FMO_RESUME_ZONE -- LOG BACK IN WHERE YOU LOGGED OUT (manual p.42:
+#: "when you log in again you start from the same place you were at when you
+#: logged out"). Session.remember_zone has stored the zone of every 0x0153
+#: grant on the pilot (`mapkind`/`mapno`) since 09-29, and nothing read it:
+#: every world entry granted FMO_MAPKIND in the pilot's band. '1' = a 0x0150
+#: world entry grants the stored zone instead, when it is safe:
+#:   * not the Coliseum band 600..607 -- the one band where a MapKind and
+#:     MapNo that disagree are a MEASURED crash (areachange.AREA_CHANGE_STRICT,
+#:     2026-09-04), and the one world entry has never been tried in;
+#:   * a zone D83 lets the pilot's nation be in (zonecontrol.ZONE_ROWS_D83),
+#:     so a defector does not wake up in the enemy HQ;
+#:   * a trained pilot (progress byte 128 == 99): the opening map is the
+#:     tutorial's;
+#:   * no FMO_MAPKIND_SWEEP.
+#: The MapNo is then picked for that zone the same way as any world entry
+#: (FMO_ZONE_MAPNO). Default '0' (code and release): a world entry into a
+#: non-default zone has not been seen on a screen yet.
+RESUME_ZONE = (os.environ.get("FMO_RESUME_ZONE", "").strip() or "0") != "0"
+RESUME_EXCLUDE = (600, 607)
+
+
+def resume_mapkind(char, nation, trained=True):
+    """(MapKind, why) a world entry should resume, or (None, why not)."""
+    if not RESUME_ZONE:
+        return None, "FMO_RESUME_ZONE=0"
+    if MAPKIND_SWEEP:
+        return None, "FMO_MAPKIND_SWEEP is set"
+    mk = (char or {}).get("mapkind")
+    if not isinstance(mk, int) or isinstance(mk, bool) or not in_mapkind_band(mk):
+        return None, "no stored zone"
+    if RESUME_EXCLUDE[0] <= mk <= RESUME_EXCLUDE[1]:
+        return None, f"stored zone {mk} is in the Coliseum band {RESUME_EXCLUDE} (crash history)"
+    if not trained:
+        return None, f"stored zone {mk}, but the pilot has not finished training"
+    row = next((r for r in zonecontrol.ZONE_ROWS_D83 if r[0] == mk), None)
+    if nation not in (1, 2) or row is None or not row[nation]:
+        return None, f"stored zone {mk} is not one D83 opens to nation {nation}"
+    return mk, f"FMO_RESUME_ZONE: the pilot logged out in zone {mk}"
+
+
 def next_mapkind():
     """The MapKind to send. Walks FMO_MAPKIND_SWEEP if one is set."""
     if not MAPKIND_SWEEP:
@@ -604,4 +666,4 @@ def reply_0153(fill=None, mapkind=None, mapno=None, pilotpos=None, csn=None,
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import addressing, popnation, popsweep, room, status  # noqa: E402
+from . import addressing, popnation, popsweep, room, status, zonecontrol  # noqa: E402

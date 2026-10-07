@@ -124,6 +124,31 @@ from .knobs import _env_int
 #: into this file; Python then refused to import it at all.
 NUL = bytes(1)
 
+#: KEY: THE 24-HOUR DELETE LOCK (manual p.38: "A character that has been
+#: created cannot be deleted for 24 hours"). The client's own error table
+#: 0x613955F0 carries SE's code for it: -14106 (0xC8E6) -> 2:97 "A character
+#: cannot be deleted until 24 hours after it was created." The delete machine
+#: 0x611849B0 hands the reply's +0x08 word to UI event 0x1075 (delete failed).
+#: FMO_DELETE_LOCK_HOURS: 0 (code default) = no lock; the release value is 24.
+#: The clock is the record's `born_at` (economy.seed_new_character); a pilot
+#: created before that key existed has none and is not locked.
+DELETE_LOCK_HOURS = _env_int("FMO_DELETE_LOCK_HOURS", "0")
+DELETE_LOCK_CODE = 0xC8E6
+
+
+def delete_locked(char, now):
+    """A reason string when `char` is still inside the delete lock, else None."""
+    born = (char or {}).get("born_at")
+    if DELETE_LOCK_HOURS <= 0 or not isinstance(born, int) or isinstance(born, bool):
+        return None
+    left = born + DELETE_LOCK_HOURS * 3600 - int(now)
+    if left <= 0:
+        return None
+    return (f"created {int(now) - born}s ago; SE: no delete for {DELETE_LOCK_HOURS} h "
+            f"(FMO_DELETE_LOCK_HOURS), {left // 3600}h{(left % 3600) // 60:02d}m left; "
+            f"code 0xC8E6 = 2:97")
+
+
 #: request id -> (reply id, payload bytes the client reads, what it is)
 CHARSEL = {
     0x013F: (0x0001, 0, "DELETE CHARACTER"),
@@ -165,26 +190,82 @@ CHARSEL = {
 # nothing selectable, and they are what these defaults change. If a retry still
 # says [FM00000], the cause is elsewhere and this should be set back to zeros
 # rather than tuned.
+#:
+#: KEY: WHAT +0x08 / +0x0C DO (static 2026-09-30). 0x61013420 turns the block
+#: into a mode at screen+0x11D: +0x08 < 0 -> mode 4, else +0x0C < 0 -> mode 3,
+#: else 1 or 2 (the cursor starts on the SMALLER nation). The nation menu
+#: 0x6101549D then builds descriptor 0x61386468 + mode-variant * 32: variant
+#: 1 (mode 3) lists only 99:230 (value 1, O.C.U.), variant 2 (mode 4) only
+#: 99:231 (value 2, U.S.N.). So a negative +0x08 CLOSES the O.C.U. and a
+#: negative +0x0C CLOSES the U.S.N. -- the manual's "if the strength
+#: difference is too large, you cannot choose the dominant army" (p.38).
+#:
+#: FMO_NATION_POP: "a,b" serves those two numbers (the old fixed default);
+#: "live" serves the real head counts (nation_counts: stored pilots per nation
+#: at Pilot level >= FMO_NATION_POP_LEVEL, default 1 = everyone), and closes
+#: the larger nation when FMO_NATION_CLOSE_PCT is set and the larger side
+#: leads by more than that percent of its head count AND by at least
+#: FMO_NATION_CLOSE_MIN pilots (so 2 vs 1 on a new server closes nothing).
+#: FMO_NATION_CLOSE_PCT=0 (code default) never closes.
 NATION_POP = (os.environ.get("FMO_NATION_POP", "").strip() or "1000,1000")
+NATION_POP_LIVE = NATION_POP.lower() == "live"
+NATION_POP_LEVEL = _env_int("FMO_NATION_POP_LEVEL", "1")
+NATION_CLOSE_PCT = _env_int("FMO_NATION_CLOSE_PCT", "0")
+NATION_CLOSE_MIN = _env_int("FMO_NATION_CLOSE_MIN", "10")
 NATION_ENABLE = _env_int("FMO_NATION_ENABLE", "1", 10)
+
+
+def nation_counts(rosters, min_level=None):
+    """{1: n, 2: n}: stored pilots per nation (defection.population, at Pilot
+    level >= FMO_NATION_POP_LEVEL)."""
+    return defection.population(rosters, NATION_POP_LEVEL if min_level is None else min_level)
+
+
+def nation_gap_pct(counts):
+    """How far the larger nation leads, in percent of its own head count
+    (0 when even or empty). Pure."""
+    a, b = int(counts.get(1, 0)), int(counts.get(2, 0))
+    big = max(a, b)
+    return (abs(a - b) * 100) // big if big else 0
+
+
+def closed_nation(counts, pct=None, min_gap=None):
+    """The nation the creation screen must not offer (1 or 2), or None. Pure."""
+    pct = NATION_CLOSE_PCT if pct is None else pct
+    min_gap = NATION_CLOSE_MIN if min_gap is None else min_gap
+    a, b = int(counts.get(1, 0)), int(counts.get(2, 0))
+    if pct <= 0 or a == b or abs(a - b) < min_gap or nation_gap_pct(counts) <= pct:
+        return None
+    return 1 if a > b else 2
 #: Change Nations (0x01AA) carries no target nation (+0x28 is 0 in every submit
 #: on record), so the switch is to the OTHER one. 0 = leave the nation alone.
 NATION_CHANGE_TOGGLE = os.environ.get("FMO_NATION_CHANGE_TOGGLE", "1") != "0"
 REPLY_019D_LEN = 36
 
 
-def reply_019d():
+def reply_019d(counts=None):
     """The 36 bytes at screen+0x1AD. All-zero with FMO_NATION_POP=0,0 and
     FMO_NATION_ENABLE=0, which is what every measurement before 2026-08-20
-    ran against."""
+    ran against. With FMO_NATION_POP=live, `counts` ({1: n, 2: n}) are the
+    populations and the closed flag follows closed_nation()."""
     b = bytearray(REPLY_019D_LEN)
-    try:
-        a, c = (int(x) for x in NATION_POP.split(",")[:2])
-    except ValueError:
-        a = c = 0
+    closed = None
+    if NATION_POP_LIVE:
+        counts = counts or {}
+        a, c = int(counts.get(1, 0)), int(counts.get(2, 0))
+        if a + c <= 0:
+            # 0 + 0 is the "no nations" denominator; an empty server is even
+            a = c = 1
+        closed = closed_nation(counts)
+    else:
+        try:
+            a, c = (int(x) for x in NATION_POP.split(",")[:2])
+        except ValueError:
+            a = c = 0
     struct.pack_into("<II", b, 0x00, a & 0xFFFFFFFF, c & 0xFFFFFFFF)
-    # +0x08 / +0x0C stay 0: both are sign-tested and only a NEGATIVE value
-    # changes the mode, so zero is the neutral choice, not a placeholder.
+    # +0x08 / +0x0C: sign-tested, and only a NEGATIVE value changes the mode,
+    # so zero is the neutral choice. -1 closes that nation (see above).
+    struct.pack_into("<ii", b, 0x08, -1 if closed == 1 else 0, -1 if closed == 2 else 0)
     b[0x10] = NATION_ENABLE & 0xFF
     return bytes(b)
 
@@ -218,3 +299,7 @@ FAIL_CODE = _env_int("FMO_FAIL_CODE", "1")
 #: reading the image: the user clicked "Change Nations" on 2026-08-18 and this
 #: is the request that went out.
 MSG_CHANGE_NATIONS = 0x01AB
+
+
+# Called at run time only; imported last so that import cycles resolve.
+from . import defection  # noqa: E402

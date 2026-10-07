@@ -70,11 +70,19 @@ class SessionPilotRecord:
         _key = missionbook.mission_next_key(cur, mid)
         if _key is not None:
             _new["key"] = _key              # record+0x00 for THIS accept
+        # a STORY mission (catalogue title or tile) also moves its own flag
+        # byte 0 -> 1, as the NPC's srv_104 would (missionbook.story_accept_apply);
+        # committed with the accept, pushed by the caller
+        _sm, _swhat = missionbook.story_accept_apply(char, name, sector, nation)
+        if _sm is not None:
+            _new["story_byte"] = int(_sm["own"])
+        log(f"{self.peer}      story mission: {_swhat}")
         cur = cur + [_new]
         char["missions"] = cur
         try:
             self.commit(f"accepted mission {mid} {name!r}"
-                        + (f", fee H$ {fee}" if fee else "")
+                        + (f", fee {fee} MP" if fee and missionboard.MISSION_FEE_MP else f", fee H$ {fee}" if fee else "")
+                        + (f", {_swhat}" if _sm is not None else "")
                         + f" -- {len(cur)} accepted mission(s) on file")
         except Exception as e:
             log(f"{self.peer}   WARNING: accept of mission {mid} NOT banked ({e!r})")
@@ -181,14 +189,16 @@ class SessionPilotRecord:
     def spend_area_pass(self, char, zone):
         """Take one transit pass off the pilot when opening `zone` cost one.
 
-        Mirrors the client's own verdict (area_permit_cost at the pilot's
-        class-12 tier): a free move spends nothing. Returns the spent serials
-        ([] or [serial]) for the live 0x015A push.
+        Mirrors the client's own verdict (area_permit_cost at the tier
+        0x611E4000 makes of the pilot's class-12 level, permits.area_tier): a
+        free move spends nothing. Returns the spent serials ([] or [serial])
+        for the live 0x015A push.
         """
         nation, _nsrc = zoneentry.nation_for_session(char, status.STATUS_NATION, "FMO_STATUS_NATION")
         rows = zonecontrol.parse_zone_control(zonecontrol.ZONE_CONTROL) if zonecontrol.ZONE_CONTROL else []
-        tier = classes.class_level(classes.class_exp_of(char).get(permits.AREA_PASS_TIER_CLASS, 0))
+        tier, _lv = permits.pilot_area_tier(char)
         cost, why = permits.area_permit_cost(zone, nation, tier, rows)
+        why += f" (Pilot level {_lv})"
         if cost != 1:
             log(f"{self.peer}   area {zone}: no pass spent ({why}; 2 = the "
                 f"client moved freely, 0 = it should not have offered it)")
@@ -239,11 +249,13 @@ class SessionPilotRecord:
             log(f"{self.peer}   FMO_PERMIT: nation {nation} ({src}) is neither "
                 f"1 nor 2, so there is no HQ pass to mint.")
             return None
-        held = {int(it["id"]) for it in inventory.stored_items(char)
-                if int(it["kind"]) == permits.PASS_KIND}
-        wanted = [w for w in wanted if w not in held]
+        # A grant is once per pilot, ever: a pass the client has CONSUMED to
+        # open an area is gone from the item list but stays in GRANTED_KEY, so
+        # the next visit does not refill it (the re-mint bug before 09-30).
+        given = permits.granted_passes(char)
+        wanted = [w for w in wanted if w not in given]
         if not wanted:
-            return None                      # already held; say nothing
+            return None                      # already granted; say nothing
         recs, names = [], []
         for _w in wanted:
             lo, hi = shop.mint_serial()
@@ -252,6 +264,7 @@ class SessionPilotRecord:
             names.append("id %d -> zone kind %d%s" % (
                 _w, permits.PASS_ZONE_KIND[_w],
                 " (FMO_PERMIT_RANKS, rank %s)" % rank if _w in _by_rank else ""))
+        char[permits.GRANTED_KEY] = sorted(given | set(wanted))
         try:
             self.commit(f"Personnel Officer granted transit pass(es) "
                         f"(kind 0x{permits.PASS_KIND:02X} ids {wanted})")
@@ -268,6 +281,74 @@ class SessionPilotRecord:
             f"set FMO_PERMIT=0 and say so.")
         return packet.build(shop.MSG_ACQUIRE_REPLY, shop.item_mint_payload(recs), pushes.QUEUE_SEQ, conn_id)
 
+    def grant_reward_pass(self, conn_id, item_id, why):
+        """Mint ONE transit pass `item_id` (kind 0x13) as a mission reward and
+        bank it; -> the 0x016B mint push, or None (no pilot). Unlike the HQ
+        pass this is not once-ever: SE's helicopter report hands over an OC
+        pass each time the mission is reported, and a mission reports once."""
+        char = self.playing_char() if charstore.CHAR_STORE else None
+        if not char:
+            log(f"{self.peer}   {why}: no pilot in the store, pass id {item_id} NOT minted")
+            return None
+        lo, hi = shop.mint_serial()
+        inventory.add_stored_item(char, lo | (hi << 32), item_id, permits.PASS_KIND, 0)
+        char[permits.GRANTED_KEY] = sorted(permits.granted_passes(char) | {item_id})
+        try:
+            self.commit(f"{why}: transit pass id {item_id} (kind 0x{permits.PASS_KIND:02X})")
+        except Exception as e:
+            log(f"{self.peer}   WARNING: {why}: the pass was NOT banked ({e!r})")
+        log(f"{self.peer}   -> 0x{shop.MSG_ACQUIRE_REPLY:04X} MINT push: {why}, pass id "
+            f"{item_id} -> zone kind {permits.PASS_ZONE_KIND.get(item_id)}")
+        return packet.build(shop.MSG_ACQUIRE_REPLY,
+                            shop.item_mint_payload([inventory.item_record(lo | (hi << 32), item_id,
+                                                                          permits.PASS_KIND)]),
+                            pushes.QUEUE_SEQ, conn_id)
+
+    def sell_hangar_pass(self, conn_id, payload, ps):
+        """The hangar mechanic's permit sale (script event 206, see
+        permits.HANGAR_SALE_EVENT) -> the packets to send BEFORE the ack.
+
+        A sale banks the debit and the pass, then answers the script with
+        p2 = 1 through a 0x015A (record answered, money delta -price, owned
+        table + flags refreshed), followed by the 0x016B mint that puts the
+        pass in the item list -- the same order and the same two pushes a
+        mission report's pass reward already uses. A refusal sends nothing:
+        the ack echoes the record with p2 = 0 and the script prints its one
+        refusal line."""
+        char = self.playing_char() if charstore.CHAR_STORE else None
+        choice = int(ps[0]) if ps else 0
+        if char is None:
+            log(f"{self.peer}   hangar permit sale (event 206, choice {choice}): no "
+                f"pilot in the store -- refused; the script will say 'not enough money'")
+            return []
+        nation, _nsrc = zoneentry.nation_for_session(char, status.STATUS_NATION, "FMO_STATUS_NATION")
+        sale = permits.hangar_sale(choice, nation, economy.wallet_money(char)[0])
+        if not sale["ok"]:
+            log(f"{self.peer}   hangar permit sale REFUSED: {sale['why']} -- the script "
+                f"prints D94 103 'not enough money' whatever the reason")
+            return []
+        why = f"hangar permit sale: {sale['why']}"
+        if self.credit_money(why, money=-sale["price"]) is None:
+            return []
+        mint = self.grant_reward_pass(conn_id, sale["pass_id"], why)
+        params = list(ps) + [0] * (scriptcall.S159_NPARAMS - len(ps))
+        params[1] = 1
+        owned = bytearray(status.reply_014a(char=char)[
+            status.S14A_OWNED:status.S14A_OWNED + resultpush.S15A_OWNED_LEN])
+        fl = self.pilot_flags()
+        if fl:
+            o = status.S14A_FLAGS11 - status.S14A_OWNED
+            owned[o:o + status.S14A_FLAGS11_LEN] = fl[:status.S14A_FLAGS11_LEN]
+        outs = [resultpush.result_push_packet(
+            conn_id, record=scriptcall.answered_0159(payload, params),
+            money=-sale["price"], contribution=0, owned=bytes(owned), pilot=char)]
+        log(f"{self.peer}   -> 0x{resultpush.MSG_RESULT_PUSH:04X} ANSWER push: event 206 "
+            f"p2 = 1 (D94 102 'This is your transit permit'), money delta "
+            f"-{sale['price']} H$, then the 0x{shop.MSG_ACQUIRE_REPLY:04X} pass mint")
+        if mint:
+            outs.append(mint)
+        return outs
+
     def pay_salary(self, char, rank, now=None):
         """The paybook this visit pays, BANKED: money and MP credited to the
         pilot, `last_payday` moved to today. (rows, H$, MP, paydays); a
@@ -275,7 +356,8 @@ class SessionPilotRecord:
         if not char:
             return [], 0, 0, 0
         rows, today = servicerecord.paybook_rows(char, rank, now)
-        days = len(rows) // 2
+        # one header + one base row per payday, and a city row when it applies
+        days = sum(1 for r in rows if r[0] == servicerecord.PAY_BASE)
         # KEY: 28:4 says "The reward will be paid by the Personnel.Officer" --
         # so a REPORTED mission's reward is paid HERE, as its own "Mission
         # bonus" line (kind 5), in whatever room the 20-row book has left.
@@ -457,6 +539,7 @@ class SessionPilotRecord:
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    charstore, classes, economy, inventory, missionbook, packet, permits, pushes, ranks,
-    servicerecord, shop, squadron, status, warmap, warstate, zonecontrol, zoneentry,
+    charstore, classes, economy, inventory, missionboard, missionbook, packet, permits, pushes,
+    ranks, resultpush, scriptcall, servicerecord, shop, squadron, status, warmap, warstate,
+    zonecontrol, zoneentry,
 )

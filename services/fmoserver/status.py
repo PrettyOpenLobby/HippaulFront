@@ -78,6 +78,8 @@ S14A_HANGAR_PW_LEN = 0x10
 #: fmodata/fmo-ranks.tsv's `rank` column IS this byte since 2026-09-12; before
 #: that it was row+1 and every name the server logged was one rank too HIGH.
 S14A_RANK = S14A_BLOCK + 0x2F          # u8, = lobby+0x8BB
+#: u8 -> lobby+0x8BD, the HANGAR RANK (payload+0x39); see hangar.HANGAR_JOB_LEVEL.
+S14A_HANGAR_RANK = S14A_BLOCK + 0x31
 
 #: KEY: THE ACTIVE WANZER SETUP -- `lobby+0x8B7` = `S14A_BLOCK + 0x2B`. Decoded
 #: 2026-09-08 from a live screenshot: the Select Wanzer list marked
@@ -350,6 +352,11 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
     if _ack:
         out.append(("ack-rank (+0x58E -> lobby+0xE1A, the E316 orders gate)",
                     S14A_BE1A, bytes([_ack & 0xFF]), _ack_src))
+    # PENALTY (penalty.py): +0x3A -> lobby+0x8BE (E0A1, nonzero = clearance
+    # revoked, D63/D83) and +0x594 -> lobby+0xE18 (E0A3, retraining wins to
+    # finish); the same bytes every 0x015A carries at +0x418 / +0x41A.
+    from . import penalty
+    out.extend(penalty.status_014a_fields(char))
     _act_setup = (STATUS_ACTIVE_SETUP if active_setup is None
                   else active_setup)
     if _act_setup:
@@ -407,6 +414,16 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
              (nation_src or "explicit"))):
         if val:
             out.append((label, off, bytes([val & 0xFF]), knob))
+    # KEY: HANGAR RANK (+0x39 -> lobby+0x8BD, see hangar.HANGAR_JOB_LEVEL): the
+    # rank the last battle end banked, never recomputed here -- SE applied the
+    # change after a battle, and 0x014C +0x0F5 must carry the same value or it
+    # resets the byte. Zero (a fresh pilot, or FMO_HANGAR_JOB_LEVEL=0) needs no byte.
+    _hr = hangar.hangar_rank_stored(char)
+    if _hr:
+        _hw, _hc = hangar.hangar_capacity(_hr)
+        out.append((f"hangar rank (+0x39 -> lobby+0x8BD; table 0x61399988: {_hw} "
+                    f"wanzers, {_hc} items)", S14A_HANGAR_RANK, bytes([_hr & 0xFF]),
+                    "character store [hangar_rank], banked at the last battle end"))
     _hpw = (char.get("hangar_password") or "") if char else ""
     if _hpw:
         out.append(("hangar password (+0x738 -> lobby+0x1000, the string the "
@@ -611,5 +628,5 @@ def status_body(fields_list):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    charselect, classes, economy, inventory, permits, poplook, ranks, zonecontrol,
+    charselect, classes, economy, hangar, inventory, permits, poplook, ranks, zonecontrol,
 )

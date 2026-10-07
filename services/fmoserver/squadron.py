@@ -244,7 +244,35 @@ def squadron_insignia_word(nation, group_id=0):
     return 0                                # safe: let the player register one
 
 
-def reply_01ad(req=b"", groups=(), char=None):
+#: KEY: THE SQUADRON'S NATION IS RECORDED, NOT RE-READ (2026-09-30). Slot
+#: +0x09 used to be stamped with the nation of whoever was looking, so a
+#: member who had defected still saw an active squadron of his NEW army.
+#: SE (manual p.50): a squadron belongs to the army it was formed in, and a
+#: member in the enemy army sees it inactive. A squadron is a POL group and
+#: is formed outside FMO, so the nation is recorded the first time the
+#: squadron is served to one of its members (fmo_squadron_nation) and served
+#: from the record after that. FMO_SQUADRON_NATION_STORE=0 = the old stamp.
+SQUADRON_NATION_STORE = _env_int("FMO_SQUADRON_NATION_STORE", "1") != 0
+
+
+def squadron_nation(group_id, viewer_nation=None, who=None):
+    """(nation, source) for squadron `group_id`: the recorded one, recording
+    `viewer_nation` first when there is none yet and one is given; (0, why)
+    when nothing is on file and nothing may be recorded. Never raises."""
+    if not SQUADRON_NATION_STORE or fmostore is None or not charstore.FMO_DB:
+        return 0, "no store (FMO_SQUADRON_NATION_STORE=0 or FMO_DB off)"
+    try:
+        got = fmostore.squadron_nation(group_id)
+        if not got and viewer_nation in (1, 2):
+            got = fmostore.set_squadron_nation(group_id, viewer_nation, who)
+            if got:
+                return got, f"recorded now from {who or 'a member'}'s pilot"
+    except Exception as e:
+        return 0, f"store error {e!r}"
+    return (got, "recorded") if got in (1, 2) else (0, "not recorded yet")
+
+
+def reply_01ad(req=b"", groups=(), char=None, who=None):
     """The 68-byte squadron table, and a one-line description of it.
 
     `char` is the pilot being served: its nation is what the client will
@@ -330,7 +358,12 @@ def reply_01ad(req=b"", groups=(), char=None):
             litter.append(i)
             continue
         b[off + SQ_IS_FMO] = 1
-        b[off + SQ_NATION] = nation & 0xFF
+        # +0x09 is the SQUADRON's nation, not the viewer's (squadron_nation):
+        # a member now in the other army gets a row that will not activate.
+        _sqn = (nation if SQUADRON_NATION >= 0 else
+                squadron_nation(gid, nation if char is not None else None,
+                                who)[0] or nation)
+        b[off + SQ_NATION] = _sqn & 0xFF
         # +0x0A: the REGISTERED insignia, which also decides whether "Set
         # squadron insignia" is greyed (mask 0x61398FCC, row 7).
         #
@@ -473,11 +506,69 @@ def insignia_for(nation):
     return rows[:INSIGNIA_MAX]
 
 
-def insignia_payload(nation):
+#: KEY: THE BATTLE FEE RATES RIDE THIS BLOCK TOO (static 2026-10-01). The Battle
+#: Fee the setup screen shows (Playing Manual p.62, "Battle Fee : 0") and the
+#: sortie checks against the wallet is the CLIENT's sum, 0x61175CB0 over the
+#: setup's 21 item records (setup+0x28, stride 0x18): for each of a record's
+#: six modification bytes (+0x0C..+0x11; SE's own error string 0x6133B5B0
+#: calls the index "ReconIdx" of "FmoComGetReconstType") that is non-zero,
+#:     fee += base * level * rate[type] / 100000       (0x611E1F60, 64-bit)
+#: where base is the first u32 of a record the item's catalogue entry
+#: resolves (0x611A4760; most likely its price, NOT proved), and type =
+#: 0x611E1C20(kind, modification index), the client's per-kind tables at
+#: 0x613998D0..0x61399960, which only ever return 0..7. rate[type] is the u32
+#: at lobby+0x7E0D + type*4 (0x61175D3E) = THIS block's +0x18 + type*4, so the
+#: eight rates are block +0x18..+0x37, written by nothing but this push. We
+#: served them as zeros, so every fee read 0, exactly as the manual's own
+#: screenshot does. Callers: the setup screen (0x6103F6B5, "%6d"), the sortie
+#: check (0x611B73E5, against lobby+0x88C) and 0x611B8287.
+#: WARNING: The fee is computed and shown by the client. No decoded request
+#: field carries it (0x0139 in sortie.py; its +0x10..+0x3F is 48 bytes from
+#: [[globals+0x198]+0x2C]+0x388, not decoded), recomputing it here would need
+#: the client's per-kind type tables and the item `base`, and this server
+#: never authors a modified part (its item records carry zeros there), so
+#: the debit SE made (0x01A1, 8:74 "Paid H$%d as the sortie cost for a
+#: modified unit") is not built.
+#: FMO_BATTLE_FEE_RATES: eight comma-separated integers, rate[0]..rate[7];
+#: empty (default) = all zero, the block byte for byte as before. SE's values
+#: were never found in any captured page, so there is no default to ship.
+BATTLE_FEE_RATES_OFF = 0x18
+BATTLE_FEE_RATES_N = 8
+BATTLE_FEE_DIVISOR = 100000           # 0x186A0 at 0x611E1F7D
+
+
+def parse_battle_fee_rates(text):
+    """(rates tuple of 8, error or None). Empty or malformed = all zero."""
+    text = (text or "").strip()
+    if not text:
+        return (0,) * BATTLE_FEE_RATES_N, None
+    try:
+        vals = [int(x, 0) for x in text.replace(" ", "").split(",") if x != ""]
+    except ValueError as e:
+        return (0,) * BATTLE_FEE_RATES_N, f"not integers ({e})"
+    if len(vals) != BATTLE_FEE_RATES_N or any(v < 0 or v > 0x7FFFFFFF for v in vals):
+        return (0,) * BATTLE_FEE_RATES_N, (f"needs exactly {BATTLE_FEE_RATES_N} values "
+                                           f"in 0..2147483647, got {vals}")
+    return tuple(vals), None
+
+
+BATTLE_FEE_RATES, _BATTLE_FEE_ERR = parse_battle_fee_rates(
+    os.environ.get("FMO_BATTLE_FEE_RATES", ""))
+
+
+def battle_fee(base, level, rate):
+    """One modification's share of the fee, as 0x611E1F60 computes it."""
+    return int(base) * int(level) * int(rate) // BATTLE_FEE_DIVISOR
+
+
+def insignia_payload(nation, rates=None):
     """The 0x019F body: a u32 count then 8-byte rows {u8 nation, u8 0, u16 id,
-    u32 0}. The nation byte is the PLAYER's, because 0x611BE344 tests equality."""
+    u32 0}. The nation byte is the PLAYER's, because 0x611BE344 tests equality.
+    +0x18..+0x37 are the eight Battle Fee rates (BATTLE_FEE_RATES)."""
     rows = insignia_for(nation)
     b = bytearray(INSIGNIA_LIST_LEN)
+    for i, r in enumerate(BATTLE_FEE_RATES if rates is None else rates):
+        struct.pack_into("<I", b, BATTLE_FEE_RATES_OFF + 4 * i, int(r) & 0xFFFFFFFF)
     struct.pack_into("<I", b, INSIGNIA_COUNT_OFF, len(rows))
     for i, (rid, _en) in enumerate(rows):
         off = INSIGNIA_ROW_OFF + i * INSIGNIA_ROW_LEN
@@ -494,7 +585,7 @@ def insignia_push(conn_id, nation):
     in-scene for, and it must REPEAT per scene -- 0x6117A2E4 zeroes the block
     on every lobby reset."""
     rows = insignia_for(nation)
-    if not rows:
+    if not rows and not any(BATTLE_FEE_RATES):
         return None
     return packet.build(MSG_INSIGNIA_LIST, insignia_payload(nation), pushes.QUEUE_SEQ, conn_id)
 
@@ -552,4 +643,4 @@ def squadron_insignia_push_body(group_id, insignia, money):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import packet, pushes, zoneentry  # noqa: E402
+from . import charstore, packet, pushes, zoneentry  # noqa: E402

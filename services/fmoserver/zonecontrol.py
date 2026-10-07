@@ -1,6 +1,7 @@
 """The zone-control push (0x016C): which nation holds each zone."""
 import os
 import struct
+from .wirelog import log
 
 
 #: PROBE: THE ZONE-CONTROL PUSH -- `0x016C`, and it is why every sector in Change
@@ -129,17 +130,89 @@ ZONE_ROWS_D83 = (
 )
 
 
+#: KEY: THE `levels` TABLE -- the manual's zone level gates (p.37) served as
+#: row bytes (static 2026-09-30). The row byte is read in exactly one place,
+#: the Change Area gate 0x611794A0 (the only caller of 0x611A3AA0), which runs
+#: it against the pilot's tier through the matrix 0x613966E4
+#: (permits.AREA_ACCESS). The tier steps at Pilot level 5/10/15/20/51
+#: (permits.AREA_TIER_BANDS). Read down the matrix, each row byte is one gate:
+#:     1  permit at levels 1-9, free from 10      (own Controlled Zone / HQ)
+#:     2  refused below 5, permit 5-9, free from 10
+#:     3  refused below 10, permit 10-19, free from 20  (own Occupied Zone)
+#:     4  refused below 15, free from 15          (the enemy's Occupied Zone)
+#:     5  refused below 20, free from 20          (Fierce Battle Zone)
+#: which is the manual's ladder: Occupied from 10, the enemy's Occupied from
+#: 15, Fierce from 20. The Coliseum (p.45, level 10) takes 2: there is no
+#: Coliseum pass (no item maps to zone kind 6), so the permit band 5-9
+#: refuses in practice and level 10 opens it.
+#: FMO_ZONE_LEVEL_BYTES overrides one class at a time: "hq=1,occ=3,enemy=4,
+#: fz=5,col=2". Only the rows D83 already allows for a nation get a byte;
+#: the rest stay 0 exactly as `all` serves them.
+ZONE_LEVEL_DEFAULTS = {"hq": 1, "occ": 3, "enemy": 4, "fz": 5, "col": 2}
+
+
+def _zone_level_bytes(spec):
+    out = dict(ZONE_LEVEL_DEFAULTS)
+    for clause in (spec or "").replace(" ", "").split(","):
+        if not clause:
+            continue
+        k, _, v = clause.partition("=")
+        try:
+            if k.lower() not in out:
+                raise ValueError("unknown class")
+            out[k.lower()] = int(v, 0) & 0xFF
+        except ValueError:
+            log(f"[fmo] WARNING: FMO_ZONE_LEVEL_BYTES: ignoring {clause!r} "
+                  f"(want hq|occ|enemy|fz|col=<byte>)")
+    return out
+
+
+ZONE_LEVEL_BYTES = _zone_level_bytes(os.environ.get("FMO_ZONE_LEVEL_BYTES", ""))
+
+
+def zone_level_byte(zone, nation, table=None):
+    """The `levels` row byte for one zone and one nation (1 O.C.U. / 2
+    U.S.N.): which of the manual's zone classes the zone is FOR THAT nation.
+    Kind 1/3 are the O.C.U./U.S.N. HQs, 2/4 their occupation zones, 5 the
+    frontline, 6 the Coliseum. Pure."""
+    t = ZONE_LEVEL_BYTES if table is None else table
+    kind = int(zone) // 100
+    own_hq, own_occ, enemy_occ = (1, 2, 4) if nation == 1 else (3, 4, 2)
+    if kind == own_hq:
+        return t["hq"]
+    if kind == own_occ:
+        return t["occ"]
+    if kind == enemy_occ:
+        return t["enemy"]
+    if kind == 5:
+        return t["fz"]
+    if kind == 6:
+        return t["col"]
+    return 0
+
+
+def level_rows(table=None):
+    """ZONE_ROWS_D83 with each nation's 1 replaced by its `levels` byte."""
+    return [(z, zone_level_byte(z, 1, table) if ocu else 0,
+             zone_level_byte(z, 2, table) if usn else 0)
+            for z, ocu, usn in ZONE_ROWS_D83]
+
+
 def parse_zone_control(entries):
     """`id[:ocu[:usn]]` rows -> [(zone_id, ocu, usn)], capped at the block.
 
     usn defaults to ocu and ocu defaults to 1 (the matrix value that is
     "selectable" for every tier >= 3). The bare token `live` expands to
-    ZONE_LIVE_WARZONES at 1/1.
+    ZONE_LIVE_WARZONES at 1/1; `all` to every D83 row at 1; `levels` to every
+    D83 row at the manual's level gate (level_rows).
     """
     rows = []
     for e in entries:
         if e.lower() == "live":
             rows.extend((z, 1, 1) for z in ZONE_LIVE_WARZONES)
+            continue
+        if e.lower() == "levels":
+            rows.extend(level_rows())
             continue
         if e.lower() == "all":
             # Every row gate (A) can accept, with the client's OWN per-nation

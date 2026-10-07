@@ -41,6 +41,7 @@ import os
 import threading
 import time
 
+import fmoarena
 import fmowar
 try:
     import fmosectors                        # the (selector, tile) -> sector row table
@@ -52,7 +53,8 @@ TITLE = "Front Mission Online - City Control"
 
 #: what /fmoboard calls this board, and what its one feed is called
 DISCORD_TITLE = "City Control"
-DISCORD_FEED_NAMES = {"": "standings"}
+#: "arenas" is a second post, the Coliseum's open arenas, edited in place
+DISCORD_FEED_NAMES = {"": "standings", "arenas": "arenas"}
 #: whose player count the bot's status shows ("Watching 12 players online").
 #: fmo.py publishes it; with nobody publishing, the status is simply blank.
 PRESENCE_GAME = "fmo"
@@ -144,21 +146,25 @@ def holder(s):
     return n if n in (OCU, USN) else 0
 
 
-def seed_holder(s):
+def seed_holder(s, tile=None):
     """Who a sector opened the war with: its seed kind's nation
-    (fmowar.SEED_BY_KIND, "seeded": "kind 2"), nobody when it was not seeded."""
+    (fmowar.SEED_BY_KIND, "seeded": "kind 2"), nobody when it was not seeded.
+    With its `tile`, fmowar.War.opening's answer, which also knows that each
+    side's fortress opens held by that side (2026-09-30)."""
     try:
         kind = int(str(s.get("seeded") or "").split()[-1])
     except (ValueError, IndexError):
         return 0
+    if tile is not None and kind in fmowar.SEED_BY_KIND:
+        return fmowar.War.opening(int(tile), kind)[0]
     return fmowar.SEED_BY_KIND.get(kind, (0, 0))[0]
 
 
-def changed_hands(s):
+def changed_hands(s, tile=None):
     """A sector whose holder is not the one it opened with. NOT its `updated`
     stamp: settle() stamps a win that only fills the counter (prod 2026-09-12:
     two O.C.U. Occupied Zone 01 sectors, still O.C.U.'s at 60 %)."""
-    return holder(s) != seed_holder(s)
+    return holder(s) != seed_holder(s, tile)
 
 
 def cities(war):
@@ -228,6 +234,29 @@ def phase(war, now):
             "judged": judged, "last": last}
 
 
+def arenas(now):
+    """The Coliseum's arenas as the Registration Officer lists them at `now`:
+    {"official": [...], "hosted": [...], "next_change": unix}. The officials
+    follow fmoarena's schedule; the hosted ones are the server's stored
+    document (fmo_coliseum), less any whose time is up."""
+    def row(a):
+        return {"id": int(a.get("id") or 0), "name": str(a.get("name") or "Arena"),
+                "promoter": str(a.get("promoter") or ""),
+                "format": int(a.get("format") or fmoarena.FORMAT_NORMAL),
+                "headcount": int(a.get("headcount") or 1),
+                "req_bgs": int(a.get("req_bgs") or 0),
+                "bg_cost": int(a.get("bg_cost") or 0), "fee": int(a.get("fee") or 0),
+                "start": int(a.get("start") or 0), "end": int(a.get("end") or 0),
+                "rules": fmoarena.rule_text(a)}
+    doc = fmoarena.read_state() or {}
+    hosted = [a for a in (doc.get("hosted") or {}).values()
+              if isinstance(a, dict) and not (a.get("end") and now >= a["end"])]
+    return {"official": [row(fmoarena.scheduled(a, now)) for a in fmoarena.OFFICIAL],
+            "hosted": [row(a) for a in sorted(hosted, key=lambda a: (a.get("start") or 0,
+                                                                    a.get("id") or 0))],
+            "next_change": fmoarena.next_change(now)}
+
+
 def _sig(snap):
     h = hashlib.sha1()
     h.update(repr([(c["tile"], c["nation"], c["control"], c["bg_max"], c["bg_min"])
@@ -244,7 +273,7 @@ def snapshot(args=None, now=None):
     rows = cities(war)
     score = war.score()
     sectors = war.data.get("sectors") or {}
-    changed = sum(1 for s in sectors.values() if isinstance(s, dict) and changed_hands(s))
+    changed = sum(1 for t, s in sectors.items() if isinstance(s, dict) and changed_hands(s, t))
     snap = {"board": NAME, "title": TITLE, "updated": int(now),
             "poll_s": float(getattr(args, "poll", 5.0) or 5.0),
             "war": {"present": present, "mtime": int(mtime) if mtime else None,
@@ -257,6 +286,8 @@ def snapshot(args=None, now=None):
             "connections": connections(now),
             "defaults": {"counter_cap": fmowar.COUNTER_CAP, "rate_step": fmowar.RATE_STEP}}
     snap["sig"] = _sig(snap)
+    snap["arenas"] = arenas(now)
+    snap["arenas_sig"] = hashlib.sha1(repr(snap["arenas"]).encode()).hexdigest()[:16]
     return snap
 
 
@@ -512,6 +543,62 @@ def discord_bot_message(snap, args=None):
         payload["components"] = [{"type": 1, "components": [
             {"type": 2, "style": 5, "label": "Open the board", "url": url}]}]
     return payload, files
+
+
+def _money(n):
+    return "H$ {:,}".format(int(n))
+
+
+def _arena_line(a, now):
+    """Two lines for one player-hosted arena."""
+    if a["format"] == fmoarena.FORMAT_TOURNAMENT:
+        what = "tournament for %d BGs of %d" % (a["req_bgs"], a["headcount"])
+        prize = a["fee"] * 2
+    else:
+        what = "%d vs %d" % (a["headcount"], a["headcount"])
+        prize = a["fee"]
+    head = "**%s**%s - %s, B.G. Cost %d" % (a["name"], " by %s" % a["promoter"]
+                                           if a["promoter"] else "", what, a["bg_cost"])
+    if a["fee"]:
+        head += ", entry %s, prize %s per win" % (_money(a["fee"]), _money(prize))
+    if a["start"] and now < a["start"]:
+        when = "Battles start <t:%d:t> (<t:%d:R>)" % (a["start"], a["start"])
+    else:
+        when = "Open now"
+    if a["end"]:
+        when += ", closes <t:%d:t>" % a["end"]
+    return "%s\n%s. %s." % (head, when, a["rules"])
+
+
+def discord_arenas_message(snap, args=None):
+    """(payload, files) for the Coliseum post: the official arenas with the
+    hour's B.G. Cost and the day's rules, then every player-hosted arena."""
+    ar, now = snap["arenas"], snap["updated"]
+    lines = []
+    if ar["official"]:
+        lines.append("**Official arenas** (free entry, no prize). These rules hold "
+                     "until <t:%d:t> (<t:%d:R>)." % (ar["next_change"], ar["next_change"]))
+        for a in ar["official"]:
+            lines.append("- **%s**, B.G. Cost %d: %s" % (a["name"], a["bg_cost"], a["rules"]))
+        lines.append("")
+    lines.append("**Player arenas**")
+    if ar["hosted"]:
+        lines += [_arena_line(a, now) for a in ar["hosted"]]
+    else:
+        lines.append("None right now. A Second Lieutenant or above can host one at "
+                     "the Coliseum Coordinator for 100 MP.")
+    lines += ["", "Register with the Registration Officer in the Coliseum lobby "
+              "(Pilot level 10 and up)."]
+    embed = {"title": "Front Mission Online: Coliseum",
+             "description": "\n".join(lines)[:4000], "color": 0x5FE0CF,
+             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+             "footer": {"text": "Huffman Island Coliseum"}}
+    return {"embeds": [embed], "allowed_mentions": {"parse": []}, "attachments": []}, []
+
+
+def discord_arenas_bot_message(snap, args=None):
+    """The Coliseum post as the bot (/fmoboard arenas); no buttons."""
+    return discord_arenas_message(snap, args)
 
 
 def discord_events(prev, snap):

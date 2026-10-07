@@ -149,8 +149,16 @@ def result_push_body(record=b"", money=0, contribution=0, granted=(),
     return bytes(b)
 
 
-def result_push_packet(conn_id, **fields):
-    """The 0x015A push on the queue sequence. Nothing polls for it."""
+def result_push_packet(conn_id, pilot=None, **fields):
+    """The 0x015A push on the queue sequence. Nothing polls for it.
+
+    `pilot` = the character the push is for: its CURRENT penalty bytes
+    (penalty.penalty_bytes) go in +0x418..+0x41A and win over any b418/b419/
+    b41a passed. The tail 0x6117E958 stores all three on EVERY 0x015A, so a
+    push that echoed zeros would hand a penalised pilot its clearance back."""
+    if pilot is not None:
+        from . import penalty
+        fields.update(penalty.push_fields(pilot))
     return packet.build(MSG_RESULT_PUSH, result_push_body(**fields),
                         pushes.QUEUE_SEQ, conn_id)
 

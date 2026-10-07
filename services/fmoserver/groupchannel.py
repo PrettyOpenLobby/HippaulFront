@@ -140,23 +140,72 @@ def group_member_flags(account, gid):
     """+0x54 of `account`'s member blob: listed, plus ready / continue."""
     flags = G_FLAG_LISTED
     ready, cont = GROUP_READY.get(account, (0, 0))
-    if ready == 1 or battlegroups.GROUP_CREATOR_ACCOUNT.get(gid) == account:
+    if ready == 1 or battlegroups.group_leader(gid) == account:
         flags |= G_FLAG_READY
     if cont == 1:
         flags |= G_FLAG_CONT
     return flags
 
 
-def group_blob_update(uid, leader, flags, voice=True):
+def group_blob_update(uid, leader, flags, voice=True, listed=True):
     """A cmd 191 for member `uid`: the blob from +0x4C onward, full length (the
     handler copies body+0x08.. to blob+0x4C.., so a short body would copy
-    whatever follows it). +0x54 bit 0 must stay set or the member is dropped."""
+    whatever follows it). +0x54 bit 0 must stay set or the member is dropped;
+    listed=False clears it on purpose, to drop a kicked member (group_delist)."""
     tail = bytearray(0x1C8 - G191_BLOB_FROM)
     struct.pack_into("<I", tail, GROUP_POP_LEADER_OFF - G191_BLOB_FROM, 1 if leader else 0)
-    struct.pack_into("<I", tail, GROUP_POP_FLAGS_OFF - G191_BLOB_FROM, flags | G_FLAG_LISTED)
+    struct.pack_into("<I", tail, GROUP_POP_FLAGS_OFF - G191_BLOB_FROM,
+                     (flags | G_FLAG_LISTED) if listed else (flags & ~G_FLAG_LISTED))
     tail[G190_VOICE - G191_BLOB_FROM] = 1 if voice else 0
     body = struct.pack("<I", uid & 0xFFFFFFFF) + bytes(4) + bytes(tail)
     return fmoworld.record(roomrelay.GROUP_BLOB_UPDATE_CMD, body)
+
+
+def _group_chans():
+    return [(k, c) for k, c in list(WORLD_PEERS.items())
+            if isinstance(k, tuple) and len(k) == 3 and k[2] == "group"]
+
+
+def group_member_by_alias(account, alias):
+    """The account of the member `account`'s client knows as UnitID `alias`
+    on its group connection, or None. That id is what the Group Commands
+    member list hands to Kick / Change Leader: the list row's peer+0x10
+    (0x6116F6F3..0x6116F6F9, posted with event 0x1003 / 0x1004), and every
+    other member's peer there is an alias we minted in group_queue. The
+    client's own id is refused by the client itself (event 0x13EA)."""
+    for _k, c in _group_chans():
+        if getattr(c, "account", None) != account:
+            continue
+        for okey, a in list(getattr(c, "alias_of", {}).items()):
+            if a == alias:
+                other = WORLD_PEERS.get(okey)
+                if other is not None and getattr(other, "account", None):
+                    return other.account
+    return None
+
+
+def group_delist(gid, account):
+    """Take `account` off every other member's Group Commands list: a cmd
+    191 for its alias WITHOUT +0x54 bit 0 (G190_STATUS_BIT0 -- a 191 drops a
+    member without it), then forget the alias was introduced, so a later
+    rejoin is introduced again by group_queue. Returns the channels told."""
+    mine = [c for _k, c in _group_chans() if getattr(c, "account", None) == account]
+    n = 0
+    for _k, c in _group_chans():
+        if getattr(c, "account", None) in (None, account):
+            continue
+        if getattr(c, "account", None) not in GROUP_MEMBERS.get(gid, []):
+            continue
+        for m in mine:
+            alias = c.alias_of.get(getattr(m, "peer_key", m.addr))
+            if not alias:
+                continue
+            c.pending.append(group_blob_update(alias, False, 0, listed=False))
+            rs = c.remotes.get(alias)
+            if rs is not None:
+                rs.popped = False
+            n += 1
+    return n
 
 
 def group_push_flags(account):
@@ -165,7 +214,7 @@ def group_push_flags(account):
     gid = GROUP_OF.get(account)
     if not gid:
         return 0
-    leader = battlegroups.GROUP_CREATOR_ACCOUNT.get(gid) == account
+    leader = battlegroups.group_leader(gid) == account
     flags = group_member_flags(account, gid)
     n = 0
     gchans = [c for k, c in list(WORLD_PEERS.items())
@@ -186,10 +235,168 @@ def group_push_flags(account):
     return n
 
 
+#: KEY: SE'S JOIN RULES (AH/F98/D92 218-220): "While you belong to a platoon
+#: you can neither form a new battle group nor join another one. Leave your
+#: battle group first." / "Nor can you join a platoon that has too many
+#: members." Until 2026-09-30 group_join MOVED the member silently and had no
+#: cap. The refusal codes come from the client's code -> message table at
+#: 0x613955F0 (see battlegroups.CODE_BONUS_FUNDS); the JOIN failure arm
+#: (event 0x10D0 -> 0x61181A4A) draws 9:3 "Failed to join the battle group."
+#: with the code's own line under it:
+JOIN_CODE_IN_GROUP = -14116      # 9:0 "You already belong to a battle group."
+JOIN_CODE_FULL = -30018          # 5:33 "...the battle group is at its member limit."
+JOIN_CODE_COST = -30023          # 5:37 "Your B.G.Cost is too low to join..."
+#: FMO_GROUP_RULES=1 (default): refuse those joins; 0 = the old silent move.
+GROUP_RULES = _env_int("FMO_GROUP_RULES", "1") != 0
+#: FMO_GROUP_CAP: the member limit. SE never printed it; news/frontline/
+#: mission.html:23 calls a battle-map mission "a platoon mission of about ten",
+#: and 3:3 caps a sector sortie at 10 -- so 10, OURS to tune. 0 = no cap.
+GROUP_CAP = _env_int("FMO_GROUP_CAP", "10")
+#: WARNING: A MEMBERSHIP IS ONLY REAL WHILE THE CLIENT HOLDS IT. Our 0x0155
+#: serves no LoginGroup entries, so a relogged client belongs to NO group while
+#: GROUP_OF (in-process) still names the old one. Refusing on that stale row
+#: would lock a pilot out of every group until a restart, with no menu to leave
+#: from. So a membership counts only while that account's group channel was
+#: heard in the last GROUP_LIVE_S seconds, or the join is younger than that
+#: (the channel comes up a few seconds after the 0x0158). Ours.
+GROUP_LIVE_S = 300
+#: {account: monotonic of its last create/join}, for the grace above.
+_joined_at = {}
+
+
+def group_member_live(account, now=None):
+    """True while `account`'s group membership is still held by its client."""
+    now = time.monotonic() if now is None else now
+    if now - _joined_at.get(account, -1e9) <= GROUP_LIVE_S:
+        return True
+    wall = time.time()
+    return any(isinstance(k, tuple) and len(k) == 3 and k[2] == "group"
+               and getattr(c, "account", None) == account
+               and wall - (getattr(c, "seen_at", 0) or 0) <= GROUP_LIVE_S
+               for k, c in list(WORLD_PEERS.items()))
+
+
+#: KEY: A BATTLE GROUP OUTLIVES ITS MEMBERS' LOGOUTS (manual p.42: logging out
+#: does not take you out of your battle group). Our 0x0155 serves no
+#: LoginGroup entries, so a relogged client belongs to no group while
+#: GROUP_MEMBERS still lists it. FMO_GROUP_REATTACH=1 (default): on the
+#: session's first keepalive, a pilot whose group still exists on this
+#: server is attached to it again with the same 0x0174 push a JOIN uses.
+#: Groups live in this process only, so a server restart still ends them.
+GROUP_REATTACH = _env_int("FMO_GROUP_REATTACH", "1") != 0
+
+
+def group_reattach(sess, conn_id):
+    """The 0x0174 that puts `sess`'s pilot back in its battle group after a
+    relog, once per session, or None. The group must still exist (not
+    disbanded) and still list the account."""
+    if not GROUP_REATTACH or getattr(sess, "group_reattach_done", False):
+        return None
+    sess.group_reattach_done = True
+    try:
+        acct = sess.account
+    except Exception:
+        return None
+    gid = GROUP_OF.get(acct) if acct else None
+    if (not gid or acct not in GROUP_MEMBERS.get(gid, [])
+            or battlegroups.group_state(gid) is None):
+        return None
+    if not grouplogin.GROUP_ATTACH:
+        return None
+    # A create/join in the last minute is this very session's: its client is
+    # attached already, and a second attach would tear the connection down.
+    if time.monotonic() - _joined_at.get(acct, -1e9) < 60:
+        return None
+    _joined_at[acct] = time.monotonic()        # live again while it reconnects
+    queue_group_entry(sess.ip, acct)           # its new group channel claims it
+    try:
+        pkt = grouplogin.group_attach_packet(
+            conn_id, gid, host=addressing.host_for(addressing.GROUP_HOST, sess.ip))
+    except ValueError as e:
+        log(f"{sess.peer}   GROUP RE-ATTACH to {gid} not sent: {e}")
+        return None
+    log(f"{sess.peer}   -> 0x{grouplogin.MSG_GROUP_ATTACH:04X} GROUP RE-ATTACH: "
+        f"{acct} is still a member of group {gid} (relogged), attached again")
+    return pkt
+
+
+def group_chat_listeners(chan):
+    """The OTHER members' live group channels for a /bg line sent on group
+    channel `chan`: by ACCOUNT, through GROUP_OF / GROUP_MEMBERS, never by
+    address or room. Empty when `chan` is bound to no account or its account
+    is in no group (the sender still gets its own echo)."""
+    acct = getattr(chan, "account", None)
+    gid = GROUP_OF.get(acct) if acct else None
+    if not gid or acct not in GROUP_MEMBERS.get(gid, []):
+        return []
+    others = set(GROUP_MEMBERS.get(gid, [])) - {acct}
+    wall = time.time()
+    return [c for k, c in list(WORLD_PEERS.items())
+            if isinstance(k, tuple) and len(k) == 3 and k[2] == "group"
+            and c is not chan and getattr(c, "account", None) in others
+            and wall - (getattr(c, "seen_at", 0) or 0) <= GROUP_LIVE_S]
+
+
+#: group_join_refusal's default: look the value up (battlegroups.account_bg_cost
+#: for the joiner, the group's stored create form for Required B.G.Cost).
+AUTO = object()
+
+
+def group_join_refusal(gid, account, cost=AUTO, required=AUTO):
+    """None when `account` may join group `gid`, else (code, why). `cost` /
+    `required` are the joiner's B.G.Cost and the group's Required B.G.Cost;
+    left out they are looked up, and None = unknown, which skips that rule
+    (see battlegroups.pilot_bg_cost)."""
+    if not GROUP_RULES or not gid or not account:
+        return None
+    if required is AUTO:
+        required = int((battlegroups.group_state(gid) or {}).get("required") or 0)
+    if cost is AUTO:
+        # The leader's own form capped Required at its own cost (D92 227),
+        # and a member already in is not joining: neither is judged again.
+        own = (battlegroups.GROUP_CREATOR_ACCOUNT.get(gid) == account
+               or account in GROUP_MEMBERS.get(gid, []))
+        cost = battlegroups.account_bg_cost(account) if required and not own else None
+    old = GROUP_OF.get(account)
+    if (old and old != gid and account in GROUP_MEMBERS.get(old, [])
+            and group_member_live(account)):
+        return JOIN_CODE_IN_GROUP, (f"{account} already belongs to group {old} "
+                                    f"(AH/F98/D92 218: leave it first)")
+    mem = GROUP_MEMBERS.get(gid, [])
+    if account not in mem and GROUP_CAP > 0:
+        live = [a for a in mem if group_member_live(a)]
+        if len(live) >= GROUP_CAP:
+            return JOIN_CODE_FULL, (f"group {gid} already has {len(live)} "
+                                    f"member(s), the limit is {GROUP_CAP} "
+                                    f"(FMO_GROUP_CAP; AH/F98/D92 220)")
+    if cost is not None and required and cost < required:
+        return JOIN_CODE_COST, (f"B.G.Cost {cost} is below the group's Required "
+                                f"B.G.Cost {required} (AH/F98/D92 223-225)")
+    return None
+
+
+def group_create_refusal(account):
+    """None when `account` may create a group, else (code, why): D92 218, a
+    member of a live group cannot form another."""
+    if not GROUP_RULES or not account:
+        return None
+    old = GROUP_OF.get(account)
+    if old and account in GROUP_MEMBERS.get(old, []) and group_member_live(account):
+        return JOIN_CODE_IN_GROUP, (f"{account} already belongs to group {old} "
+                                    f"(AH/F98/D92 218)")
+    return None
+
+
 def group_join(gid, account):
-    """Record `account` as a member of battle group `gid` (and of no other)."""
+    """Record `account` as a member of battle group `gid` (and of no other).
+    False (nothing changed) when group_join_refusal refuses; a STALE
+    membership elsewhere (see GROUP_LIVE_S) is dropped, as before."""
     if not gid or not account:
-        return
+        return False
+    no = group_join_refusal(gid, account)
+    if no is not None:
+        log(f"   GROUP JOIN REFUSED: {account} -> group {gid}: {no[1]} (code {no[0]})")
+        return False
     old = GROUP_OF.get(account)
     if old and old != gid and account in GROUP_MEMBERS.get(old, []):
         GROUP_MEMBERS[old].remove(account)
@@ -197,6 +404,19 @@ def group_join(gid, account):
     if account not in mem:
         mem.append(account)
     GROUP_OF[account] = gid
+    _joined_at[account] = time.monotonic()
+    return True
+
+
+def group_leave(account):
+    """0x0172 LEAVE / a kick: `account` belongs to no group any more.
+    Returns the group it left, or None."""
+    gid = GROUP_OF.pop(account, None)
+    if gid is not None and account in GROUP_MEMBERS.get(gid, []):
+        GROUP_MEMBERS[gid].remove(account)
+    GROUP_READY.pop(account, None)
+    _joined_at.pop(account, None)
+    return gid
 
 
 def group_member_row(account):
@@ -252,6 +472,8 @@ def group_queue(chan):
     if not (room.PEER_LINK and chan.key == GROUP_KEY and chan.tables
             and getattr(chan, "group_popped", False)):
         return 0
+    if getattr(chan, "mission_type", None):
+        return 0                # a mission-group connection (missiongroups)
     gid = GROUP_OF.get(getattr(chan, "account", None))
     if not gid:
         return 0
@@ -277,7 +499,7 @@ def group_queue(chan):
             host = socket.gethostbyname(host)
         except OSError:
             continue
-        leader = battlegroups.GROUP_CREATOR_ACCOUNT.get(gid) == acct
+        leader = battlegroups.group_leader(gid) == acct
         chan.pending.append(group_remote_member_record(
             alias, first, last, leader, GROUP_KEY, rs.tag, host, addressing.GROUP_PORT,
             flags=group_member_flags(acct, gid)))
@@ -328,6 +550,6 @@ GROUP_POP_KEY = int(os.environ.get("FMO_UDP_GROUP_KEY", "0").strip() or "0", 0)
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    addressing, battlegroups, charstore, identity, missionblock, popnation, room, roomrelay,
-    worldchannel,
+    addressing, battlegroups, charstore, grouplogin, identity, missionblock, popnation, room,
+    roomrelay, worldchannel,
 )

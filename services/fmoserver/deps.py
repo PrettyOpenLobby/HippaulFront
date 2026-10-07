@@ -75,6 +75,14 @@ try:
 except ImportError:                                  # pragma: no cover
     fmolayout = fmodevtool = fedevtool = None
 
+try:
+    # The story gates tool (fmogates.py): the flag/rank catalogue and its
+    # page, served on the same tool port. Optional: absent, the port serves
+    # the NPC editor alone.
+    import fmogates
+except ImportError:                                  # pragma: no cover
+    fmogates = None
+
 
 def flat_globals():
     """What `globals()` meant in the single-file fmo.py: every top-level

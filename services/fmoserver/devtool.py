@@ -72,7 +72,7 @@ def devtool_start():
             lambda band=None, qs=None: fmodevtool.build_state(
                 devtool_ctx(), band, want_plan=bool(qs and qs.get("plan"))),
             lambda op: fmodevtool.apply_edit(devtool_ctx(), op),
-            page=fmodevtool.PAGE, name="fmo-devtool")
+            page=fmodevtool.PAGE, name="fmo-devtool", routes=gatetool.routes())
     except SystemExit as e:
         log(f"WARNING: lobby NPC editor REFUSED to start: {e} -- the world door "
             f"serves without it")
@@ -88,11 +88,12 @@ def devtool_start():
     log(f"VERIFIED: lobby NPC editor ON: http://{bind}:{port}/"
         f"{'?t=<FMO_DEVTOOL_TOKEN>' if token else ''} -- layout file "
         f"{npccast.NPC_LAYOUT.path} ({', '.join(bands) if bands else 'no bands yet: every band is served from the env'}); "
-        f"floor plans ship for maps {fmolayout.plans_available()}")
+        f"floor plans ship for maps {fmolayout.plans_available()}; story gates at /gates"
+        f"{'' if gatetool.fmogates else ' UNAVAILABLE (fmogates did not import)'}")
     return srv
 
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    areachange, groupchannel, move, npccast, npcroster, popsweep, rooms, zoneentry,
+    areachange, gatetool, groupchannel, move, npccast, npcroster, popsweep, rooms, zoneentry,
 )

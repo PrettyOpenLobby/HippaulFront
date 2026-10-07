@@ -137,9 +137,14 @@ def _main(db):
             509: {94099: 0, 94101: 0, 103100: 0}, 513: {112101: 0}}
     w.seed_from_sectors(fake, force=True)
     s = boardfmo.snapshot(now=mid)
-    check("a freshly seeded map: the cities on file are Deadlock, nothing changed hands",
+    # 2026-09-30: the two fortresses open a phase held by their own side
+    # (fmowar.War.opening: only the LOSER's fortress starts Deadlock, and on a
+    # tie both keep theirs); every other city opens Deadlock
+    _fort = {t: n for n, t in fmowar.FORTRESS.items()}
+    check("a freshly seeded map: the cities are Deadlock but for each side's own "
+          "fortress, nothing changed hands",
           s["war"]["present"] and s["war"]["changed"] == 0
-          and all(c["nation"] == 0 for c in s["cities"])
+          and all(c["nation"] == _fort.get(c["tile"], 0) for c in s["cities"])
           and boardfmo.status_text(s) == "No sector has changed hands this phase")
     w.settle(69118, fmowar.OCU, won=True, now=mid)          # prod's shape: a win that only fills the counter
     s = boardfmo.snapshot(now=mid)
@@ -272,6 +277,40 @@ def _main(db):
               files and files[0][0] == "fmo-city-control.png" and files[0][2][:4] == b"\x89PNG"
               and e["image"]["url"] == "attachment://fmo-city-control.png")
     check("no em dashes in anything posted", chr(0x2014) not in json.dumps(payload, ensure_ascii=False))
+
+    print("Discord: the Coliseum post (/fmoboard arenas)")
+    import calendar
+    import fmoarena
+    sat = calendar.timegm((2026, 10, 10, 11, 30, 0))         # Saturday 20:30 JST
+    _rs = fmoarena.read_state
+    fmoarena.read_state = lambda: {"hosted": {
+        "1003": {"id": 1003, "name": "Iron Cup", "promoter": "Ned.Arena", "format": 2,
+                 "headcount": 3, "req_bgs": 8, "bg_cost": 5, "fee": 9000,
+                 "start": sat + 600, "end": sat + 7800, "sub_rule": 2,
+                 "weapons": [0] * 9 + [1, 1, 1, 0], "bps": [0] * 12},
+        "1004": {"id": 1004, "name": "Done", "end": sat - 5}}}
+    try:
+        ar = boardfmo.arenas(sat)
+        apay, _af = boardfmo.discord_arenas_bot_message({"arenas": ar, "updated": sat}, args)
+    finally:
+        fmoarena.read_state = _rs
+    ad = apay["embeds"][0]["description"]
+    check("the officials carry the hour's cost and the day's rules, to midnight JST",
+          [(a["bg_cost"], a["rules"]) for a in ar["official"]]
+          == [(4, "Sudden Death"), (4, "Sudden Death"), (4, "Heavy Mobile Weapon Orders")]
+          and ar["next_change"] == calendar.timegm((2026, 10, 10, 15, 0, 0)), ar["official"])
+    check("a hosted arena is listed with its fee, prize and start; an ended one is not",
+          [a["id"] for a in ar["hosted"]] == [1003]
+          and "**Iron Cup** by Ned.Arena - tournament for 8 BGs of 3" in ad
+          and "prize H$ 18,000 per win" in ad and "<t:%d:R>" % (sat + 600) in ad
+          and "banned: Knuckle, Rod, Pile Bunker" in ad, ad)
+    check("the feed is /fmoboard arenas, one message edited in place",
+          polboards.feed_names(boardfmo, "fmo").get("arenas") == "fmo_arenas"
+          and polboards.feed_fn(boardfmo, "arenas", "bot_message") is not None
+          and "arenas_sig" in snap and "arenas" in snap)
+    check("...and nothing in it pings or uses an em dash",
+          apay["allowed_mentions"] == {"parse": []}
+          and chr(0x2014) not in json.dumps(apay, ensure_ascii=False))
     net = FakeNet()
     d = polboards.Discord("fmo", hook, state, every=60, ttl=600, refresh=1800, opener=net)
     build = lambda: boardfmo.discord_message(snap, args)        # noqa: E731

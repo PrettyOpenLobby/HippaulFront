@@ -111,6 +111,12 @@ def mission_record_fill(body, rec, mid, name, fields=None):
     raw = str(name).encode("cp932", "replace")[:ML_NAME_MAX - 1]
     body[rec + ML_NAME:rec + ML_NAME + len(raw)] = raw
     for off, val in (fields or {}).items():
+        if isinstance(val, str):
+            # an order row's commander / assignee name (+0x44 / +0x74), cut
+            # so the NUL stays inside its 0x20 bytes
+            raw = val.encode("cp932", "replace")[:missionboard.ROW_NAME_MAX - 1]
+            body[rec + off:rec + off + len(raw)] = raw
+            continue
         struct.pack_into("<I", body, rec + off, int(val) & 0xFFFFFFFF)
 
 

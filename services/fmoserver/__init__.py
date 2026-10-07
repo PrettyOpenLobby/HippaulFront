@@ -84,6 +84,8 @@
                       ended, resupply.
     trade.py          Player trade: the trade messages, records and the trade service between
                       two pilots.
+    coliseum.py       The Coliseum: the arena desks (list, register, cancel, host, the bracket and
+                      streak board), official and player-hosted arenas, the waiting window.
     pilotrecord.py    Session's pilot record: money, class experience, flags, passes, salary,
                       the ceasefire bonus and the officer review.
     settlement.py     Session's battle settlement: kill bonuses, mission and war results, the
@@ -116,6 +118,8 @@
                       to an account, serve_udp.
     groupchannel.py   Battle groups on the world channel: members, the Player List, group
                       sorties and member blobs.
+    missiongroups.py  Mission groups (Playing Manual p.61): the 0x0174 attaches for a derived
+                      mission's issuer and takers, their connections, /mgl and /mgm.
     rooms.py          Rooms: who stands in the same zone, arrivals and departures, battle rooms.
     squad.py          The enemy squad the client runs: squad owners, positions, the fire and hit
                       relays and kill credit.
@@ -127,6 +131,15 @@
                       triggers, kill credit.
     datagram.py       _serve_datagram: one inbound world-channel datagram, decoded and answered.
     devtool.py        The lobby NPC editor hook (FMO_DEVTOOL_PORT).
+    gatetool.py       The story gates tool's live side: pilots, online sessions, queued edits.
+    loot.py           Spoils: the battle group's loot window after a win (group cmds 214/215,
+                      the Need/Want/Pass choices) and the items it grants (0x016B).
+    penalty.py        Friendly-fire penalty points and retraining: the 0x017B report, the 0x017C
+                      vote, the three script bytes (+0x418..+0x41A) and the retraining wins.
+    solo.py           The solo area (SE's Festa 2006 rules): one NPC ally at a time, two
+                      enemies at a time, ten kills win, three allies lost lose.
+    defection.py      Defection (Change Nations): who may change nations, the refusal the
+                      client shows, and what a defection costs the pilot.
     main.py           run(): the listeners, the startup log and the background threads.
     selftests.py      The offline selftest (`python fmo.py --selftest`): no socket, no client.
 
@@ -145,8 +158,9 @@ from . import (
     battlemaps, battlegroups, grouplogin, withdraw, scriptcall, resultpush, battleend,
     lobbymessage, timesync, pushes, trade, msgnames, pilotrecord, settlement, session,
     tcpserver, community, udpconfig, popnames, poplook, popnation, popparts, battlepop, npccast,
-    npcroster, room, worldchannel, groupchannel, rooms, squad, roomrelay, peerlink, referee,
-    datagram, devtool, main, selftests,
+    npcroster, room, worldchannel, groupchannel, missiongroups, rooms, squad, roomrelay, peerlink,
+    referee,
+    datagram, devtool, gatetool, loot, penalty, solo, defection, main, selftests,
 )
 
 __all__ = [
@@ -160,6 +174,6 @@ __all__ = [
     'lobbymessage', 'timesync', 'pushes', 'trade', 'pilotrecord', 'settlement', 'session',
     'tcpserver', 'community', 'udpconfig', 'popself', 'popnames', 'poplook', 'popnation',
     'popparts', 'popsweep', 'battlepop', 'npccast', 'npcroster', 'room', 'worldchannel',
-    'groupchannel', 'rooms', 'squad', 'roomrelay', 'peerlink', 'referee', 'datagram', 'devtool',
-    'main', 'selftests',
+    'groupchannel', 'missiongroups', 'rooms', 'squad', 'roomrelay', 'peerlink', 'referee', 'datagram', 'devtool',
+    'gatetool', 'loot', 'penalty', 'solo', 'defection', 'main', 'selftests',
 ]

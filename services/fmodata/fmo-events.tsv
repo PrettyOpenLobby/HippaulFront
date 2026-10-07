@@ -14,12 +14,14 @@ event	p1	answer	set	note
 #           <expr> = int | pM | flag[pM] | flag[<idx>]  (the pilot's flag byte)
 #   set     FMO_STATUS_FLAGS grammar on the pilot's flags: 128=99 (byte), 173
 #           (bit); pM is allowed as an index, so p1=99 = "set the byte the
-#           script named to 99"
+#           script named to 99"; @step / @report are the mission steps
+#           (scriptcall.MISSION_SCRIPT_STEPS): run first, only on a catalogue
+#           mission's own byte, and they write the answer themselves
 #   note    free text, logged when the row fires
 # A row that changes nothing for a pilot is a plain ack. Rows starting with #
-# are comments. There are NO active rows shipped: every candidate below is
-# INFERRED from the captures + the missions table and enabling one is a live
-# test whose bar is the script's next branch, not the log line.
+# are comments. Every active row below is INFERRED from the scripts' call sites
+# (not from a server capture); its live bar is the script's next branch, not
+# the log line.
 #
 # The helper library (D87/D63/D65 0x740..) classifies the events by whether the script
 # READS the answer (fmoscriptdis, 2026-09-11):
@@ -39,9 +41,35 @@ event	p1	answer	set	note
 #   205  [34, 104, 130]   the senior sergeant (tag_senior / registration)
 #   102  [0, row, col, a, b]  a sector (row*1000+col tile) -- the war map
 #
-# Candidates (uncomment ONE, recreate fmo, talk to the NPC, read the branch):
-#104	*	p1=flag[p1]		answer a mission's progress byte (0 = not started, 99 = done)
-# ARMED 2026-09-11 (live test): a pilot whose byte 128 != 99 talks to the sergeant -> the
-# answered 0x015A carries 128=99 -> the next counter talks. Existing pilots already at 99
-# get a plain ack (the row changes nothing for them).
-205	*		128=99	the sergeant registers the pilot (byte 128 == 99 is every counter's gate)
+# 2026-09-30, 104 and 105 (SCP bytecode, fmogates' decoder; scriptcall.py
+# MISSION_SCRIPT_STEPS has the addresses). PROVED: no caller reads the answered
+# p1 of either; srv_105 reads p2 and p2 != 0 makes the client announce the
+# mission's rewards. 104 comes on byte 0 after the offer scene and from
+# LobbySally on byte 1 with the sortie on the mission's tile; 105 comes on byte
+# 3 after the clear scene. INFERRED: 104 = accept (0 -> 1) / sortied (1 -> 2),
+# 105 = report (3 -> 99), p2 = 0 because nothing here grants the reward. The
+# return from a sortie moves 1/2 to 3 (progress.py). Byte 128 (registration)
+# steps through the same rows and is reported from 2 (scriptcall.REGISTRATION_BYTE).
+# 2026-10-01: 105 answers p2 = 1 when the byte has a reward (fmo-gates.json
+# rewards, SE's reward routine), which plays the "Obtained ... / Earned NH$"
+# lines; the session pays the money and the OC pass (FMO_MISSION_REWARD=0 = old
+# behaviour). To go back: comment both.
+104	*		@step	a mission's accept (byte 0 -> 1) or its sortie (1 -> 2); 128 the same
+105	*		@report	a mission's report after the clear scene (3 -> 99; 128: 2 -> 99) and its reward
+# 2026-09-11 to 09-30 this file armed `205 * 128=99`. The gate catalogue
+# (fmo-gates.json server_events, every call site in the SCP scripts) shows 205 is
+# not the sergeant's registration: it carries a BIT id (34 the sergeant, 42 the
+# base-life arc, 43/56/57 Harada's arc, 112 Forster/Miller, 120/128 the
+# Hunt Down / Destroy the Rebels briefings) and 200 does the same (16 Map
+# Selector, 32 training ground).
+# 2026-10-01: 201 is not a byte-128 write either. The First Sergeant (0x8074)
+# sends 201 [active job] (1 Assault, 2 Missiler, 3 Mechanic) and then 104 [128]
+# on byte 128 == 0, and his own switch only knows 0 / 1 / 2 / 99, so the
+# 09-30 row `201 * 128=p1` parked every new pilot on a job number that no
+# script ever moved to 99. Byte 128 now moves through 104/105 like a mission
+# (scriptcall.REGISTRATION_BYTE): 104 0 -> 1 at the sergeant, 1 -> 2 at the
+# training-success scene 0x8084, 105 2 -> 99 when he says "cleared to sortie".
+# 201 is a plain ack. To go back: restore `201	*		128=p1`.
+200	*		p1	a script marks flag bit p1 (Map Selector 16, training ground 32)
+201	*			the training job the sergeant picked (1..3); nothing to store
+205	*		p1	a script marks flag bit p1 (34 the sergeant, story arcs 42..128)

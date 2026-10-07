@@ -23,8 +23,10 @@ STATE OF PROOF (2026-09-12), stated plainly:
     carries the id and nothing else, which the client reads as "no data".
   * The RULES are SE's own, from the archived site (audited 2026-09-12,
     the war-phase and control-rate pages): a 制圧カウンター of wins before the
-    control rate ticks, PC wins moving it more than NPC wins, control
-    flipping when the rate is driven to zero, ~2-month phases judged at
+    control rate ticks, PC wins moving it more than NPC wins, a loss
+    moving it back, a sector driven to zero going neutral (Deadlock) before
+    it changes hands, lower caps on fortresses and bases, a frontline reset
+    when a new phase starts (rules added 2026-09-30), ~2-month phases judged at
     12:00 on the 1st with a ceasefire until the 5th. The NUMBERS (counter
     cap, tick size) are knobs with labelled defaults, not SE's -- SE never
     published them.
@@ -72,6 +74,56 @@ RATE_STEP = int(os.environ.get("FMO_WAR_RATE_STEP", "20") or 20)
 PHASE1_START = os.environ.get("FMO_WAR_PHASE1", "2026-09-05").strip() or "2026-09-05"
 
 
+def _env_int(name, default):
+    """int() of an env knob, EMPTY = UNSET. The same guard as
+    fmoserver/knobs._env_int, repeated here because this module stays
+    import-light (importing the fmoserver package pulls in the whole server)."""
+    return int(os.environ.get(name, "").strip() or str(default), 0)
+
+
+#: FMO_WAR_LOSS -- A LOSS LOWERS THE LOSER'S CONTROL RATE. SE's tutorial
+#: (AI/F00/D08 78): 「制圧率はセクターごとに存在し、勝利すると制圧率が上昇、
+#: 敗北することで制圧率が減少します」. A battle lost against NPCs fills the
+#: ENEMY's counter by this weight, as if the NPC side had won it (NPC wins
+#: weigh 1, SE 050815: 「NPC戦の制圧カウンター変動値を、PC戦と比較して更に
+#: 小さく」). A PvP loss moves nothing here: the winners' own settles already
+#: moved it, at double weight. 0 = the old rule, a loss changes nothing.
+#: The weight is ours, to tune.
+LOSS_WEIGHT = _env_int("FMO_WAR_LOSS", 1)
+#: FMO_WAR_NEUTRAL -- A SECTOR CHANGES HANDS THROUGH NEUTRAL. SE's manual
+#: supplement (guide/addmanual.html 93): selecting a sector on the war map
+#: cycles its holder 「敵軍→中立→自軍」, and the neutral state is Deadlock
+#: (guide/phase: 「Deadlock状態(いずれの陣営にも制圧されていない状態)」;
+#: systext 10:33..35 O.C.U. Control / U.S.N. Control / Deadlock). So a rate
+#: driven to 0 leaves the sector Deadlock (nation 0), and only the NEXT full
+#: counter hands it to the winner at one step. On the kind-7 record this is
+#: the `nation` sign 0 we already write for Deadlock; which raw byte the
+#: client draws as "Deadlock" is not read yet (FMO_WAR_MAP is unbound), so
+#: 0 is our encoding, not a proven one. 0 = the old straight flip.
+NEUTRAL = _env_int("FMO_WAR_NEUTRAL", 1) != 0
+#: FMO_WAR_FACILITY_CAP -- the control-rate CAP of a fortress or base, in
+#: percent (every other sector caps at 100). SE, update 050815:
+#: 「制圧カウンター上限値を各セクターに応じて引き下げ…更に、要塞・戦略拠点の
+#: 制圧率上限を引き下げたことで、より少ない勝利数でセクターを制圧することが
+#: 可能となります」. SE gave no number; 60 is ours, to tune, and it is the value
+#: that reproduces SE's own worked example (topics 0906mission): a radar base
+#: fully held by the enemy stops its radar after ONE stage 「制圧率を一段階
+#: 変動させるだけで」 and becomes ours after 「さらに三段階」 -- 60 -> 40 (radar
+#: off), 40 -> 20, 20 -> Deadlock, Deadlock -> ours at 20: 1 + 3 steps of
+#: RATE_STEP 20. An ordinary city at 100 needs 6, SE's 「三段階以上」.
+#: 0 = no per-sector cap (every sector at 100, the old rule).
+FACILITY_CAP = _env_int("FMO_WAR_FACILITY_CAP", 60)
+#: FMO_WAR_PHASE_RESET -- A NEW PHASE RESETS THE FRONTLINE. SE (guide/phase):
+#: 「激戦区の戦局図は、新たなフェイズの開始と同時にリセットされます」, and the
+#: 2006-06-05 notice (polnews news7740): 「停戦に伴い、激戦区セクター状況を
+#: 初期化しました。なお初期化に伴い、停戦時に実行中のエリアミッションはすべて
+#: 自動的に失敗となります」 with the loser's fortress starting Deadlock. At the
+#: start of phase N >= 2 every frontline sector goes back to its opening
+#: state, once. 0 = the old rule (the frontline carries over; only the
+#: loser's fortress changes).
+PHASE_RESET = _env_int("FMO_WAR_PHASE_RESET", 1) != 0
+
+
 #: KEY: THE ECONOMIC CITIES -- SE's phase page (guide/phase.html, audit §A2) lists
 #: nineteen with 2-4 control points; the score at judgement is the sum held.
 #: Each maps to ONE sector of the frontline zones by its 『』 place name in
@@ -110,6 +162,39 @@ def city_rows():
 #: table, and the war map asks for exactly these tiles as its zone extras
 #: (0x6118C6BF..: 903094099 / 903103100).
 FORTRESS = {OCU: 94099, USN: 103100}
+#: KEY: THE FORTRESSES AND BASES of the three live frontline zones (505, 509,
+#: 513), every ARE row whose 『』 name is a 要塞 or a 基地, read out of the
+#: decoded ARE sector table (2026-09-30): tile -> "selector:row name". SE's 050815 note lowers the cap
+#: of 「要塞・戦略拠点」; which facilities SE counted as 戦略拠点 is not
+#: published, so every base is in (ours). Frontline tiles are shared with no
+#: other selector, so the tile alone names the sector.
+FACILITY = {
+    85098: "505:8 対空ミサイル基地", 85104: "505:14 防衛基地",
+    87102: "505:26 防衛基地", 88103: "505:34 戦略ミサイル基地",
+    89101: "505:39 防衛基地", 90098: "505:43 仮設駐屯基地",
+    90100: "505:45 レーダー基地", 91099: "505:51 防衛基地",
+    91100: "505:52 対空防衛基地", 91103: "505:55 レーダー基地",
+    91104: "505:56 防衛基地", 92103: "505:62 仮設駐屯基地",
+    94099: "509:2 要塞", 97103: "509:27 レーダー基地",
+    98104: "509:35 対空ミサイル基地", 99099: "509:37 レーダー基地",
+    100102: "509:47 レーダー基地", 100104: "509:49 対空防衛基地",
+    103100: "509:66 要塞", 104100: "513:3 対空ミサイル基地",
+    105099: "513:9 防衛基地", 106098: "513:15 仮設駐屯基地",
+    106100: "513:17 レーダー基地", 106103: "513:20 仮設駐屯基地",
+    107101: "513:25 防衛基地", 107103: "513:27 レーダー基地",
+    107104: "513:28 防衛基地", 110101: "513:46 防衛基地",
+    110103: "513:48 戦略ミサイル基地", 112099: "513:58 対空防衛基地",
+    112103: "513:62 防衛基地", 113098: "513:64 レーダー基地",
+    113101: "513:67 モーガン要塞",
+}
+
+
+def control_cap(tile):
+    """The highest control rate `tile` can reach: FACILITY_CAP for a
+    fortress or base (SE 050815), else 100. Never below one RATE_STEP."""
+    if FACILITY_CAP and int(tile) in FACILITY:
+        return max(RATE_STEP, min(100, FACILITY_CAP))
+    return 100
 #: FMO_WAR_SEED -- how a sector with no history starts, by its zone KIND
 #: (selector // 100: 1 O.C.U. control, 2 O.C.U. occupied, 3 U.S.N. control,
 #: 4 U.S.N. occupied, 5 frontline): (nation, control %). SE's opening map is
@@ -283,6 +368,8 @@ class War:
         self.data = {"sectors": {}, "phases": {}, "log": []}
         self.present = False            # was there a stored state
         self.updated_at = None          # when it was last written (epoch s)
+        self.frontline = set()          # kind-5 tiles seeding saw (not stored)
+        self.resets_now = []            # [(phase, record)] the last tick reset
         if load:
             self.load()
 
@@ -321,39 +408,61 @@ class War:
         that side won. Returns (sector, what changed) -- a string for the log.
 
         SE's shape: wins fill a per-sector counter; when it reaches the cap
-        the control rate moves by a step toward the winner; a rate driven to
-        0 flips the sector to the winner at one step. A loss changes
-        nothing here (the winner's own settle moves it). During a ceasefire
-        nothing moves ("停戦期間の戦闘結果は…一切影響しません")."""
+        the control rate moves by a step toward the winner. A loss against
+        NPCs fills the ENEMY's counter (LOSS_WEIGHT, AI/F00/D08 78). A rate
+        driven to 0 leaves the sector neutral, Deadlock, and the next full
+        counter hands it to the winner at one step (NEUTRAL, addmanual 93:
+        「敵軍→中立→自軍」). A fortress or base caps at FACILITY_CAP (050815).
+        During a ceasefire nothing moves ("停戦期間の戦闘結果は…一切影響しません")."""
         s = self.sector(tile)
         n = int(nation)
-        if n not in NATIONS or not won:
-            return s, "no change (%s)" % ("a loss" if not won else "no nation")
+        if n not in NATIONS:
+            return s, "no change (no nation)"
         _, _, _, _, ceasefire = phase_at(now)
-        s["wins"][str(n)] = s["wins"].get(str(n), 0) + 1
+        if won:
+            s["wins"][str(n)] = s["wins"].get(str(n), 0) + 1
+            mover, weight = n, (2 if pvp else 1)
+        else:
+            lost = s.setdefault("losses", {"1": 0, "2": 0})
+            lost[str(n)] = lost.get(str(n), 0) + 1
+            if not LOSS_WEIGHT or pvp:
+                self.save()
+                return s, ("no change (a loss%s)" % (
+                    " in PvP: the winners' own settles move the counter" if LOSS_WEIGHT
+                    else "; FMO_WAR_LOSS=0"))
+            # the side that beat us: the enemy's counter fills, as an NPC win
+            mover, weight = (USN if n == OCU else OCU), LOSS_WEIGHT
         if ceasefire:
-            return s, "ceasefire: win recorded, control untouched"
-        weight = 2 if pvp else 1
-        c = s["counter"].get(str(n), 0) + weight
+            self.save()
+            return s, "ceasefire: %s recorded, control untouched" % ("win" if won else "loss")
+        c = s["counter"].get(str(mover), 0) + weight
         if c < COUNTER_CAP:
-            s["counter"][str(n)] = c
+            s["counter"][str(mover)] = c
             s["updated"] = int(now or _now())
             self.save()
-            return s, "counter %d/%d for nation %d" % (c, COUNTER_CAP, n)
-        s["counter"][str(n)] = 0
+            return s, "counter %d/%d for nation %d%s" % (
+                c, COUNTER_CAP, mover, "" if won else " (nation %d's loss)" % n)
+        s["counter"][str(mover)] = 0
         before = (s["nation"], s["control"])
-        if s["nation"] == n:
-            s["control"] = min(100, s["control"] + RATE_STEP)
+        cap = control_cap(tile)
+        if s["nation"] == mover:
+            s["control"] = min(cap, s["control"] + RATE_STEP)
         elif s["nation"] in NATIONS:
-            s["control"] -= RATE_STEP
+            s["control"] = min(cap, s["control"]) - RATE_STEP
             if s["control"] <= 0:
-                s["nation"], s["control"] = n, RATE_STEP
-        else:                                     # nobody held it: Deadlock -> the winner
-            s["nation"], s["control"] = n, RATE_STEP
-        s["deadlock"] = False
+                if NEUTRAL:                       # enemy -> neutral (Deadlock)
+                    s["nation"], s["control"] = 0, 0
+                else:                             # the old straight flip
+                    s["nation"], s["control"] = mover, min(cap, RATE_STEP)
+        else:                                     # neutral (Deadlock) -> the winner
+            s["nation"], s["control"] = mover, min(cap, RATE_STEP)
+        s["deadlock"] = s["nation"] not in NATIONS
         s["updated"] = int(now or _now())
         self.save()
-        return s, "control %s -> (%d, %d%%)" % (before, s["nation"], s["control"])
+        return s, "control %s -> (%d, %d%%)%s%s" % (
+            before, s["nation"], s["control"],
+            " NEUTRAL (Deadlock)" if s["deadlock"] else "",
+            "" if won else " on nation %d's loss" % n)
 
     def sign(self, tile):
         """+1 O.C.U., -1 U.S.N., 0 Deadlock -- what 10:33..35 draw from."""
@@ -373,14 +482,17 @@ class War:
                        key=lambda kv: (kv[0] // 100 == 5, kv[0]))
         for selector, rows in order:
             kind = int(selector) // 100
+            if kind == 5:
+                # the frontline, remembered for the phase reset
+                self.frontline.update(int(t) for t in rows)
             if kind not in SEED_BY_KIND:
                 continue
-            nation, control = SEED_BY_KIND[kind]
             for tile in rows:
                 key = str(int(tile))
                 if key in self.data["sectors"]:
                     continue
                 s = self.sector(tile)
+                nation, control = self.opening(tile, kind)
                 s["nation"], s["control"] = nation, control
                 s["deadlock"] = nation == 0
                 s["seeded"] = "kind %d" % kind
@@ -388,6 +500,60 @@ class War:
         if n:
             self.save()
         return n
+
+    @staticmethod
+    def opening(tile, kind):
+        """(nation, control) a sector opens a phase with. SEED_BY_KIND by zone
+        kind, except the two Freedom City fortresses, which open held by
+        their own side at their cap: SE's penalty is that the LOSER's
+        fortress starts Deadlock (guide/phase), and on a tie 「両軍とも要塞を
+        放棄することなく同条件で国境が再設定されます」, so unpenalised they
+        start held."""
+        for nat, t in FORTRESS.items():
+            if int(tile) == t and int(kind) == 5:
+                return nat, control_cap(t)
+        return SEED_BY_KIND[int(kind)]
+
+    def frontline_tiles(self):
+        """Every frontline (kind 5) tile this war knows: the ones seeding saw,
+        the ones seeded as kind 5 on file, and the cities, fortresses and
+        facilities (all of them frontline sectors)."""
+        out = set(self.frontline) | set(CITIES) | set(FORTRESS.values()) | set(FACILITY)
+        for key, s in self.data["sectors"].items():
+            if s.get("seeded") == "kind 5":
+                out.add(int(key))
+        # a tile seeded by another kind is not the frontline's to reset
+        return {t for t in out
+                if (self.data["sectors"].get(str(t)) or {}).get("seeded", "kind 5") == "kind 5"}
+
+    def reset_frontline(self, pn, at):
+        """SE: the frontline goes back to its opening state when phase `pn`
+        starts; the previous phase's loser's fortress starts Deadlock. Returns
+        the record kept under data["resets"][pn]."""
+        prev = self.data["phases"].get(str(pn - 1)) or {}
+        pen = prev.get("penalty") or {}
+        n = 0
+        for tile in sorted(self.frontline_tiles()):
+            if str(tile) not in self.data["sectors"] and tile not in FORTRESS.values():
+                continue                         # never touched: already its opening
+            s = self.sector(tile)
+            nation, control = self.opening(tile, 5)
+            if pen and int(pen.get("tile") or 0) == tile:
+                nation, control = 0, 0           # the loser's fortress: Deadlock
+            s["nation"], s["control"] = nation, control
+            s["deadlock"] = nation == 0
+            s["counter"] = {"1": 0, "2": 0}
+            s["reset"] = int(pn)
+            s["updated"] = int(at)
+            n += 1
+        return {"at": int(at), "sectors": n, "penalty": pen or None}
+
+    def frontline_reset_at(self):
+        """When the frontline was last reset (the start of that phase, epoch
+        s), or 0. SE (news7740): area missions running at the reset fail, so
+        an area accept older than this is failed; the mission book reads it."""
+        return max([int(r.get("at") or 0) for r in (self.data.get("resets") or {}).values()]
+                   or [0])
 
     # ---- the phase --------------------------------------------------------
     def score(self):
@@ -429,7 +595,22 @@ class War:
                 rec["penalty"] = {"nation": loser, "tile": FORTRESS[loser]}
             self.data["phases"][key] = rec
             judged.append((pn, rec))
-        if judged:
+        # SE: the frontline resets when a NEW phase starts (guide/phase,
+        # news7740), after the judgement above has named the loser. Phase 1
+        # is the war's opening, never a reset. Phases skipped while the
+        # server was down collapse into one reset at the current phase's
+        # start, and each is recorded so none runs twice.
+        self.resets_now = []
+        if PHASE_RESET and n >= 2:
+            done = self.data.setdefault("resets", {})
+            todo = [pn for pn in range(2, n + 1) if str(pn) not in done]
+            if todo:
+                rec = self.reset_frontline(n, start)
+                for pn in todo:
+                    done[str(pn)] = rec if pn == n else {"at": int(start), "sectors": 0,
+                                                         "superseded_by": n}
+                self.resets_now.append((n, rec))
+        if judged or self.resets_now:
             self.save()
         return judged
 
@@ -506,10 +687,22 @@ def selftest():
     for _ in range(3):
         w.settle(69118, USN, won=True, now=mid)
     s = w.sector(69118)
-    check("the enemy's full counter drives the rate down; at 0 the sector flips",
+    check("the enemy's full counter drives the rate down; at 0 the sector goes "
+          "NEUTRAL (Deadlock), not straight across (addmanual 93)",
+          s["nation"] == 0 and s["deadlock"] and w.sign(69118) == 0)
+    for _ in range(3):
+        w.settle(69118, USN, won=True, now=mid)
+    s = w.sector(69118)
+    check("the next full counter hands the neutral sector over at one step",
           s["nation"] == USN and s["control"] == RATE_STEP and w.sign(69118) == -1)
     _, what = w.settle(69118, OCU, won=False, now=mid)
-    check("a loss changes nothing", "no change" in what and w.sector(69118)["nation"] == USN)
+    check("an NPC loss fills the ENEMY's counter (AI/F00/D08 78)",
+          "loss" in what and w.sector(69118)["counter"]["2"] == 1
+          and w.sector(69118)["losses"]["1"] == 1)
+    _, what = w.settle(69118, OCU, won=False, pvp=True, now=mid)
+    check("a PvP loss moves nothing (the winners' settles do)",
+          "no change" in what and w.sector(69118)["counter"]["2"] == 1)
+    w.sector(69118)["counter"]["2"] = 0
     _, what = w.settle(69118, OCU, won=True, now=_ts(2026, 11, 2))
     check("a ceasefire win is recorded but moves no counter",
           "ceasefire" in what and w.sector(69118)["counter"]["1"] == 0
@@ -561,6 +754,51 @@ def selftest():
     check("the nineteen cities and both fortresses are distinct tiles",
           len(CITIES) == 19 and sum(p for _n, p, _w in CITIES.values()) == 66
           and FORTRESS[OCU] not in CITIES and FORTRESS[USN] not in CITIES)
+    check("seeding opens each Freedom City fortress held by its own side at its cap",
+          w4.sector(FORTRESS[OCU])["nation"] == OCU
+          and w4.sector(FORTRESS[OCU])["control"] == control_cap(FORTRESS[OCU]))
+
+    # per-sector caps (050815) and the 0906mission radar-base arithmetic
+    w5 = War(autosave=False, load=False)
+    w5.data = {"sectors": {}, "phases": {}, "log": []}
+    for t, cap in ((90100, control_cap(90100)), (85102, 100)):   # radar base, city
+        s = w5.sector(t)
+        s["nation"], s["control"] = USN, cap
+    steps = {}
+    for t in (90100, 85102):
+        k = 0
+        while w5.sector(t)["nation"] != OCU and k < 20:
+            for _ in range(COUNTER_CAP):
+                w5.settle(t, OCU, won=True, now=mid)
+            k += 1
+        steps[t] = k
+    check("a fully enemy radar base is ours in 1 + 3 steps (0906mission), a city in 6",
+          (not FACILITY_CAP or steps[90100] == 4) and steps[85102] == 6)
+    for _ in range(COUNTER_CAP * 5):
+        w5.settle(90100, OCU, won=True, now=mid)
+    check("a base never climbs past its cap", w5.sector(90100)["control"] == control_cap(90100))
+
+    # the phase reset (guide/phase, news7740)
+    w6 = War(autosave=False, load=False)
+    w6.data = {"sectors": {}, "phases": {}, "log": []}
+    w6.seed_from_sectors({100: {60126: 0}, 509: {94099: 0, 94101: 0, 103100: 0}}, force=True)
+    for _ in range(3):
+        w6.settle(94101, OCU, won=True, now=mid)          # Oak Hills -> O.C.U.
+    w6.tick(now=_ts(2026, 11, 2))
+    check("no reset inside the ceasefire", w6.frontline_reset_at() == 0
+          and w6.sector(94101)["nation"] == OCU)
+    w6.tick(now=_ts(2026, 11, 5, 1))
+    check("phase 2 opens with the frontline reset, the loser's fortress Deadlock, "
+          "the winner's held, the Controlled Zone untouched",
+          (not PHASE_RESET) or (w6.frontline_reset_at() == _ts(2026, 11, 5)
+                                and w6.sector(94101)["deadlock"]
+                                and w6.sector(FORTRESS[USN])["deadlock"]
+                                and w6.sector(FORTRESS[OCU])["nation"] == OCU
+                                and w6.sector(60126)["nation"] == OCU
+                                and w6.sector(60126)["control"] == 100))
+    w6.settle(94101, OCU, won=True, now=_ts(2026, 11, 6))
+    w6.tick(now=_ts(2026, 11, 7))
+    check("a phase resets once", w6.sector(94101)["counter"]["1"] == 1)
 
     # persistence round trip, in a throwaway database
     fdb = _fmodb()

@@ -74,8 +74,28 @@ def _war_tick(st):
                 + (f"; Deadlock penalty on nation {rec['penalty']['nation']}'s "
                    f"fortress tile {rec['penalty']['tile']}" if rec.get("penalty") else "")
                 + " (SE's phase page; the reward table is not served yet)")
+        for pn, rec in getattr(st, "resets_now", ()):
+            log(f"war state: PHASE {pn} STARTED -- the frontline is RESET to its "
+                f"opening state ({rec['sectors']} sector(s); guide/phase, news7740)"
+                + (f", nation {rec['penalty']['nation']}'s fortress tile "
+                   f"{rec['penalty']['tile']} opens Deadlock" if rec.get("penalty") else
+                   ", both fortresses held (a tie or no judgement)")
+                + f". Area missions accepted before {rec['at']} are failed "
+                f"(frontline_reset_at).")
     except Exception as e:                       # pragma: no cover
         log(f"war state: WARNING: phase tick failed ({e!r})")
+
+
+def frontline_reset_at():
+    """When the frontline was last reset by a new phase (epoch s), or 0 when
+    it never was or there is no war state. SE (news7740): 「初期化に伴い、停戦時に
+    実行中のエリアミッションはすべて自動的に失敗となります」 -- an area
+    (category 3) accept made before this moment is FAILED. The mission book
+    owns the missions and reads this; the war state only knows the moment."""
+    if WAR == "0" or fmowar is None:
+        return 0
+    st = war_state()
+    return st.frontline_reset_at() if st is not None else 0
 
 
 def parse_war_fields(spec):

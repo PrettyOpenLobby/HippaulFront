@@ -5,7 +5,7 @@ import struct
 import time
 from .deps import contentauth, fmomsn, fmostore
 from .wirelog import hexdump, log
-from . import pilotrecord, resume, settlement, sortie, trade, wirelog
+from . import coliseum, pilotrecord, resume, settlement, sortie, trade, wirelog
 
 
 # --------------------------------------------------------------------------- #
@@ -17,6 +17,7 @@ class Session(
         settlement.SessionSettlement,
         resume.SessionResume,
         trade.SessionTrade,
+        coliseum.SessionColiseum,
 ):
     """One client. `conn_id` is what we hand it in the handshake reply."""
 
@@ -509,27 +510,49 @@ class Session(
             # The client only ever thinks about the slot it picked, so the id in
             # the payload is authoritative when it names a row we hold.
             existing = self.find(rec["id"])
+            # The names ride this message too. The name step (0x0177) has
+            # already judged them when it made the row; judge them here when
+            # they are new or changed (a client that skips the name step), so
+            # a second "Henry Viduka" cannot come in through the side door.
+            if existing is None or ((existing.get("first"), existing.get("last"))
+                                    != (rec["first"], rec["last"])):
+                _code, _why = charstore.name_refusal(
+                    rec["first"], rec["last"],
+                    self.name_taken(rec["first"], rec["last"], rec["id"]))
+                if _code is not None:
+                    self.fail_code = _code
+                    return _why
+            # FMO_START_MONEY: the first message that names the nation
+            # (+0x28) is this one, so the head-count gap is judged here.
+            _counts = (charselect.nation_counts(self.all_rosters())
+                       if economy.START_MONEY is not None else None)
             if existing is not None:
                 existing.update(rec)
+                _money = economy.apply_start_money(existing, rec.get("nation_byte"), _counts)
                 self.commit(f"completed id {rec['id']} {rec['first']} "
                             f"{rec['last']}, nation {rec['nation']}, class "
-                            f"{rec['cls']}, hangar pw {rec['hangar_pw']}")
+                            f"{rec['cls']}, hangar pw {rec['hangar_pw']}"
+                            + (f"; starting money {existing['money']} ({_money})"
+                               if _money else ""))
             else:
                 rec["id"] = charstore.next_free_id(self.roster, rec["id"])
                 economy.seed_new_character(rec)
+                _money = economy.apply_start_money(rec, rec.get("nation_byte"), _counts)
                 self._roster.append(rec)
                 self.commit(f"created id {rec['id']} {rec['first']} "
                             f"{rec['last']}, nation {rec['nation']}, class "
                             f"{rec['cls']}, hangar pw {rec['hangar_pw']} -- "
-                            f"starting {economy.seed_summary(rec)}")
+                            f"starting {economy.seed_summary(rec)}"
+                            + (f" ({_money})" if _money else ""))
         elif msg == 0x0177 and len(payload) >= 0x26:
             first = charstore._name_at(payload, 0x04)
             last = charstore._name_at(payload, 0x15)
-            if charstore.NAME_UNIQUE:
-                clash = self.name_taken(first, last, char_id)
-                if clash:
-                    self.fail_code = charstore.NAME_TAKEN_CODE
-                    return clash
+            _code, _why = charstore.name_refusal(
+                first, last,
+                self.name_taken(first, last, char_id) if charstore.NAME_UNIQUE else None)
+            if _code is not None:
+                self.fail_code = _code
+                return _why
             c = self.find(char_id)
             if c is None:
                 # WARNING: THE NAME STEP OF CREATION, not a rename. The client is
@@ -564,6 +587,10 @@ class Session(
             if c is None:
                 return (f"delete for id {char_id}, which is not in this "
                         f"account's roster")
+            _locked = charselect.delete_locked(c, time.time())
+            if _locked:
+                self.fail_code = charselect.DELETE_LOCK_CODE
+                return f"delete for id {char_id} refused: {_locked}"
             self._roster.remove(c)
             self.commit(f"deleted id {char_id} ({c.get('first', '')} "
                         f"{c.get('last', '')})")
@@ -921,10 +948,17 @@ class Session(
                         log(f"{self.peer}   progression: back from a sortie, "
                             f"no played character on this session")
                     else:
-                        _m, _what, _ra = progress.advance_progress(_pc)
+                        _m, _what, _ra = progress.advance_progress(
+                            _pc, tile=self.sector[0] if self.sector else None)
                         if _m:
+                            # the byte may be 3 (cleared, awaiting the report's
+                            # 105) or 99 (done): say which, and push the flags
+                            # at the next lobby keepalive rather than into the
+                            # scene change this 0x0150 starts
+                            self.flags_push_due = True
                             self.commit(f"progression: {_pc.get('first','')} "
-                                        f"{_pc.get('last','')} completed "
+                                        f"{_pc.get('last','')} "
+                                        f"{'cleared' if ': cleared,' in _what else 'completed'} "
                                         f"'{_m['title']}' -> {_what}"
                                         + (f", rank -> {_ra} (FMO_PROGRESS_RANK_"
                                            f"FOLLOW: the successor's level)"
@@ -933,9 +967,9 @@ class Session(
                                 f"frontier is "
                                 + (" | ".join(x["title"] for x in
                                               progress.progress_frontier(_pc)) or "(nothing)")
-                                + ". WARNING: 0x014A goes out at Start Game only, so "
-                                  f"the new flags/rank reach the client on the "
-                                  f"next Start Game.")
+                                + ". The flags reach the client in a 0x015A at the "
+                                  f"next lobby keepalive; rank and Pilot level at "
+                                  f"the next Start Game (0x014A).")
                         else:
                             log(f"{self.peer}   progression: back from a "
                                 f"sortie -- {_what}")
@@ -960,6 +994,20 @@ class Session(
             if mk != _mk0:
                 log(f"{self.peer}   zone kind {_mk0} -> {mk}: nation {_gnat} "
                     f"({_gnat_src}) belongs in that band, per AI/F08/D15.DAT")
+            # KEY: STAY IN THE ZONE THE PILOT IS IN (FMO_RESUME_ZONE, manual
+            # p.42 "you start from the same place you were at when you logged
+            # out"): remember_zone stores every grant's zone, so the stored
+            # zone is where the pilot was -- at a login and at a lobby Move
+            # alike. resume_mapkind says when that is safe; the MapNo below
+            # then follows the zone.
+            if zoneentry.RESUME_ZONE and charstore.CHAR_STORE:
+                _rz, _rz_why = zoneentry.resume_mapkind(self.playing_char(), _gnat,
+                                                        self.pilot_trained())
+                if _rz is not None:
+                    log(f"{self.peer}   zone {mk} -> {_rz}: {_rz_why}")
+                    mk = _rz
+                else:
+                    log(f"{self.peer}   zone {mk} kept: {_rz_why}")
             # KEY: THE MAP FOLLOWS THE ZONE (FMO_ZONE_MAPNO). A sweep still wins:
             # it is the knob you arm to go LOOKING for a map.
             if not zoneentry.MAPNO_SWEEP:
@@ -984,6 +1032,14 @@ class Session(
                                       mapno=mn, mapkind=mk,
                                       place=move.entry_place(mk) if move.PLACES else None,
                                       account=self.account)
+            _opc = self.playing_char() if charstore.CHAR_STORE else None
+            _f18 = zoneentry.opening_field18(_opc)        # before remember_zone
+            if _f18 is not None:
+                _opc["opening_seen"] = True
+                self.commit(f"opening: {_opc.get('first', '')} {_opc.get('last', '')} "
+                            f"enters the world for the first time -> this entry is a "
+                            f"ROOM (+0x18 = 1), the nation's story script plays in "
+                            f"MapNo {mn}")
             self.remember_zone(mk, mn, "world entry")
             if zoneentry.FILL_0153:
                 log(f"{self.peer}   -> 0x0153 (NOT N+1), {zoneentry.REPLY_0153_LEN}B: "
@@ -991,7 +1047,8 @@ class Session(
                     f"ClientScriptNo={csn} "
                     f"MusicNo={zoneentry.MUSIC_NO} "
                     f"SeNo={zoneentry.SE_NO}, PilotPos={pp}, "
-                    f"+0x18={zoneentry.FIELD_18} +0x1C={zoneentry.FIELD_1C}, "
+                    f"+0x18={zoneentry.FIELD_18 if _f18 is None else _f18} "
+                    f"+0x1C={zoneentry.FIELD_1C}, "
                     f"endpoint {addressing.BATTLE_HOST}:{addressing.BATTLE_PORT}")
                 log(f"{self.peer}   {zoneentry.describe_script_choice(mk, _gnat, _gnat_src)}")
                 log(f"{self.peer}   WARNING: this reply makes the client LEAVE THE "
@@ -1011,7 +1068,7 @@ class Session(
                     f"of 0 on a slot names the id that does not exist")
             outs = [packet.build(zoneentry.MSG_0150_REPLY,
                            zoneentry.reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
-                                                csn=csn,
+                                                csn=csn, field18=_f18,
                                                 host=addressing.host_for(addressing.BATTLE_HOST, self.ip),
                                      self_id=self.wire_self_id()),
                            self.reply_seq(), p["conn"])]
@@ -1060,6 +1117,12 @@ class Session(
             return [packet.build(handshake.MSG_SESSION_START, b"", self.reply_seq(), p["conn"])]
 
         if p["msg"] == move.MSG_MEMBER_CHECK_REQ:
+            # KEY: /tell sends this same id WITH TEXT at +0x32 (trade.MSG_TELL);
+            # the Login Check sends names only. A tell goes to its one
+            # recipient and is never dumped to the log below.
+            _tell = trade.parse_tell(p["payload"]) if trade.TELL else None
+            if _tell is not None:
+                return self.on_tell(p, *_tell)
             if not charselect.ANSWER_LOBAPI:
                 log(f"{self.peer}   FMO_ANSWER_LOBAPI=0 -- 0x0181 unanswered, "
                     f"and the room-member screen will hang.")
@@ -1191,6 +1254,20 @@ class Session(
             if mk != _mk0:
                 log(f"{self.peer}   zone kind {_mk0} -> {mk}: nation {_gnat} "
                     f"({_gnat_src}) belongs in that band, per AI/F08/D15.DAT")
+            # KEY: STAY IN THE ZONE THE PILOT IS IN (FMO_RESUME_ZONE, manual
+            # p.42 "you start from the same place you were at when you logged
+            # out"): remember_zone stores every grant's zone, so the stored
+            # zone is where the pilot was -- at a login and at a lobby Move
+            # alike. resume_mapkind says when that is safe; the MapNo below
+            # then follows the zone.
+            if zoneentry.RESUME_ZONE and charstore.CHAR_STORE:
+                _rz, _rz_why = zoneentry.resume_mapkind(self.playing_char(), _gnat,
+                                                        self.pilot_trained())
+                if _rz is not None:
+                    log(f"{self.peer}   zone {mk} -> {_rz}: {_rz_why}")
+                    mk = _rz
+                else:
+                    log(f"{self.peer}   zone {mk} kept: {_rz_why}")
             # KEY: THE MAP FOLLOWS THE ZONE (FMO_ZONE_MAPNO). A sweep still wins:
             # it is the knob you arm to go LOOKING for a map.
             if not zoneentry.MAPNO_SWEEP:
@@ -1825,6 +1902,39 @@ class Session(
                 f"{battlegroups.GROUP_OP_NAMES.get(p['msg'], 'a GROUP request')} ({len(_b)}B, "
                 f"u32[0]={_gid} = GroupID?, bytes {_b[:16].hex(' ')}) -> message 1 "
                 f"on its seq (the object's poll wants word[+6] == 1).")
+            if p["msg"] == 0x01A0 and len(_b) >= 8:
+                # B.G.BONUS (battlegroups.bonus_request): leader only, raise
+                # only, cap FMO_BG_BONUS_MAX; a refusal is 7:64 + the code's line.
+                _amt = struct.unpack_from("<I", _b, battlegroups.Q1A0_AMOUNT)[0]
+                _no = battlegroups.bonus_request(_gid, self.account, _amt)
+                if _no is not None:
+                    log(f"{self.peer}   B.G.BONUS H$ {_amt} REFUSED: {_no[1]} -> "
+                        f"0x{charselect.MSG_FAIL:04X} code {_no[0]}")
+                    return [packet.build(charselect.MSG_FAIL, b"", p["seq"], _no[0] & 0xFFFF)]
+                log(f"{self.peer}   B.G.BONUS: group {_gid} bonus is now H$ {_amt}")
+            if (p["msg"] in (0x0171, 0x0179) and len(_b) >= 8
+                    and battlegroups.GROUP_MEMBER_OPS):
+                # KICK / CHANGE LEADER: +0x00 = the chosen member as THIS
+                # client knows it (our alias), +0x04 = the GroupID.
+                _alias, _mgid = struct.unpack_from("<II", _b, battlegroups.Q171_TARGET)
+                _tacct = groupchannel.group_member_by_alias(self.account, _alias)
+                _op = (battlegroups.group_kick if p["msg"] == 0x0171
+                       else battlegroups.group_change_leader)
+                _no = _op(_mgid, self.account, _tacct)
+                if _no is not None:
+                    log(f"{self.peer}   {battlegroups.GROUP_OP_NAMES[p['msg']]} of "
+                        f"UnitID {_alias:#x} ({_tacct or 'unresolved'}) in group "
+                        f"{_mgid} REFUSED: {_no[1]} -> 0x{charselect.MSG_FAIL:04X} "
+                        f"code {_no[0]}")
+                    return [packet.build(charselect.MSG_FAIL, b"", p["seq"], _no[0] & 0xFFFF)]
+            if p["msg"] == 0x0172:
+                # LEAVE: a member leaves; the leader's leave disbands (D92 214-215).
+                _lg = groupchannel.GROUP_OF.get(self.account)
+                if _lg and battlegroups.group_leader(_lg) == self.account:
+                    battlegroups.group_disband(_lg, f"its leader {self.account} left")
+                else:
+                    _lg = groupchannel.group_leave(self.account)
+                    log(f"{self.peer}   LEAVE: {self.account} left group {_lg}")
             if p["msg"] == 0x0173 and len(_b) >= 8:
                 # KEY: THE SORTIE SETTING (sender 0x6116CFF0): +0x04 1 = Ready,
                 # 2 = Standing By; +0x07 1 = Continue, 2 = Do not continue;
@@ -1943,7 +2053,8 @@ class Session(
                     # wipes them (the 09-11 tutorial-replay bug).
                     _owned = status.reply_014a(char=_pc_item or {})[status.S14A_OWNED:status.S14A_OWNED + resultpush.S15A_OWNED_LEN]
                     outs.append(resultpush.result_push_packet(
-                        p["conn"], money=_price, contribution=0, owned=_owned))
+                        p["conn"], money=_price, contribution=0, owned=_owned,
+                        pilot=_pc_item or {}))
                     log(f"{self.peer}   -> 0x{resultpush.MSG_RESULT_PUSH:04X} money-only "
                         f"push (+{_price}) so the wallet moves NOW rather than "
                         f"at the next login. Rides FMO_RESULT_PUSH because it "
@@ -1983,6 +2094,20 @@ class Session(
             # KEY: THE PLAYER LIST: u32 count at
             # +0x80, 0x40-byte rows from +0x84. Zeros drew "[NO PLAYER]"
             # (10:48) -- the rows are the group's members, joiner included.
+            # SE's join rules (groupchannel.group_join_refusal): a member of
+            # another live group, or a full group, is refused with the
+            # client's own code (9:3 + 9:0 / 5:33), and a B.G.Cost below the
+            # group's Required B.G.Cost (5:37) -- the PLAYING pilot's cost,
+            # noted here so the rule and the platoon total read that pilot.
+            battlegroups.note_pilot_cost(self.account, self.playing_char()
+                                         if charstore.CHAR_STORE else None)
+            _no = (penalty.clearance_refusal(self.playing_char() if charstore.CHAR_STORE
+                                             else None, "platoon")
+                   or groupchannel.group_join_refusal(_gid, self.account))
+            if _no is not None:
+                log(f"{self.peer}   JOIN group {_gid} REFUSED: {_no[1]} -> "
+                    f"0x{charselect.MSG_FAIL:04X} code {_no[0]}")
+                return [packet.build(charselect.MSG_FAIL, b"", p["seq"], _no[0] & 0xFFFF)]
             groupchannel.group_join(_gid, self.account)
             groupchannel.queue_group_entry(self.ip, self.account)   # its group channel claims it
             if not community.GROUP_BOARD_MARK:
@@ -2048,7 +2173,10 @@ class Session(
             _b = p["payload"]
             _leader = _b[0x08:0x58].split(b"\0")[0].decode("ascii", "replace")
             _comment = _b[0x58:0x110].split(b"\0")[0].decode("cp932", "replace")
-            _total = struct.unpack_from("<I", _b, 0x110)[0] if len(_b) >= 0x114 else 0
+            # CORRECTED 2026-09-30: +0x110 is the voice flag; Total Battles is
+            # the byte at +0x114 (battlegroups.parse_create_form).
+            _form = battlegroups.parse_create_form(_b)
+            _total = _form["total"]
             _f114 = _b[0x114:0x118].hex(" ") if len(_b) >= 0x118 else "?"
             battlegroups.BATTLE_GROUPS[self.peer] = {"leader": _leader, "comment": _comment,
                                                      "total_battles": _total, "f114": _f114,
@@ -2069,6 +2197,15 @@ class Session(
             log(f"{self.peer}   0x0156 CREATE BATTLE GROUP ({len(_b)}B): leader "
                 f"{_leader!r}, comment {_comment!r}, total battles {_total}, "
                 f"+0x114 = {_f114}. FMO_ANSWER_0156={battlegroups.ANSWER_0156!r}.")
+            battlegroups.note_pilot_cost(self.account, self.playing_char()
+                                         if charstore.CHAR_STORE else None)
+            _no = (penalty.clearance_refusal(self.playing_char() if charstore.CHAR_STORE
+                                             else None, "platoon")
+                   or groupchannel.group_create_refusal(self.account))
+            if _no is not None and battlegroups.ANSWER_0156 not in ("0", "fail", "ack"):
+                log(f"{self.peer}   CREATE REFUSED: {_no[1]} -> "
+                    f"0x{charselect.MSG_FAIL:04X} code {_no[0]} (9:5 + 9:0)")
+                return [packet.build(charselect.MSG_FAIL, b"", p["seq"], _no[0] & 0xFFFF)]
             if battlegroups.ANSWER_0156 == "0":
                 log(f"{self.peer}   WARNING: staying silent: the window polls forever (the hang).")
                 return []
@@ -2097,6 +2234,9 @@ class Session(
             _gid = len(battlegroups.BATTLE_GROUPS_MADE) + 1
             battlegroups.BATTLE_GROUPS_MADE.append((self.peer, _gid, _leader, time.time()))
             battlegroups.GROUP_CREATOR_ACCOUNT[_gid] = self.account
+            _pst = battlegroups.register_group(_gid, self.account, _form)
+            log(f"{self.peer}   group {_gid}: Total Battles {_pst['total']}, Required "
+                f"B.G.Cost {_pst['required']}, B.G.Bonus H$ {_pst['bonus']}")
             groupchannel.group_join(_gid, self.account)
             groupchannel.queue_group_entry(self.ip, self.account)   # its group channel claims it
             _entry = grouplogin.group_entry(_gid, addressing.host_for(addressing.GROUP_HOST, self.ip),
@@ -2444,12 +2584,20 @@ class Session(
                                     f" x{_se[str(_ev)]['n']}")
                     except Exception as _e:
                         log(f"{self.peer}   WARNING: script event NOT persisted ({_e!r})")
-                _rule = scriptcall.event_rule_for(_ev, _ps)
+                # PENALTY: event 211 = the retraining battle is over (D83
+                # 0x2AD6); a counted win is pushed here, before the ack
+                outs += penalty.on_script_event(self, p["payload"], _pc, _ev, _ps, p["conn"])
+                # the hangar mechanic's permit sale answers itself (permits.HANGAR_SALE_EVENT)
+                _rule = (None if _ev == permits.HANGAR_SALE_EVENT
+                         else scriptcall.event_rule_for(_ev, _ps))
+                if _ev == permits.HANGAR_SALE_EVENT:
+                    outs += self.sell_hangar_pass(p["conn"], p["payload"], _ps)
                 if _rule is not None:
                     _fl = fmostore.flags_bytes(_pc.get("flags")) if (fmostore and _pc) else b""
                     if not _fl:
                         _fl = status.reply_014a(char=_pc or {})[status.S14A_FLAGS11:status.S14A_FLAGS11 + status.S14A_FLAGS11_LEN]
                     _ans, _nfl, _what = scriptcall.apply_event_rule(_rule, _ps, _fl)
+                    _reward_money, _reward_pushes = 0, []
                     if not _what:
                         log(f"{self.peer}   fmo-events.tsv row for event {_ev} "
                             f"(p1 {_rule['p1'] if _rule['p1'] is not None else '*'}) "
@@ -2461,6 +2609,29 @@ class Session(
                         if _nfl != _fl:
                             if _pc is not None and fmostore:
                                 _pc["flags"] = _nfl.hex()
+                                # a mission the script just REPORTED (105, @report
+                                # 3 -> 99) is complete: the Pilot level / rank
+                                # follow the frontier advance applies
+                                for _cw in progress.completions_follow(_pc, _fl, _nfl):
+                                    _what.append(_cw)
+                                    log(f"{self.peer}   progression: {_cw}")
+                                # the report's reward (scriptcall.MISSION_REWARD):
+                                # the script prints it because p2 = 1; pay it here
+                                if scriptcall.MISSION_REWARD:
+                                    for _rb, _rm, _ri in progress.rewards_due(_pc, _fl, _nfl):
+                                        _why = f"mission byte {_rb} reported"
+                                        if _rm:
+                                            _reward_money += _rm
+                                            self.credit_money(f"{_why}: reward {_rm} H$", money=_rm)
+                                        _pid = progress.REWARD_PASS.get((_ri or {}).get("name"))
+                                        if _pid:
+                                            _mint = self.grant_reward_pass(p["conn"], _pid, _why)
+                                            if _mint:
+                                                _reward_pushes.append(_mint)
+                                        elif _ri:
+                                            log(f"{self.peer}   {_why}: {_ri.get('kind')} "
+                                                f"{_ri.get('name')!r} needs no grant (the cosmetic "
+                                                f"catalogue already offers it)")
                                 try:
                                     self.commit(f"script event {_ev}: flags "
                                                 + ", ".join(w for w in _what if w.startswith("flag")))
@@ -2472,18 +2643,21 @@ class Session(
                         _owned = bytearray(status.reply_014a(char=_pc or {})[status.S14A_OWNED:status.S14A_OWNED + resultpush.S15A_OWNED_LEN])
                         _owned[status.S14A_FLAGS11 - status.S14A_OWNED:status.S14A_FLAGS11 - status.S14A_OWNED + status.S14A_FLAGS11_LEN] = _nfl
                         _rec = scriptcall.answered_0159(p["payload"], _ans)
+                        # +0x418..+0x41A = the pilot's penalty bytes (pilot=),
+                        # not the record's own: the arm stores them either way
                         outs.append(resultpush.result_push_packet(
-                            p["conn"], record=_rec, money=0, contribution=0,
-                            owned=bytes(_owned),
-                            b418=_rec[scriptcall.S159_B418], b419=_rec[scriptcall.S159_B418 + 1],
-                            b41a=_rec[scriptcall.S159_B418 + 2]))
+                            p["conn"], record=_rec, money=_reward_money, contribution=0,
+                            owned=bytes(_owned), pilot=_pc or {}))
                         log(f"{self.peer}   -> 0x{resultpush.MSG_RESULT_PUSH:04X} ANSWER push "
                             f"({resultpush.S15A_BODY_LEN}B, queue seq 0x{pushes.QUEUE_SEQ:08X}) BEFORE "
                             f"the ack: the record with the answered params at "
                             f"+0x{scriptcall.S159_PARAMS:X} goes back into lobby+0x6E4E "
                             f"(+0xAD8 = 0), the owned table + flags refreshed, "
-                            f"no money/items. The ack below then copies it to "
+                            + (f"money delta +{_reward_money} H$ (mission reward). "
+                               if _reward_money else "no money. ")
+                            + "The ack below then copies it to "
                             f"the script, whose 0xE222 reads the answer.")
+                        outs += _reward_pushes
             log(f"{self.peer}   -> message 1 on seq 0x{p['seq']:08X}: the match "
                 f"arm copies lobby+0x6E4E out to the script and sets "
                 f"lobby+0x73EA = 1 (FMO_ANSWER_0159=fail/0 to A/B it).")
@@ -2524,6 +2698,13 @@ class Session(
             # for this pilot (0x017D) rides the keepalive like 0x015A does
             trade.LIVE_SESSIONS[self.ip] = self
             outs += self.trade_pushes_due(p["conn"])
+            # the story gates tool's queued edits land here, on this thread
+            outs += gatetool.gate_ops_due(self, p["conn"])
+            # spoils: a won group battle's loot round, and items won (loot.py)
+            outs += loot.loot_pushes_due(self, p["conn"])
+            # the Coliseum: a waiting window the leader opened, a withdrawn
+            # entry, an arena that ended (coliseum.py; FMO_COLISEUM)
+            outs += self.coliseum_pushes_due(p["conn"])
             if timesync.TIME_SYNC:
                 outs.append(timesync.time_sync_packet(p["conn"], when, when_us))
             if pushes.PUSH_PROBE and not getattr(self, "push_probe_done", False):
@@ -2556,8 +2737,12 @@ class Session(
                     for _b in referee.objective_tick(_bst, _bc, time.time()):
                         log(f"{self.peer}   objective: {_b}")
                         referee.hud_banner(_bc, _b)
+            # THE COLISEUM: an arena match ends on its verdict (both teams
+            # judged together), never on this pilot's own death or a timer
+            outs += self.arena_end_due(p["conn"])
             if (battleend.BATTLE_END and _bst is not None
-                    and not getattr(self, "battle_end_done", False)):
+                    and not getattr(self, "battle_end_done", False)
+                    and not self.in_arena_match()):
                 _trig = referee.pilot_death_trigger(
                     battleend.PILOT_DEATHS.get(self.account),
                     getattr(self, "sortie_granted_at", None), time.time(),
@@ -2581,6 +2766,11 @@ class Session(
                         p["conn"], f"the battle end ({_trig[0]})", won=_trig[1])
                     if _rp:
                         outs.append(_rp)
+                    # FRIENDLY FIRE: the 0x017B must land under the BATTLE
+                    # gate (0x611734E0), i.e. before the 0x014C that ends it
+                    _pr = self.penalty_report_push(p["conn"])
+                    if _pr:
+                        outs.append(_pr)
                     _be = self.battle_end_push(p["conn"], why=_trig[0],
                                                won=_trig[1])
                     if _be:
@@ -2646,7 +2836,7 @@ class Session(
                             for s in _ap["spent"]][:resultpush.S15A_MAX_ITEMS]
                     outs.append(resultpush.result_push_packet(
                         p["conn"], money=0, contribution=0, owned=_aow,
-                        spent=_asp))
+                        spent=_asp, pilot=_ach))
                     log(f"{self.peer}   -> 0x{resultpush.MSG_RESULT_PUSH:04X} AREA push: "
                         f"owned table with the opened-area bits for "
                         f"{_ap['zones']} and {len(_asp)} spent pass "
@@ -2738,6 +2928,17 @@ class Session(
                         log(f"{self.peer}   the creation screen maps code "
                             f"0xC43B to 17:117 'That name is already in use' "
                             f"(0x61178CDE, table 0x613958E0) -- a real message")
+                    elif _code == charstore.NAME_RESERVED_CODE:
+                        log(f"{self.peer}   code 0xC90E is the name step's other "
+                            f"by-value code (0x61178CDE); table 0x613955F0 maps it "
+                            f"to 17:118 'That name cannot be used'. Not yet seen "
+                            f"on a screen")
+                    elif _code == charselect.DELETE_LOCK_CODE:
+                        log(f"{self.peer}   code 0xC8E6 is SE's delete lock; table "
+                            f"0x613955F0 maps it to 2:97 'cannot be deleted until 24 "
+                            f"hours after it was created'. The delete machine "
+                            f"0x611849B0 hands it to UI event 0x1075; whether that "
+                            f"event draws 2:97 or a bare [FMO%05d] is not yet seen")
                     else:
                         log(f"{self.peer}   WARNING: the CODE is only the %05d in "
                             f"'[%s%05d] %s'. The message text is a fixed "
@@ -2775,6 +2976,9 @@ class Session(
         if p["msg"] == sortie.MSG_SORTIE_REQ:
             return self.on_sortie(p)
 
+        if p["msg"] == penalty.MSG_PENALTY_GIVE:
+            return self.on_penalty_give(p)
+
         if p["msg"] == sortiepush.MSG_SORTIE_GO:
             return self.on_sortie_go(p)
 
@@ -2787,6 +2991,11 @@ class Session(
 
         if p["msg"] == resume.MSG_RESUME_REQ:
             return self.on_resume(p)
+
+        if self.wants_spectate(p):
+            # Delacroix: the 0x01C0 that follows his list carries an ARENA id
+            # and is a spectate request (coliseum.py), not the mission board's
+            return self.on_spectate(p)
 
         if p["msg"] == missionblock.MSG_MISSION_REQ and charselect.ANSWER_LOBAPI and missionblock.SERVE_MISSION_BLOCK:
             body = missionblock.reply_01c1()
@@ -2809,9 +3018,20 @@ class Session(
 
         if p["msg"] == charselect.MSG_NATION_REQ and charselect.ANSWER_LOBAPI:
             reply = lobapi.LOBAPI[charselect.MSG_NATION_REQ][0]
-            body = charselect.reply_019d()
+            _counts = (charselect.nation_counts(self.all_rosters())
+                       if charselect.NATION_POP_LIVE else None)
+            body = charselect.reply_019d(_counts)
             log(f"{self.peer}   0x019C = the NATION SELECT screen's data "
                 f"request (sent by 'Create character')")
+            if _counts is not None:
+                _closed = charselect.closed_nation(_counts)
+                log(f"{self.peer}   FMO_NATION_POP=live: O.C.U. {_counts.get(1, 0)} / "
+                    f"U.S.N. {_counts.get(2, 0)} pilot(s) at Pilot level "
+                    f"{charselect.NATION_POP_LEVEL}+ (gap {charselect.nation_gap_pct(_counts)}%); "
+                    + (f"nation {_closed} CLOSED (+0x{8 if _closed == 1 else 0xC:02X} = -1; "
+                       f"FMO_NATION_CLOSE_PCT={charselect.NATION_CLOSE_PCT}, "
+                       f"_MIN={charselect.NATION_CLOSE_MIN})" if _closed else
+                       f"both open (FMO_NATION_CLOSE_PCT={charselect.NATION_CLOSE_PCT})"))
             log(f"{self.peer}   -> 0x{reply:04X}, {len(body)}B: populations "
                 f"{charselect.NATION_POP}, ENABLE={charselect.NATION_ENABLE} at +0x10. WARNING: A "
                 f"HYPOTHESIS about the [FM00000] refusal, not a proven cause: "
@@ -2829,6 +3049,48 @@ class Session(
             c = self.find(cid)
             log(f"{self.peer}   0x01AA = CHANGE NATIONS submit, id {cid}")
             if c is not None:
+                from . import defection
+                nb = p["payload"][0x28] if len(p["payload"]) >= 0x29 else 0
+                _was = popnation.character_nation(c)[0]
+                _to = nb if nb in (1, 2) else (3 - _was if charselect.NATION_CHANGE_TOGGLE
+                                               and _was in (1, 2) else None)
+                # SE: "the character's name can be changed when defecting" --
+                # under the same rules as creation: unique, and not a reserved
+                # name. Judged first, so a refused name stores nothing. The
+                # 0x01AA mismatch arm hands +0x08 to the 0x613955F0 formatter,
+                # which draws 17:117 for 0xC43B and 17:118 for 0xC90E.
+                _nf = charstore._name_at(p["payload"], 0x04)
+                _nl = charstore._name_at(p["payload"], 0x15)
+                if (_nf, _nl) != (c.get("first"), c.get("last")):
+                    _code, _nwhy = charstore.name_refusal(
+                        _nf, _nl, self.name_taken(_nf, _nl, c.get("id")))
+                    if _code is not None:
+                        log(f"{self.peer}   -> 0x{charselect.MSG_FAIL:04X} RENAME REFUSED, "
+                            f"code 0x{_code:04X}: {_nwhy}; nothing stored")
+                        return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(), _code)]
+                # KEY: DEFECTION RULES (SE update 050906 97-108, news5570, topics
+                # 060227; see defection.py). Judged BEFORE anything is stored: a
+                # refused defection must not keep the rename either. The refusal
+                # is message 2 with SE's own code in +0x08, which the client's
+                # table 0x613955F0 turns into systext 2:109..2:114.
+                # FMO_DEFECTION=0 restores the unconditional switch.
+                if defection.DEFECTION and _was in (1, 2) and _to in (1, 2) and _to != _was:
+                    _code, _dwhy = defection.defection_verdict(c, _was, _to, self.all_rosters())
+                    if _code is not None:
+                        log(f"{self.peer}   -> 0x{charselect.MSG_FAIL:04X} DEFECTION REFUSED, "
+                            f"code {_code} (wire 0x{_code & 0xFFFF:04X}): {_dwhy}. The client "
+                            f"draws {defection.REFUSAL_TEXT.get(_code)}; nothing stored "
+                            f"(FMO_DEFECTION=0 restores the unconditional switch)")
+                        return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(),
+                                             _code & 0xFFFF)]
+                    log(f"{self.peer}   DEFECTION ALLOWED {_was} -> {_to}: {_dwhy}")
+                    for _line in defection.apply_defection(c):
+                        log(f"{self.peer}      defection: {_line}")
+                    log(f"{self.peer}      defection: NOT applied here: buddy list and "
+                        f"radio-voice registrations (not held by this service); nation "
+                        f"insignia are per squadron, not on the pilot. The client's own "
+                        f"copy of rank, money and items can only change at its next "
+                        f"0x014A/0x0133 (not yet seen on a screen).")
                 c["first"] = charstore._name_at(p["payload"], 0x04)
                 c["last"] = charstore._name_at(p["payload"], 0x15)
                 # WARNING: +0x26 is the GENDER (the swapped-key hazard); the nation is +0x28,
@@ -2838,8 +3100,18 @@ class Session(
                 # nation consumer reads -- and Molly, switched to U.S.N.,
                 # still spawned in the O.C.U. zone with the O.C.U. cast (the
                 # log said "nation 2" only because she is female).
-                c["nation"] = p["payload"][0x26]
-                nb = p["payload"][0x28] if len(p["payload"]) >= 0x29 else 0
+                # Manual p.38: defecting "cannot change your gender". A record
+                # that already holds a gender (1/2) keeps it whatever the
+                # submit carries; only a record without one (a creation that
+                # never reached 0x013E) takes +0x26.
+                _g_was = c.get("gender", c.get("nation"))
+                _g_new = p["payload"][0x26]
+                if _g_was in (1, 2) and _g_new != _g_was:
+                    log(f"{self.peer}      WARNING: submit +0x26 (gender) = {_g_new} but the "
+                        f"pilot is {_g_was}; gender cannot change on a defection, kept {_g_was}")
+                else:
+                    c["nation"] = _g_new
+                    c["gender"] = _g_new
                 # WARNING: THE SUBMIT DOES NOT NAME THE NEW NATION (live 2026-09-27):
                 # +0x28 is 0 in every Change Nations submit on record, one
                 # switch O.C.U. -> U.S.N. and one U.S.N. -> O.C.U. --
@@ -2964,7 +3236,9 @@ class Session(
                     f"or what it costs. WARNING: What SE keyed this bitmap on is NOT "
                     f"established: FMO_PARTS_STOCK={partsstock.PARTS_STOCK_SPEC!r} is our "
                     f"choice, not a measurement.")
-                outs.append(partsstock.parts_stock_push(p["conn"]))
+                # the pilot's nation picks which victory series it sees (partsstock)
+                _snat, _ = self.grant_nation()
+                outs.append(partsstock.parts_stock_push(p["conn"], nation=_snat))
             if squadron.SERVE_SQUADRON:
                 _inat, _isrc = zoneentry.script_nation(
                     self.playing_char() if charstore.CHAR_STORE else None)
@@ -3067,10 +3341,17 @@ class Session(
             if missionboard.MISSION_ACCEPT == "gate":
                 _req = missionbook.mission_requirements().get(_mid)
                 _char = self.playing_char() if charstore.CHAR_STORE else None
+                # a derived mission (order) another pilot already took, or one
+                # cancelled / expired: it is no longer in the requirements, so
+                # without this the "no row" arm below accepted it a second time
+                _taken = (missionbook.order_accept_refusal(_mid, getattr(self, "account", None))
+                          if missionboard.ORDER else None)
                 if community.MSN_MARK:
                     log(f"{self.peer}      WARNING: FMO_MSN=mark poisons every field "
                         f"of the record, so the requirements are offsets, not "
                         f"numbers. NOT gating on them -- accepting.")
+                elif _taken is not None:
+                    _code, _why = _taken
                 elif _req is None:
                     log(f"{self.peer}      WARNING: no served row carries id {_mid}, "
                         f"so there are no requirements to judge -- accepting. "
@@ -3092,6 +3373,18 @@ class Session(
                                        f"already -- it is on their record")
                 else:
                     _code, _why = missionbook.mission_accept_verdict(_req, _char)
+                if (missionboard.MISSION_PLACE and _code is None and _req is not None
+                        and not community.MSN_MARK):
+                    # FMO_MISSION_PLACE (Playing Manual p.59/60): Area missions
+                    # only in the Strategy Room, Battle Map / Sector only where
+                    # the Intelligence Officer is
+                    _pcode, _pwhy = missionbook.mission_place_refusal(
+                        _req.get("cat"), rooms.WORLD_ZONES.get(self.ip),
+                        move.WORLD_PLACES.get(self.ip))
+                    log(f"{self.peer}      PLACE: {_pwhy}"
+                        + (f" -> refused, code {_pcode}" if _pcode is not None else ""))
+                    if _pcode is not None:
+                        _code, _why = _pcode, _pwhy
                 if (areatargets.AREA_TARGETS and _code is None and _req is not None
                         and _req.get("cat") == 3 and _tflag == 1):
                     _zn = rooms.WORLD_ZONES.get(self.ip)
@@ -3123,7 +3416,8 @@ class Session(
                 if _req is not None and not community.MSN_MARK:
                     log(f"{self.peer}      GATE: row {_req['name']!r} wants "
                         f"rank {_req['rank']} ({ranks.rank_name(_req['rank'])}) "
-                        f"and a fee of H$ {_req['fee']}; it pays MP "
+                        f"and a Fee of {'MP' if missionboard.MISSION_FEE_MP else 'H$'} "
+                        f"{_req['fee']}; it pays MP "
                         f"{_req['reward_mp']}/H$ {_req['reward_hs']} -- {_why}")
             if missionboard.MISSION_ACCEPT == "1" or (missionboard.MISSION_ACCEPT == "gate"
                                                       and _code is None):
@@ -3131,10 +3425,40 @@ class Session(
                 if (missionboard.MISSION_FEE and missionboard.MISSION_ACCEPT == "gate"
                         and _req and _req.get("fee")):
                     _fee = int(_req["fee"])
-                    _now = self.credit_money(
+                    # KEY: FMO_MISSION_FEE_MP (default): SE's Fee is MP --
+                    # 「Fee(MP)を支払ってそのミッションを受けたことになります」
+                    # (guide/mission) -- and it is never refunded, cancel
+                    # included. The gate above already refused a pilot short
+                    # of it with -7. No push carries MP on its own, so the
+                    # on-screen MP catches up at the next 0x014A.
+                    _mpc = self.playing_char() if (missionboard.MISSION_FEE_MP
+                                                   and charstore.CHAR_STORE) else None
+                    if missionboard.MISSION_FEE_MP and _mpc is None:
+                        log(f"{self.peer}      WARNING: FMO_MISSION_FEE=1 but there "
+                            f"is no stored pilot to charge the Fee (MP {_fee}) "
+                            f"-- accepting for FREE. A fee nobody paid must "
+                            f"not read as paid.")
+                        _fee = 0
+                    elif missionboard.MISSION_FEE_MP:
+                        _mpw, _mpn = economy.spend_mp(_mpc, _fee)
+                        try:
+                            self.commit(f"mission Fee for {_req['name']!r} (id "
+                                        f"{_mid}): MP {_mpw} -> {_mpn}")
+                        except Exception as _e:
+                            log(f"{self.peer}      WARNING: the Fee (MP {_fee}) "
+                                f"was NOT banked ({_e!r})")
+                        log(f"{self.peer}      CHARGED the Fee, MP {_fee}: MP "
+                            f"{_mpw} -> {_mpn} (FMO_MISSION_FEE_MP=1, SE's "
+                            f"「必要階級 + 必要MP」). Not refunded on cancel. "
+                            f"Bar: the Profile's MP is down {_fee} after a relog.")
+                    # FMO_MISSION_FEE_MP=0: the old H$ charge
+                    _now = (self.credit_money(
                         f"mission acceptance fee for {_req['name']!r} "
                         f"(id {_mid})", money=-_fee)
-                    if _now is None:
+                        if not missionboard.MISSION_FEE_MP else None)
+                    if missionboard.MISSION_FEE_MP:
+                        pass                 # charged (or not) in MP above
+                    elif _now is None:
                         log(f"{self.peer}      WARNING: FMO_MISSION_FEE=1 but there "
                             f"is no stored pilot to charge -- accepting for "
                             f"FREE. A fee nobody paid must not read as paid.")
@@ -3145,8 +3469,8 @@ class Session(
                             f"8:74 'sortie cost for a modified unit', which "
                             f"this is not -- so the on-screen H$ is STALE "
                             f"until the next 0x014A. Bar: the Profile is down "
-                            f"{_fee} AFTER A RELOG. WARNING: Accepting this row again "
-                            f"charges again; nothing records an accept yet.")
+                            f"{_fee} AFTER A RELOG. A second accept of an "
+                            f"active row is refused with -4 before any charge.")
                 _kept = None
                 if missionboard.MISSION_ACCEPT == "gate" and _req is not None:
                     # the battlefield's ZONE: the row's own (FMO_MSN_ZONES)
@@ -3165,6 +3489,18 @@ class Session(
                         control=areatargets.AREA_CONTROL if _area_tile else None)
                     if _kept:
                         _nm = _kept[-1]
+                        # the CONTRIBUTION it pays on its report, snapshotted
+                        # like the reward so a re-tuned FMO_MISSION_CONTRIB
+                        # cannot change an accepted mission's pay
+                        _rc = missionbook.mission_contribution(_nm.get("cat"))
+                        if _rc:
+                            _nm["reward_contrib"] = _rc
+                            try:
+                                self.commit(f"mission {_mid} pays contribution {_rc} "
+                                            f"on its report (FMO_MISSION_CONTRIB)")
+                            except Exception as _e:
+                                log(f"{self.peer}      WARNING: contribution snapshot NOT "
+                                    f"banked ({_e!r}); the report pays by category")
                         log(f"{self.peer}      SNAPSHOT: key {missionbook.mission_key(_nm)} "
                             f"(record+0x00 for this accept; mission id {_mid} "
                             f"in the low 16 bits), category {_nm.get('cat')}, "
@@ -3184,8 +3520,18 @@ class Session(
                        f"no report path." if _kept else
                        "WARNING: Nothing is RECORDED: no accepted state, no deadline "
                        "-- the mission is accepted on screen only."))
-                return [packet.build(missionboard.MSG_MISSION_ACCEPT_REPLY, b"",
+                _acc = [packet.build(missionboard.MSG_MISSION_ACCEPT_REPLY, b"",
                                      self.reply_seq(), p["conn"])]
+                # a story mission's byte moved 0 -> 1 (missionbook.story_accept_apply):
+                # hand the client the flag block now, the story gates tool's push
+                if (_kept and _kept[-1].get("story_byte") is not None
+                        and missionbook.MISSION_ACCEPT_STORY == 1):
+                    _acc.append(scriptcall.flags_push_packet(self, p["conn"], self.playing_char()))
+                    log(f"{self.peer}   -> 0x{resultpush.MSG_RESULT_PUSH:04X} FLAGS push "
+                        f"(queue seq 0x{pushes.QUEUE_SEQ:08X}): story byte "
+                        f"{_kept[-1]['story_byte']} = 1 in the owned table, no record, "
+                        f"no money (FMO_MISSION_ACCEPT_STORY=1)")
+                return _acc
             if _code is not None:
                 log(f"{self.peer}   -> 0x{charselect.MSG_FAIL:04X} REFUSED BY THE GATE, "
                     f"code {_code} (wire 0x{_code & 0xFFFF:04X}): the client "
@@ -3207,6 +3553,74 @@ class Session(
                 f"'Confirmation'. FMO_MISSION_ACCEPT={missionboard.MISSION_ACCEPT!r}; this "
                 f"is a DELIBERATE refusal, not a gate on anything the pilot is.")
             return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(), _code & 0xFFFF)]
+
+        if (p["msg"] == areatargets.MSG_ORDER_REQ and charselect.ANSWER_LOBAPI
+                and missionboard.ORDER):
+            # KEY: THE ORDER (0x0194 -> 0x0195): a sector / area mission's
+            # taker issues a derived mission (missionboard's ORDER block).
+            # Body = payload + 0x20; +0x000 template, +0x004 source key,
+            # +0x038 op time, +0x13C base / +0x140 chosen Order MP, +0x144
+            # percent (0x611C4CF0, re-read 2026-09-30).
+            _ob = bytes(p["payload"][areatargets.ORDER_BODY:areatargets.ORDER_BODY + 0x14C])
+            _char = self.playing_char() if charstore.CHAR_STORE else None
+            if len(_ob) < 0x148 or _char is None:
+                log(f"{self.peer}   0x0194 = ORDER: "
+                    + ("too short" if len(_ob) < 0x148 else "no pilot on this connection")
+                    + f" -> 0x0002 code {missionboard.ORDER_CODE_FAIL} (27:4)")
+                return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(),
+                                     missionboard.ORDER_CODE_FAIL & 0xFFFF)]
+            self.log_order(p["payload"])       # every field named, kept on the pilot
+            _of = {o: struct.unpack_from("<I", _ob, o)[0] for o in areatargets.ORDER_FIELDS}
+            _oname = _ob[areatargets.ORDER_NAME:areatargets.ORDER_NAME + areatargets.ORDER_NAME_LEN
+                         ].split(b"\0")[0].decode("cp932", "replace")
+            _ocm = _ob[areatargets.ORDER_COMMENT:areatargets.ORDER_COMMENT + areatargets.ORDER_COMMENT_LEN
+                       ].split(b"\0")[0].decode("cp932", "replace")
+            for _m, _n in missionbook.order_expire_apply(_char):
+                log(f"{self.peer}   ORDER {_m['derived']} {_m.get('name')!r} expired "
+                    f"untaken: Order MP {_n} refunded")
+            _e, _code, _why = missionbook.order_create(_char, self.account, _of,
+                                                      issuer=_oname, comment=_ocm)
+            if _e is None:
+                log(f"{self.peer}   0x0194 = ORDER from key {_of[0x004]} (template "
+                    f"{_of[0x000]:#x}, chosen MP {_of[0x140]}) REFUSED: {_why} -> "
+                    f"0x0002 code {_code} (the poll 0x611CD170's failure arm)")
+                return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(),
+                                     _code & 0xFFFF)]
+            try:
+                self.commit(f"ORDER: {_why}")
+            except Exception as _e2:
+                log(f"{self.peer}   WARNING: the order was NOT banked ({_e2!r})")
+            log(f"{self.peer}   0x0194 = ORDER by {_oname!r}, comment {_ocm!r}: {_why}. "
+                f"-> 0x{missionboard.MSG_ORDER_REPLY:04X} empty: the client draws 21:27 "
+                f"'This mission has been ordered.' It is listed for other pilots "
+                f"(category {_e['cat']}) until taken; Cancel refunds the Order MP "
+                f"while it is still Ordered.")
+            return [packet.build(missionboard.MSG_ORDER_REPLY, b"", self.reply_seq(), p["conn"])]
+
+        if (p["msg"] == missionboard.MSG_MISSION_CANCEL and charselect.ANSWER_LOBAPI
+                and missionboard.ORDER and len(p["payload"]) >= 4):
+            # a CANCEL of one of this pilot's own ORDERS (its key is the
+            # derived id): refund the Order MP only while it is still
+            # Ordered (guide/mission 154-155); anything else falls through
+            _ok = struct.unpack_from("<I", p["payload"], 0)[0]
+            _char = self.playing_char() if charstore.CHAR_STORE else None
+            _m, _was, _ref = (missionbook.order_cancel_apply(_char, _ok)
+                              if _char else (None, None, 0))
+            if _m is not None:
+                if _was == "ordered":
+                    try:
+                        self.commit(f"ORDER {_m['derived']} cancelled, Order MP "
+                                    f"{_ref} refunded")
+                    except Exception as _e2:
+                        log(f"{self.peer}   WARNING: order cancel NOT banked ({_e2!r})")
+                log(f"{self.peer}   0x0196 = CANCEL of ORDER {_m['derived']} "
+                    f"{_m.get('name')!r}: was {_was}"
+                    + (f" -> cancelled, Order MP {_ref} REFUNDED" if _was == "ordered"
+                       else " -- only an Ordered mission can be cancelled; nothing "
+                            "refunded")
+                    + f" -> 0x{missionboard.MSG_MISSION_CANCEL_REPLY:04X} empty")
+                return [packet.build(missionboard.MSG_MISSION_CANCEL_REPLY, b"",
+                                     self.reply_seq(), p["conn"])]
 
         if (p["msg"] in (missionboard.MSG_MISSION_REPORT, missionboard.MSG_MISSION_CANCEL)
                 and charselect.ANSWER_LOBAPI and missionboard.MISSION_REPORT):
@@ -3263,7 +3677,10 @@ class Session(
                                 f"{_was} -> {_m.get('status')}"
                                 + (f", reward H$ {_pay['hs']}/MP {_pay['mp']} "
                                    f"owed at the Personnel Officer"
-                                   if _pay else ""))
+                                   if _pay else "")
+                                + (f", contribution +{_pay['contrib']} banked "
+                                   f"(FMO_MISSION_CONTRIB)"
+                                   if _pay and _pay.get("contrib") else ""))
                 except Exception as _e:
                     log(f"{self.peer}   WARNING: report of mission {_mid} NOT banked "
                         f"({_e!r})")
@@ -3281,12 +3698,21 @@ class Session(
                    + ("" if servicerecord.SALARY else " -- WARNING: but FMO_SALARY=0, so no "
                       "paybook is served and it stays owed")
                    if _pay else "")
+                + (f"; contribution +{_pay['contrib']} BANKED now (shown at the "
+                   f"next 0x014A)" if _pay and _pay.get("contrib") else "")
                 + (". WARNING: Its time was up: the deadline is "
                    f"{missionbook.mission_deadline()}s from the accept." if _was == "expired"
                    else ""))
             return [packet.build(missionboard.MSG_MISSION_REPORT_REPLY,
                                  missionlist.reply_018f(_mid, _m.get("name", ""), _f),
                                  self.reply_seq(), p["conn"])]
+
+        if (p["msg"] in coliseum.HANDLED and coliseum.COLISEUM
+                and charselect.ANSWER_LOBAPI):
+            # THE COLISEUM DESKS (coliseum.py): the arena list, register,
+            # cancel, host, the bracket / streak board and the streak's
+            # return. FMO_COLISEUM=0 leaves them to the zero stubs below.
+            return self.on_coliseum(p)
 
         if p["msg"] in lobapi.LOBAPI:
             reply, need = lobapi.LOBAPI[p["msg"]]
@@ -3443,9 +3869,9 @@ class Session(
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
     addressing, areachange, areatargets, battleend, battlegroups, battlemaps, charlist,
-    charselect, charstore, citytable, community, cosmetics, economy, groupchannel, grouplogin,
-    handshake, hangar, identity, inventory, lobapi, lobbymessage, missionblock, missionboard,
-    missionbook, missionlist, move, packet, partsstock, popnames, popnation, popself, progress,
-    pushes, ranks, referee, resultpush, room, rooms, scriptcall, servicerecord, shop,
+    charselect, charstore, citytable, community, cosmetics, economy, gatetool, groupchannel,
+    grouplogin, handshake, hangar, identity, inventory, lobapi, loot, lobbymessage, missionblock, missionboard,
+    missionbook, missionlist, move, packet, partsstock, penalty, permits, popnames, popnation, popself,
+    progress, pushes, ranks, referee, resultpush, room, rooms, scriptcall, servicerecord, shop,
     sortiepush, squadron, status, timesync, warmap, withdraw, zonecontrol, zoneentry,
 )

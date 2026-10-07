@@ -1,9 +1,173 @@
 """The enemy squad the client runs: squad owners, positions, the fire and hit relays and kill
 credit."""
 import os
+import random
 import struct
 import time
-from .deps import fmoworld
+from .deps import fmosectors, fmoworld
+from .knobs import _env_int
+
+
+#: KEY: COM ENEMIES ARE DRESSED FROM SE's NPC SETS, not from the pilot's garage
+#: (2026-09-30). Until now every squad POP carried the viewing pilot's own
+#: parts at body+0x8C, so the pilot fought copies of itself. The dresser
+#: 0x611F70A0 resolves each record against the master tables with no
+#: ownership check, so the NPC-only sets (npc60-*, RECN/JAMR/SNPR/COMS-OCU/USN,
+#: WAP###) and the vehicle frames dress an enemy as well as a garage part.
+#: fmo-npc-loadouts.tsv (tools/fmodatagen/fmonpcloadouts.py) lists them.
+#: FMO_ENEMY_LOADOUTS=0 goes back to the pilot's parts.
+ENEMY_LOADOUTS = _env_int("FMO_ENEMY_LOADOUTS", "1") != 0
+NPC_LOADOUTS_TSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fmodata",
+    "fmo-npc-loadouts.tsv")
+#: body+0x125 on every squad POP (fmoworld.POP_HP_SCALE): the percent of the
+#: parts' record HP. We sent 0 and every enemy part had 1 HP (0x611F721A).
+ENEMY_HP_PCT = _env_int("FMO_ENEMY_HP_PCT", "100")
+#: the battle's NPC level when neither the war state's B.G.Cost nor the
+#: sector's NPC rank is known (the frontline zones' rows carry no rank). SE
+#: (update 050719): "NPC level 25 = sector B.G.Cost 5", so level = 5 x B.G.Cost.
+ENEMY_LEVEL = _env_int("FMO_ENEMY_LEVEL", "15")
+#: percent of enemies that pop as a tank or helicopter instead of a wanzer.
+#: Ours to tune; SE's mix is not recorded.
+ENEMY_VEHICLE_PCT = _env_int("FMO_ENEMY_VEHICLE_PCT", "15")
+#: WARNING: large mobile weapons. SE put them only in held sectors with NPC
+#: level >= 25 (cities 06/12 and 14/60: K.O.N.G. X-II for the O.C.U., Algem
+#: for the U.S.N.; supply sectors 06/13, 06/19, 14/53, 14/61: Retriever I /
+#: OSV-05b Clinton B). Which 0x19 frame is which was never seen on a screen,
+#: so this is off until it is: 1 = the first enemy of a level >= 25 battle is
+#: one of the 0x19 frames.
+ENEMY_BOSS = _env_int("FMO_ENEMY_BOSS", "0") != 0
+ENEMY_BOSS_LEVEL = 25
+
+
+def enemy_hp_scale(pct=None):
+    """The body+0x125 byte for `pct` percent: pct / 10, clamped to 1..255."""
+    pct = ENEMY_HP_PCT if pct is None else pct
+    return max(1, min(255, int(pct) // 10))
+
+
+def parse_loadout_parts(text):
+    """'0=11:196 4=12:97' -> [(0, 0x11, 196), (4, 0x12, 97)]."""
+    out = []
+    for tok in (text or "").split():
+        idx, _, rest = tok.partition("=")
+        kind, _, ident = rest.partition(":")
+        out.append((int(idx), int(kind, 16), int(ident)))
+    return out
+
+
+def load_npc_loadouts(path=None):
+    """[row dict] from fmo-npc-loadouts.tsv: kind, level, nation, role, name,
+    hp, parts (parsed). [] when the file is absent (the squad then falls back
+    to the pilot's parts, and says so)."""
+    rows = []
+    try:
+        with open(path or NPC_LOADOUTS_TSV, encoding="utf-8") as f:
+            cols = f.readline().rstrip("\r\n").split("\t")
+            for line in f:
+                r = dict(zip(cols, line.rstrip("\r\n").split("\t")))
+                try:
+                    rows.append({"kind": r["kind"], "level": int(r["level"]),
+                                 "nation": int(r["nation"]), "role": r["role"],
+                                 "name": r["name"],
+                                 "parts": parse_loadout_parts(r["parts"])})
+                except (KeyError, ValueError):
+                    continue
+    except OSError:
+        return []
+    return rows
+
+
+NPC_LOADOUTS = load_npc_loadouts()
+
+
+def enemy_level_for(host):
+    """(NPC level, why) for the battle `host` sortied into: 5 x the sector's
+    B.G.Cost when the war state has it for the pilot's tile, else 5 x the NPC
+    rank the war map showed for it (fmosectors.npc_rank_for, at least 1), else
+    FMO_ENEMY_LEVEL.
+
+    WARNING: rank = B.G.Cost is OURS. The client only draws the rank; SE's
+    050719 note ties level to B.G.Cost, and the NPC loadouts' levels (1..60 =
+    5 x 1..12, SE's "minimum B.G.Cost 12" sectors) fit the same x5 scale."""
+    sess = trade.LIVE_SESSIONS.get(host)
+    tile = (getattr(sess, "sector", None) or (None,))[0]
+    if tile is None:
+        return ENEMY_LEVEL, "FMO_ENEMY_LEVEL (no sector)"
+    try:
+        ws = warstate.war_state()
+        sec = ((ws.data.get("sectors") or {}).get(str(tile)) or {}) if ws is not None else {}
+        bg = int(sec.get("bg_max") or 0)
+    except Exception as e:               # the squad pops whatever the war state does
+        bg, why = 0, f"war state: {e!r}"
+    else:
+        why = "no sector B.G.Cost"
+    if bg > 0:
+        return 5 * bg, f"sector {tile} B.G.Cost {bg} x 5"
+    sel = getattr(sess, "sector_zone", None)
+    rank = (fmosectors.npc_rank_for(sel, tile)
+            if fmosectors is not None and sel is not None else None)
+    if rank is not None:
+        return (max(1, 5 * rank[0]),
+                f"sector {sel}:{tile} NPC rank {rank[0]} x 5 ({why})")
+    return ENEMY_LEVEL, f"FMO_ENEMY_LEVEL (tile {tile}: {why}, no NPC rank)"
+
+
+def pick_loadout(rows, level, nation, rnd, vehicle_pct=None, boss=False):
+    """One row of `rows` for an enemy of `nation` in a level-`level` battle:
+    a boss frame when `boss`, a tank or helicopter vehicle_pct percent of the
+    time, else a wanzer. Within the kind: the rows of the enemy's nation or
+    of either, at the highest level <= `level` (the lowest when none is).
+    None when the table has nothing."""
+    vehicle_pct = ENEMY_VEHICLE_PCT if vehicle_pct is None else vehicle_pct
+    kinds = ["wanzer"]
+    if boss:
+        kinds.insert(0, "boss")
+    elif vehicle_pct > 0 and rnd.randrange(100) < vehicle_pct:
+        kinds.insert(0, rnd.choice(("tank", "heli")))
+    for kind in kinds:
+        cands = [r for r in rows if r["kind"] == kind and r["nation"] in (0, nation)]
+        if not cands:
+            continue
+        below = [r["level"] for r in cands if r["level"] <= level]
+        best = max(below) if below else min(r["level"] for r in cands)
+        return rnd.choice([r for r in cands if r["level"] == best])
+    return None
+
+
+def squad_loadouts(n, level, nation, rows=None, rnd=None):
+    """n loadout rows (or None each, when the table is empty) for one squad."""
+    rows = NPC_LOADOUTS if rows is None else rows
+    rnd = rnd or random.Random()
+    boss = ENEMY_BOSS and level >= ENEMY_BOSS_LEVEL
+    return [pick_loadout(rows, level, nation, rnd, boss=(boss and i == 0))
+            for i in range(n)]
+
+
+def enemy_parts(sq, i):
+    """The part records squad unit `i` pops with: its loadout's, else the
+    squad's fallback (the pilot's parts), else None."""
+    los = sq.get("loadouts") or []
+    lo = los[i] if i < len(los) else None
+    if lo is not None:
+        return lo["parts"]
+    return sq.get("parts") or None
+
+
+def enemy_pop(sq, i, uid, pos, owner, side, unit_type, brain):
+    """The cmd-7 POP of squad unit `i` (id `uid`): an AI unit (client_kind 1)
+    owned by `owner`, dressed from its loadout, with the HP scale byte."""
+    return fmoworld.record_pop(
+        uid, unit_type=unit_type, pos=pos, client_kind=1,
+        name1="Enemy", name2=str(i + 1), nation=sq["nation"], side=side,
+        parts=enemy_parts(sq, i),
+        extra={battlepop.POP_AI_OWNER: struct.pack("<I", owner),
+               battlepop.POP_AI_BRAIN: struct.pack("<I", brain),
+               # client_kind 1 scales part HP by this byte x 10 % (0x611F7124);
+               # 0 left every enemy part at 1 HP. A per-unit percent wins
+               # (the solo area's stronger last enemy, solo._make_last).
+               fmoworld.POP_HP_SCALE: bytes([enemy_hp_scale(
+                   (sq.get("hp_pct") or {}).get(i))])})
 
 
 #: VERIFIED:KEY: THE ENEMY SQUAD. With
@@ -101,10 +265,16 @@ def squad_positions(base, n, spread, gap=40.0):
     return out
 
 
-def battle_squad_for(chan, base, nation, parts, now=None, mates=None):
+def battle_squad_for(chan, base, nation, parts, now=None, mates=None,
+                     level=None, rows=None, rnd=None, n=None):
     """(squad, owner channel or None) for the room `chan` stands in. Creates a
     squad owned by `chan`'s host when there is none, when its owner has left
-    the room, or when the owner's sortie is not the one it was made for."""
+    the room, or when the owner's sortie is not the one it was made for.
+    A new squad picks one NPC loadout per enemy (squad_loadouts) for the
+    battle's NPC level (`level`, else enemy_level_for); `parts` (the pilot's)
+    is only the fallback. Every pilot in the room gets the same squad, so all
+    of them see the same enemies. `n` overrides FMO_BATTLE_ENEMIES' count
+    for a new squad (the solo area opens with SE's two)."""
     ip = referee.chan_bkey(chan)
     key = worldchannel.chan_where(chan)          # the room THIS channel stands in
     sq = BATTLE_SQUADS.get(key)
@@ -118,13 +288,18 @@ def battle_squad_for(chan, base, nation, parts, now=None, mates=None):
         if (sq["owner"] != ip and owner_chan is None) or granted != sq["granted"]:
             sq = None
     if sq is None:
-        n, spread = BATTLE_ENEMIES
+        n, spread = (n or BATTLE_ENEMIES[0]), BATTLE_ENEMIES[1]
         uid0 = battlepop.BATTLE_DUMMY[0] if battlepop.BATTLE_DUMMY else 0x2222
         sq = {"owner": ip, "ids": [uid0 + i for i in range(n)],
               "pos": squad_positions(base, n, spread, squad_gap()),
               "dead": set(), "last_hit": {},
               "granted": (referee.BATTLE_STATE.get(ip) or {}).get("granted_at"),
               "nation": nation, "parts": parts, "made": now or time.time()}
+        if ENEMY_LOADOUTS:
+            if level is None:
+                level, sq["level_src"] = enemy_level_for(chan.addr[0])
+            sq["level"] = level
+            sq["loadouts"] = squad_loadouts(n, level, nation, rows=rows, rnd=rnd)
         BATTLE_SQUADS[key] = sq
     return sq, owner_chan
 
@@ -261,7 +436,7 @@ def squad_relay(chan, addr, cmd, body, arg8):
     sq = (referee.BATTLE_STATE.get(referee.chan_bkey(chan)) or {}).get("squad")
     if not sq or sq["owner"] != referee.chan_bkey(chan):
         return 0
-    ids = set(sq["ids"])
+    ids = set(sq["ids"]) | set(sq.get("allies") or ())   # solo allies move too
     if cmd == CMD_BM_MOVE_BATCH:
         body = squad_batch_filter(body, ids)
         if body is None:
@@ -316,10 +491,19 @@ def squad_note_hits(chan, body, arg8):
     [(target, shooter)] noted."""
     sq = (referee.BATTLE_STATE.get(referee.chan_bkey(chan)) or {}).get("squad")
     hl = parse_hitlist(body)
+    # PILOT ON PILOT: a pilot's own hit list naming a pilot of its own side
+    # is filed on the victim's battle state (penalty.note_friendly_fire); the
+    # victim is asked 11:9 after the battle. Squad or no squad.
+    if hl and arg8 is not None:
+        penalty.note_friendly_fire(chan, hl["hits"], arg8)
     if not sq or not hl or arg8 is None:
         return []
     ids = set(sq["ids"])
-    if arg8 in ids:
+    if arg8 in (sq.get("allies") or ()):
+        # a SOLO-AREA ally (solo.py) runs on the owner's client: its kill is
+        # the owner's (OURS; SE's page says nothing about pay)
+        who = ("host", sq["owner"])
+    elif arg8 in ids:
         who = ("npc", arg8)
     elif arg8 == chan.self_unit():
         who = ("host", referee.chan_bkey(chan))
@@ -369,4 +553,6 @@ def squad_credit_kill(sq, target, reporter, now=None, chans=None):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import battlepop, groupchannel, move, referee, room, rooms, worldchannel  # noqa: E402
+from . import (  # noqa: E402
+    battlepop, groupchannel, move, penalty, referee, room, rooms, trade, warstate, worldchannel,
+)

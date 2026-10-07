@@ -29,10 +29,14 @@ from .knobs import _env_float, _env_int
 #:           the 12 class slots at lobby+0x7C53, and transition.
 #:   +0x0F2 s16  platoon experience bonus percent (>100 prints pct-100)
 #:   +0x0F4 u8   -> 8:58 "The battle group will be automatically disbanded..."
-#:   +0x0F5 u8   NEW HANGAR RANK -> lobby+0x8BD (0x014A payload+0x39; we serve
-#:           0). Differs from the current byte -> 8:63 "Your hangar rank is
-#:           now %d." / 8:64 "Your maximum item capacity is now %d." via
-#:           0x611E3F20 / 0x611E3F50, unless 0x611F1660() says otherwise.
+#:   +0x0F5 u8   NEW HANGAR RANK -> lobby+0x8BD (0x014A payload+0x39). A SET,
+#:           not an add: when it differs from the current byte, 0x6117E409
+#:           writes it, after 8:63 "Your hangar rank is now %d." / 8:64 "Your
+#:           maximum item capacity is now %d." for whichever of the table
+#:           0x61399988 columns (0x611E3F20 wanzers / 0x611E3F50 items)
+#:           changed; skipped whole when 0x611F1660() != 0. Filled from
+#:           hangar.hangar_rank_at_battle_end (FMO_HANGAR_JOB_LEVEL), which
+#:           banks the same value 0x014A serves -- a 0 here would demote.
 #:   +0x104  372 B  THE RESULT BLOCK -> lobby+0x69C6 (0x5D dwords), only when
 #:           HAS BLOCK and [lobby+0x24] != 5. Fields the arm reads INSIDE it:
 #:           +0x108 u32 RESULT: won when it equals 1 with +0x144 == 1, else
@@ -82,6 +86,7 @@ S14C_REPLAY = 0x110
 S14C_SURV_TABLE = 0x140
 S14C_SURV_IDX = 0x144
 S14C_OP_BONUS = 0x17E
+S14C_NEXT_BATTLE = 0x8D                # within the block
 S14C_CLASS_ROWS = 0x27C
 S14C_CLASS_ROW_LEN = 0x10
 S14C_TAIL = 0x2CC
@@ -295,6 +300,100 @@ KILL_BONUS_HS = _env_int("FMO_KILL_BONUS_HS", "0")
 WIN_MONEY = _env_int("FMO_WIN_MONEY", "0")
 WIN_CONTRIB = _env_int("FMO_WIN_CONTRIB", "0")
 KILL_EXP = os.environ.get("FMO_KILL_EXP", "").strip()
+#: KEY: PILOT EXP COMES FROM JOB EXP (2026-09-30). The setup tutorial (AI/F00/D94
+#: 85, 86, 20): battle exp is split between the main and support jobs, a job
+#: that is not set gets none, and "raising each job level also raises your
+#: pilot level". The client derives nothing: Pilot level is the class-12 row's
+#: own exp (0x611782B0) and the 0x014C arm adds each row to the kind it names
+#: (0x6117E52C), so SE's server sent Pilot exp as its own row. Ours: the Pilot
+#: row is FMO_PILOT_EXP_PCT percent (default 100) of the job exp the battle
+#: paid (kinds 1..8). 0 = no Pilot row, as before.
+PILOT_EXP_PCT = _env_int("FMO_PILOT_EXP_PCT", "100")
+PILOT_KIND = 12
+JOB_KINDS = range(1, 9)
+#: FMO_EXP_PACE (battles per level; 0 = off, the old flat rows only). The D15
+#: curve's steps grow from 82,800 (Lv 2) to ~19M (Lv 50), so no flat amount can
+#: carry a pilot through the campaign; SE's exp grew with the fight (their 2005
+#: notes tune it by sector and zone). OUR stand-in: a WIN pays the jobs one
+#: Pilot-level step divided by the pace, at the pilot's current Pilot level, a
+#: loss half that -- so a level takes about `pace` wins at every level. It goes
+#: to the pilot's SET jobs (inventory.set_jobs, the 0x0167 tail): the main job
+#: takes FMO_EXP_MAIN_PCT percent (default 50) and the support jobs share the
+#: rest; a lone main job takes all of it. A pilot with no job set (a fresh one:
+#: 0x0166 serves the tail as zeros) is paid in FMO_EXP_JOBS (default 3, the
+#: Mechanic prod has paid since 09-10). The tutorial says exp is split between
+#: main and support; the ratio is ours. A guess to tune, not SE's numbers.
+EXP_PACE = _env_int("FMO_EXP_PACE", "0")
+EXP_JOBS = os.environ.get("FMO_EXP_JOBS", "").strip() or "3"
+EXP_MAIN_PCT = _env_int("FMO_EXP_MAIN_PCT", "50")
+#: KEY: THE SECTOR SCALES THE PACED EXP (2026-10-06). SE tuned exp by where
+#: the fight was, not by a flat amount: update 050628gp4sc1:26-27 「統制区および
+#: 占領区のNPC戦エリアにおいて、セクターの地形による獲得経験値量の変化が大きく
+#: なるよう調整しました。最大で、これまでの2倍程度の経験値を得られるセクターも
+#: 存在します」 (HQ and Occupied NPC areas: up to about twice the exp by sector),
+#: and 050815yi0hz6:35 「激戦区での取得経験値が調整され、より多くの経験値が取得
+#: できるようになりました」 (the Frontline pays more). Their per-sector numbers
+#: are not on any page we hold, and the terrain byte is unbound, so the key is
+#: the battle's NPC level (squad.enemy_level_for: 5 x B.G.Cost, else 5 x the
+#: NPC rank the war map shows, the difficulty the player picked the sector by).
+#: FMO_EXP_SECTOR_PCT = the percent paid at NPC level >= SECTOR_EXP_CAP_LEVEL
+#: (25 = rank 5), linear from 100 at level 0; FMO_EXP_FRONT_PCT multiplies it
+#: on the Frontline (zone kind 5). 100 / 100 = off, the flat pace as before.
+#: The shape (x2 at the hardest NPC sector, more on the Frontline) is SE's;
+#: the line between and the Frontline factor are OURS.
+EXP_SECTOR_PCT = _env_int("FMO_EXP_SECTOR_PCT", "100")
+EXP_FRONT_PCT = _env_int("FMO_EXP_FRONT_PCT", "100")
+SECTOR_EXP_CAP_LEVEL = 25
+FRONTLINE_ZONE_KIND = 5
+
+
+def parse_exp_jobs(spec):
+    """'3' / '1,5' -> [kinds]; job kinds only (1..8)."""
+    out = []
+    for piece in (spec or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        k = int(piece, 0)
+        if k not in JOB_KINDS:
+            raise ValueError(f"FMO_EXP_JOBS kind {k}: a job is 1..8")
+        if k not in out:
+            out.append(k)
+    return out
+
+
+def paced_exp_rows(level, won, curve, jobs, pace=None, main_pct=None):
+    """The paced battle exp for a pilot at Pilot `level`: one level step /
+    pace for a win, half for a loss. `jobs` is main first: the main job takes
+    main_pct percent and the rest share the remainder evenly (a lone job takes
+    all). Pure. -> [(kind, amount)]."""
+    pace = EXP_PACE if pace is None else pace
+    main_pct = EXP_MAIN_PCT if main_pct is None else main_pct
+    if pace <= 0 or not jobs or not curve or level >= len(curve):
+        return []
+    step = curve[level] - curve[level - 1] if level >= 1 else curve[0]
+    total = step // pace if won else step // (2 * pace)
+    if len(jobs) == 1:
+        rows = [(jobs[0], total)]
+    else:
+        main = total * max(0, min(100, main_pct)) // 100
+        each = (total - main) // (len(jobs) - 1)
+        rows = [(jobs[0], main)] + [(k, each) for k in jobs[1:]]
+    return [(k, a) for k, a in rows if a > 0]
+
+
+def sector_exp_pct(npc_level, zone=None, sector_pct=None, front_pct=None):
+    """The percent the paced exp is paid at for a battle at `npc_level` in
+    zone `zone` (a selector: 505/509/513 are the Frontline): 100 at level 0,
+    rising linearly to `sector_pct` at SECTOR_EXP_CAP_LEVEL and above, times
+    `front_pct` percent on the Frontline. Pure."""
+    sp = EXP_SECTOR_PCT if sector_pct is None else sector_pct
+    fp = EXP_FRONT_PCT if front_pct is None else front_pct
+    lv = max(0, min(int(npc_level or 0), SECTOR_EXP_CAP_LEVEL))
+    pct = 100 + (int(sp) - 100) * lv // SECTOR_EXP_CAP_LEVEL
+    if zone is not None and int(zone) // 100 == FRONTLINE_ZONE_KIND:
+        pct = pct * int(fp) // 100
+    return max(0, pct)
 
 
 def battle_kills(st):
@@ -310,14 +409,16 @@ def battle_kills(st):
 
 def battle_pay(kills, won, money=0, contrib=0, exp_rows=(), kill_contrib=None,
                kill_bonus_hs=None, win_money=None, win_contrib=None,
-               kill_exp=None):
+               kill_exp=None, pilot_pct=None):
     """What one battle pays, from what happened in it. Pure.
 
     `kills` is the count of distinct enemies destroyed, `won` the verdict,
     money/contrib/exp_rows the flat per-sortie pay. The per-kill and win knobs
     default to the module's. Returns {money, contribution, exp_rows,
     kill_bonus_hs, parts} where parts is a readable breakdown for the log.
-    Experience rows are merged by kind (the arm walks at most S14C_EXP_MAX)."""
+    Experience rows are merged by kind (the arm walks at most S14C_EXP_MAX),
+    and the Pilot row (kind 12) gets `pilot_pct` percent of the job exp on top
+    of any Pilot exp named directly; it always keeps its slot."""
     kc = KILL_CONTRIB if kill_contrib is None else kill_contrib
     kb = KILL_BONUS_HS if kill_bonus_hs is None else kill_bonus_hs
     wm = WIN_MONEY if win_money is None else win_money
@@ -342,7 +443,15 @@ def battle_pay(kills, won, money=0, contrib=0, exp_rows=(), kill_contrib=None,
         for kind, amount in kx:
             merged[int(kind)] = merged.get(int(kind), 0) + kills * int(amount)
         parts.append(f"kill exp {', '.join(f'{k}:+{kills * a}' for k, a in kx)}")
-    rows = list(merged.items())[:S14C_EXP_MAX]
+    pp = PILOT_EXP_PCT if pilot_pct is None else pilot_pct
+    jobs_exp = sum(a for k, a in merged.items() if k in JOB_KINDS)
+    if pp > 0 and jobs_exp > 0:
+        merged[PILOT_KIND] = merged.get(PILOT_KIND, 0) + jobs_exp * pp // 100
+        parts.append(f"Pilot exp +{jobs_exp * pp // 100} ({pp}% of the job exp)")
+    pilot = merged.pop(PILOT_KIND, 0)
+    rows = list(merged.items())[:S14C_EXP_MAX - (1 if pilot else 0)]
+    if pilot:
+        rows.append((PILOT_KIND, pilot))
     bonus = kills * kb if kb > 0 else 0
     if bonus:
         parts.append(f"Kill bonus H$ {bonus} owed at the Personnel Officer")
@@ -350,11 +459,22 @@ def battle_pay(kills, won, money=0, contrib=0, exp_rows=(), kill_contrib=None,
             "kill_bonus_hs": bonus, "parts": parts}
 
 
+def platoon_exp_rows(rows, pct):
+    """The battle's exp rows with the platoon bonus applied (see
+    battlegroups.platoon_exp_pct). EVERY row is scaled by the same percent --
+    the job rows and the Pilot row (kind 12, itself FMO_PILOT_EXP_PCT of the
+    job exp in battle_pay) alike -- so the Pilot row stays the same share of
+    the job exp it was before the bonus. Pure."""
+    if pct == 100:
+        return list(rows)
+    return [(k, int(a) * int(pct) // 100) for k, a in rows]
+
+
 def battle_end_body(hangar_rank=0, contrib_new=0, contrib_old=0, exp_rows=(),
                     won=True, platoon_pct=0, auto_disband=0, victory=0,
                     control=0, counterattack=0, participation=0, join_pct=0,
                     platoon_money=0, platoon_payer=0, op_bonus=0,
-                    has_block=True, block=b"", tail=b""):
+                    has_block=True, block=b"", tail=b"", next_battle=False):
     """The 0x014C body. `block` / `tail` are raw overrides for the 372-B result
     block and the 72-B tail; the named fields are written OVER them, so a
     captured block can be replayed with only the verdict authored."""
@@ -386,6 +506,11 @@ def battle_end_body(hangar_rank=0, contrib_new=0, contrib_old=0, exp_rows=(),
     struct.pack_into("<I", b, S14C_RESULT, 2 if won else 0)
     b[S14C_SURV_IDX] = 0
     b[S14C_OP_BONUS] = 1 if op_bonus else 0
+    # result block +0x8D (= lobby+0x6A53, "HasNextBattleWin"): nonzero sets
+    # lobby+0x6E42, and after an ARENA battle (lobby state 0xD) the client
+    # offers the streak's next battle and sends 0x01BB (coliseum.py)
+    if next_battle:
+        b[S14C_BLOCK + S14C_NEXT_BATTLE] = 1
     struct.pack_into("<I", b, S14C_PART_A, 1 if participation else 0)
     b[S14C_VICTORY] = 1 if victory else 0
     b[S14C_CONTROL] = 1 if control else 0

@@ -2,6 +2,7 @@
 import os
 import struct
 import time
+from .knobs import _env_int
 from .wirelog import log
 
 
@@ -200,8 +201,224 @@ def parse_0139(payload):
     }
 
 
+#: KEY: JOINING A BATTLE MAP (乱入), SE's rules (2026-09-30):
+#:   update 050628 lines 22-25: "As the join-in limit approaches, the kill and
+#:     counterattack bonuses of the side that joined decrease. Joining just
+#:     before the limit roughly halves them (about 50%); joining right after
+#:     the map was created pays more (up to about 120%). The group that
+#:     CREATED the map gets the normal bonus whatever the enemy's timing."
+#:   topics/060804: "until now ... enemy BGs could sortie in for only 5
+#:     minutes"; PvP maps now wait up to 20 minutes for an enemy BG ("WAITING
+#:     FOR OPPONENTS"), both sides starting fresh when it arrives; "once the
+#:     battle has started, joining is possible for 5 minutes as before."
+#:   guide/mapselector.html:60 and warmap.S15F_SIDE_CAP: 10 vs 10 per map.
+#: The client's own refusals (code -> message table 0x613955F0; the sortie
+#: failure arm 0x611818EE draws 10:6 with the code's line under it):
+JOIN_CODE_LATE = -31107       # 3:7 "This battle map is past its join-in window"
+JOIN_CODE_SIDE_FULL = -31100  # 3:3 "...At most 10 people can sortie to one sector."
+#: FMO_JOIN_WINDOW: seconds after a map's first sortie that others may still
+#: join (SE: 5 minutes = 300). 0 = no window and no side cap (the pre-09-30
+#: behaviour). FMO_JOIN_PVP_WAIT: how long a map nobody of the other side has
+#: reached yet stays open to that side (SE: 20 minutes = 1200); WARNING: SE did
+#: this on PvP-capable areas only, and this server does not know which areas
+#: those are, so it applies to every map (ours). FMO_JOIN_PCT_EARLY /
+#: FMO_JOIN_PCT_LATE: the late side's bonus percent just after creation and at
+#: the limit (SE: "about" 120 / 50); straight-line between them, OURS.
+JOIN_WINDOW = _env_int("FMO_JOIN_WINDOW", "300")
+JOIN_PVP_WAIT = _env_int("FMO_JOIN_PVP_WAIT", "1200")
+JOIN_PCT_EARLY = _env_int("FMO_JOIN_PCT_EARLY", "120")
+JOIN_PCT_LATE = _env_int("FMO_JOIN_PCT_LATE", "50")
+
+
+def join_pct(elapsed, window=None, early=None, late=None):
+    """The late side's bonus percent for joining `elapsed` s after the map
+    was created: linear from `early` at 0 to `late` at `window`. Pure."""
+    window = JOIN_WINDOW if window is None else window
+    early = JOIN_PCT_EARLY if early is None else early
+    late = JOIN_PCT_LATE if late is None else late
+    if window <= 0:
+        return 100
+    f = min(1.0, max(0.0, float(elapsed) / window))
+    return int(round(early + (late - early) * f))
+
+
+def join_verdict(entries, my_side, my_gid, now, cap=None, window=None,
+                 pvp_wait=None):
+    """Whether a pilot of side `my_side` (0/1), in battle group `my_gid`, may
+    sortie onto a battle map whose current fighters are `entries` =
+    [(side, granted_at, gid)] (not counting this pilot). Returns (code, why,
+    pct): code None = allowed; pct = its join-in bonus percent, or None for
+    the creating side (always 100%, SE). Pure."""
+    cap = warmap.S15F_SIDE_CAP if cap is None else cap
+    window = JOIN_WINDOW if window is None else window
+    pvp_wait = JOIN_PVP_WAIT if pvp_wait is None else pvp_wait
+    entries = [e for e in entries if e[0] in (0, 1)]
+    if window <= 0 or not entries:
+        return None, "creates the map" if entries == [] else "FMO_JOIN_WINDOW=0", None
+    first = min(entries, key=lambda e: e[1])
+    elapsed = now - first[1]
+    mine = [e for e in entries if e[0] == my_side]
+    if cap > 0 and len(mine) >= cap:
+        return JOIN_CODE_SIDE_FULL, (f"side {my_side} already has {len(mine)} of "
+                                     f"{cap} on this map (10 vs 10)"), None
+    if my_gid and any(e[2] == my_gid for e in entries):
+        return None, "joins its own battle group on the map", None
+    if my_side == first[0]:
+        if elapsed <= window:
+            return None, f"the creating side, {int(elapsed)} s in", None
+        return JOIN_CODE_LATE, (f"{int(elapsed)} s since the map was created, "
+                                f"the join-in window is {window} s"), None
+    if not mine and elapsed <= pvp_wait:
+        return None, (f"the first of its side, {int(elapsed)} s in (within the "
+                      f"{pvp_wait} s wait for opponents): both start fresh"), 100
+    if elapsed <= window:
+        return None, f"joins the enemy's map {int(elapsed)} s in", join_pct(elapsed, window)
+    return JOIN_CODE_LATE, (f"{int(elapsed)} s since the enemy created the map, "
+                            f"the join-in window is {window} s"), None
+
+
 class SessionSortie:
     """Session's sortie requests: 0x0139, the group sortie GO and the battle withdraw."""
+
+    def map_fighters(self, mapno, now=None):
+        """[(side, granted_at, gid)] of everyone else fighting on `mapno`
+        now, from BATTLE_STATE (the census warmap_census counts)."""
+        now = time.time() if now is None else now
+        stale = missionblock.MISSION_TIME if missionblock.MISSION_TIME > 0 else 3600
+        me = self.battle_key()
+        out = []
+        for host, st in list(referee.BATTLE_STATE.items()):
+            if (host == me or not isinstance(st, dict) or st.get("mapno") != mapno
+                    or st.get("ended") or now - st.get("granted_at", 0) >= stale):
+                continue
+            out.append((popnation.battle_side_for(host)[0], st["granted_at"],
+                        groupchannel.GROUP_OF.get(host)))
+        return out
+
+    def platoon_sortie_verdict(self, q, mapno):
+        """(code, why) when this sortie must be refused by a battle-group or
+        join-in rule, else None. Sets self.join_pct for the settlement."""
+        self.join_pct = None
+        gid = groupchannel.GROUP_OF.get(getattr(self, "account", None))
+        leader = bool(q.get("bgflag") and gid
+                      and battlegroups.group_leader(gid) == self.account)
+        st = battlegroups.group_state(gid) if gid else None
+        bonus = int((st or {}).get("bonus") or 0) if battlegroups.BG_BONUS else 0
+        if leader and bonus > 0:
+            mc = self.stored_money()
+            if mc is not None:
+                no = battlegroups.bonus_sortie_verdict(bonus, mc[0], pushes.SORTIE_COST)
+                if no is not None:
+                    return no
+        no = self.bg_cost_sortie_verdict(q, gid, st)
+        if no is not None:
+            return no
+        if JOIN_WINDOW <= 0 or mapno is None:
+            return None
+        fighters = self.map_fighters(mapno)
+        _pc = self.playing_char() if charstore.CHAR_STORE else None
+        side = (popnation.NATION_SIDE.get(popnation.character_nation(_pc)[0])
+                if _pc else popnation.battle_side_for(self.battle_key())[0])
+        if leader and bonus > 0 and any(f[0] == side for f in fighters):
+            # 2:99: a bonus group may not join a map its own side is on
+            return battlegroups.CODE_BONUS_ALLIES, (
+                f"group {gid} has a H$ {bonus} platoon bonus set and map {mapno} "
+                f"already has pilots of this side (2:99)")
+        if side not in (0, 1):
+            return None
+        code, why, pct = join_verdict(fighters, side, gid, time.time())
+        log(f"{self.peer}   JOIN-IN: map {mapno}, side {side}, "
+            f"{len(fighters)} other pilot(s) on it: {why}"
+            + (f" -> bonus {pct}%" if pct is not None else ""))
+        if code is not None:
+            return code, why
+        self.join_pct = pct
+        return None
+
+    def bg_cost_sortie_verdict(self, q, gid, st):
+        """(code, why) when a B.G.Cost rule refuses this sortie, else None
+        (battlegroups.cost_sortie_verdict). The pilot's own cost against the
+        group's Required B.G.Cost (3:11), the platoon total against the
+        sector's B.G.Cost (3:5), and the pilot against the sector minimum and
+        the minimum of the mission this sector's tile completes (3:8)."""
+        if not battlegroups.BG_COST:
+            return None
+        _pc = self.playing_char() if charstore.CHAR_STORE else None
+        cost = battlegroups.note_pilot_cost(getattr(self, "account", None), _pc)
+        if cost is None:
+            return None
+        tile = int(self.sector[0]) if self.sector else None
+        # WARNING: the war state carries bg_max / bg_min per sector (FMO_WAR_MAP
+        # serves them at +0x31 / +0x55), but nothing fills them yet: SE says
+        # they follow the supply rate (D08 102) and the formula is unknown.
+        # 0 = unknown, so these two rules wait for data.
+        sec = {}
+        ws = warstate.war_state() if tile is not None else None
+        if ws is not None:
+            sec = (ws.data.get("sectors") or {}).get(str(tile)) or {}
+        total = cost
+        if q.get("bgflag") and gid:
+            # the platoon's live members, this pilot always among them
+            mem = [a for a in groupchannel.GROUP_MEMBERS.get(gid, [])
+                   if a != self.account and groupchannel.group_member_live(a)]
+            total = battlegroups.group_total_cost(gid, mem + [self.account])
+        mission_min = 0
+        # only when the tile can name a mission (fmo-gates.json); without it
+        # progress_frontier would return every open mission
+        if tile is not None and _pc and progress.MISSION_TILES:
+            nat = popnation.character_nation(_pc)[0]
+            mission_min = battlegroups.mission_min_cost(
+                nat, progress.progress_frontier(_pc, tile=tile))
+        no = battlegroups.cost_sortie_verdict(
+            cost, total=total,
+            required=int((st or {}).get("required") or 0) if gid else 0,
+            sector_max=int(sec.get("bg_max") or 0),
+            sector_min=int(sec.get("bg_min") or 0), mission_min=mission_min)
+        log(f"{self.peer}   B.G.COST: pilot {cost}, total {total}, tile {tile}, "
+            f"sector {sec.get('bg_max') or '?'} / min {sec.get('bg_min') or '?'}, "
+            f"mission min {mission_min or '-'}"
+            + (f" -> REFUSED: {no[1]}" if no else " -> ok"))
+        return no
+
+    def platoon_sortie_record(self, q, mapno, conn_id):
+        """After a GRANTED sortie: the leader's group sortie takes the
+        B.G.Bonus from the leader's wallet (10:27) and counts the battle; a
+        member sortieing onto its group's map joins that battle. Returns the
+        packets to send (a 0x01A1 wallet store for the debit)."""
+        gid = groupchannel.GROUP_OF.get(getattr(self, "account", None))
+        if not gid or mapno is None:
+            return []
+        outs = []
+        if q.get("bgflag") and battlegroups.group_leader(gid) == self.account:
+            _pc = self.playing_char() if charstore.CHAR_STORE else None
+            pid = charlist.to_wire(_pc["id"]) if _pc and _pc.get("id") else 0
+            rec = battlegroups.group_battle_begin(gid, self.account, mapno, pid)
+            # the Scramble Board rule: members not Ready are left behind
+            # and removed (manual p.54; battlegroups.auto_remove_unready)
+            battlegroups.auto_remove_unready(gid, self.account)
+            if rec["bonus"] > 0:
+                now = self.credit_money(f"B.G.Bonus for group {gid}",
+                                        money=-rec["bonus"])
+                if now is None:
+                    rec["bonus"] = 0
+                    log(f"{self.peer}   WARNING: B.G.Bonus NOT taken: no stored "
+                        f"wallet, so nothing will be shared out either")
+                else:
+                    outs.append(pushes.fee_push_packet(conn_id, money=now[0]))
+                    log(f"{self.peer}   B.G.BONUS: H$ {rec['bonus']} taken from "
+                        f"the leader at sortie (10:27) -> wallet {now[0]}, "
+                        f"0x{pushes.MSG_FEE_PUSH:04X} store with no fee line")
+            log(f"{self.peer}   GROUP BATTLE: group {gid} battle {rec['n']}"
+                + (f" of {rec['n'] + rec['left']}" if rec["left"] is not None else "")
+                + f" on map {mapno}"
+                + (", Continuation = do not continue" if rec["cont_off"] else ""))
+        else:
+            rec = battlegroups.group_battle_join(
+                gid, self.account, mapno, max(JOIN_WINDOW, JOIN_PVP_WAIT, 600))
+            if rec is not None:
+                log(f"{self.peer}   GROUP BATTLE: joined group {gid}'s battle "
+                    f"{rec['n']} on map {mapno} ({len(rec['joined'])} member(s) in it)")
+        return outs
 
     def on_sortie(self, p):
         """0x0139 SelectBattleMap -> 0x013A (scene 4) or message 2 (refuse).
@@ -233,11 +450,15 @@ class SessionSortie:
         _mn = None
         if not SERVE_SORTIE:
             why = "FMO_SORTIE=0 (default): the sortie is not served"
-        elif charstore.TRAINING_GATE and not self.pilot_trained():
+        elif (charstore.TRAINING_GATE and not self.pilot_trained()
+              and q["create"] not in (penalty.CREATE_TRAINING, penalty.CREATE_RETRAIN)):
+            # the training sortie itself (0xE30A: create 3, 2 = retraining) is
+            # the door out of this gate; the sergeant fires it right after
+            # 104 [128] (0x8074 0x627e). Refusing it locked new pilots out.
             why = ("FMO_TRAINING_GATE=1: this pilot has not finished training "
                    "(progress byte 128 != 99). SE's flow: greet the sergeant, "
                    "do the training sortie, THEN sortie to the battlefields "
-                   "(intro/flow.html); the sergeant's event 205 sets the byte")
+                   "(intro/flow.html); 105 [128] after the training sets the byte")
         else:
             # KEY: THE SECTOR THE WAR MAP ASKED ABOUT WINS. self.sector is set
             # by the 0x015E that opened this screen; without one (a kycli
@@ -267,6 +488,24 @@ class SessionSortie:
             else:
                 # WARNING: the PS2 gate: the console's type-1 set is unknown
                 why = self.ps2_type1_refusal(sortie_mapno(_mn)[0])
+        if not why:
+            # JOIN-IN + PLATOON RULES (2026-09-30): the 5-minute window, 10 a
+            # side, and the leader's B.G.Bonus cover -- refused with the
+            # client's OWN code so 10:6 carries SE's reason under it.
+            try:
+                _pmap = int(sortie_mapno(_mn)[0])
+            except (TypeError, ValueError):
+                _pmap = None
+            _pno = self.platoon_sortie_verdict(q, _pmap)
+            # PENALTY: revoked clearance leaves only the (re)training sortie;
+            # also notes whether this is the retraining battle (create 2)
+            _pno = penalty.sortie_verdict(self, q) or _pno
+            if _pno is not None:
+                log(f"{self.peer}   -> 0x{charselect.MSG_FAIL:04X} FAILURE, code "
+                    f"{_pno[0]}: {_pno[1]}. 0x611818EE draws 10:6 with the "
+                    f"code's own line (table 0x613955F0).")
+                return [packet.build(charselect.MSG_FAIL, b"", self.reply_seq(),
+                                     _pno[0] & 0xFFFF)]
         if why:
             log(f"{self.peer}   -> 0x{charselect.MSG_FAIL:04X} FAILURE, code {charselect.FAIL_CODE}: "
                 f"{why}. The poller posts UI event 0x106F (10:6 \"Failed to "
@@ -338,12 +577,30 @@ class SessionSortie:
         _bsr0["start_unix"] = next(
             (struct.unpack_from("<I", r)[0] for l, _o, r, _s in fields
              if l == "StartGameTime" and r), None)
+        # SOLO AREA (solo.py, SE's Festa 2006 rules): a sortie to the solo
+        # sector (FMO_SOLO_AREA, default O.C.U. 統制区10 セクター14 =
+        # selector 109 tile 74149) runs the solo squad in this battle
+        _bsr0["solo"] = solo.solo_for(getattr(self, "sector_zone", None),
+                                      self.sector[0] if self.sector else None)
+        if _bsr0["solo"]:
+            log(f"{self.peer}   SOLO AREA: selector {_bsr0['solo']['area'][0]} tile "
+                f"{_bsr0['solo']['area'][1]} -- one NPC ally at a time (Assault, "
+                f"Mechanic, Missiler), {solo.ON_FIELD} enemies on the field, win at "
+                f"{solo.SOLO_KILLS} kills, lose at {solo.SOLO_ALLY_LOSSES} allies lost "
+                f"or the pilot's death")
         if progress.PROGRESS_ADVANCE:
             _pc = (self.playing_char() or {}) if charstore.CHAR_STORE else {}
             _fr = progress.progress_frontier(_pc) if _pc else []
             log(f"{self.peer}   progression armed for the return: frontier = "
                 + (" | ".join(m["title"] for m in _fr) if _fr else "(nothing)"))
         outs = [packet.build(MSG_SORTIE_REPLY, body, self.reply_seq(), p["conn"])]
+        # PLATOON: the B.G.Bonus debit and the group battle record. Never
+        # costs the pilot the sortie it was just granted.
+        try:
+            outs += self.platoon_sortie_record(q, _bsr0["mapno"], p["conn"])
+        except Exception as e:
+            log(f"{self.peer}   WARNING: platoon record failed ({e!r}); the "
+                f"sortie goes ahead without it")
         if pushes.SORTIE_COST > 0:
             _fee = self.fee_push(p["conn"], pushes.SORTIE_COST)
             if _fee:
@@ -357,6 +614,10 @@ class SessionSortie:
         shape. Message 1 = GO (0x6117C0F3 enters scene 4 from the latched
         lobby fields); any other id = 8:29 'Battle map login failed' and a
         clean reset to [lobby+0x24]=2."""
+        _arena = getattr(self, "arena_sortie", None)
+        if _arena:
+            # the Coliseum's 0x014E (coliseum.py): this pilot's arena match
+            return self.arena_sortie_go(p, _arena)
         mn, src = sortiepush.sortie_push_mapno()
         # GO is granted ONLY when a 0x014E actually went out this session AND
         # the map still resolves -- both, so a stale latch or a knob cleared
@@ -431,6 +692,11 @@ class SessionSortie:
             f"answers with a 0x0153 -- the client leaves the battle for the "
             f"granted lobby map. Empty body: 0x611766DC reads only the id.")
         outs = [packet.build(handshake.MSG_SESSION_START, b"", self.reply_seq(), p["conn"])]
+        if self.is_spectating():
+            # a Coliseum spectator leaving: no battle of its own, no pay
+            coliseum.coliseum().leave_spectate(self.account)
+            log(f"{self.peer}   COLISEUM: a spectator left the arena battle -- no pay")
+            return outs
         # a withdraw is never a win: sortie pay only, whatever was destroyed
         push = self.battle_result_push(p["conn"], "the battle withdraw", won=False)
         if push is not None:
@@ -443,3 +709,7 @@ from . import (  # noqa: E402
     addressing, charselect, charstore, groupchannel, handshake, missionblock, missionlist,
     packet, progress, pushes, referee, rooms, sortiepush, status, warmap, withdraw, zoneentry,
 )
+from . import battlegroups, charlist, popnation, warstate  # noqa: E402  (the join-in / platoon checks)
+from . import penalty  # noqa: E402  (the penalty refusal hook)
+from . import solo  # noqa: E402  (the solo area)
+from . import coliseum  # noqa: E402  (Coliseum spectators)

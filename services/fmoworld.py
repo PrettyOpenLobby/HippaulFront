@@ -632,6 +632,33 @@ POP_KIND = 0x18         # u32 -> 0x611D2FF0 (0->0, 2->2, 3->3, 4->4, else 1)
                         # the already-removed arm and need a flag we do not set.
 POP_FLOAT38 = 0x38      # float, read at 0x611EB121 -- but ONLY for UnitType
                         # 4 and 30, which is why it is left alone by default.
+#: KEY: THE PUSH WEIGHT, body+0x3C -> entity+0x183 (static 2026-09-30). The
+#: pairwise unit separation (0x611E7CF4..0x611E7E64) moves a unit only when its
+#: weight is > 0; a weight <= 0 is never pushed (and counts as 1000 against the
+#: other unit). The POP handler turns a 0 into 50.0 for UnitType 4 and 30
+#: (0x611EB15F), which is why every NPC we ever popped could be shoved, and two
+#: terminals SE authored at one kiosk pushed each other off it (LIVE 23:4xZ).
+#: SE's own NPC dresser 0x61100C40 writes -1.0 here: its NPCs were anchored.
+POP_WEIGHT = 0x3C       # float; -1.0 = immovable
+POP_WEIGHT_ANCHORED = -1.0
+#: The unit's HEIGHT, body+0x38 -> entity+0x17F (the POP_FLOAT38 slot): a 0 is
+#: defaulted to 1.6 for UnitType 4/30 (0x611EB136). The client stacks it on the
+#: floor y in its targeting and tag code (0x611EAC63, 0x611E990E = y + 2*h), so
+#: terminals sharing one kiosk need different heights to show both name tags --
+#: the retail kiosk carries MAP.SELECTOR high and SCRAMBLE.BOARD low.
+POP_HEIGHT = POP_FLOAT38
+#: The human's POSE, body+0x50 -> entity+0x197 (static 2026-10-02). The UnitType-4
+#: creator 0x611E7190 reads it and, for 1..7, builds a motion list in
+#: 0x611E6C50 that plays once the model loads: 1 = motion 1, 2 = 0xA0,
+#: 3 = 0xA0+0xB0, 4 = 0xB2, 5 = 0xB4, 6 = 0xB6, 7 = 0xA0+0xB4. 0 = none (we have
+#: always sent 0). 8 reads past the 8-entry table -- never send it. Applied at
+#: creation only. Seen live 2026-10-02: 1 kneeling on one knee, 2 seated
+#: (neutral), 4 seated TYPING at a computer, 6 saluting, 7 seated, hand on
+#: head (thinking); 3 showed no change; 5 untried. Seated poses sit on
+#: whatever is there -- the desk and chair come from the room, so the
+#: position has to put them in the seat.
+POP_POSE = 0x50
+POP_POSES = range(1, 8)
 #: VERIFIED: THE POSITION, and the reason the first POP created an invisible unit.
 #: `0x611EB08F` does `lea esi, [body+0x1C]` and hands it to `0x6110F4B0`, which
 #: copies FOUR DWORDS to `char+0x44`:
@@ -859,6 +886,23 @@ POP_PART_ORDER = (1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 10)
 #: importing the lobby module.
 POP_PART_KINDS = frozenset(
     [0x11, 0x13, 0x21, 0x31, 0x41] + [(n << 4) | 2 for n in range(1, 14)])
+#: KEY: A VEHICLE is record 0 with bit 3 set (static 2026-09-30). The model
+#: selector 0x611ED660 reads body+0x8E (record 0's kind): bit 3 arms it and
+#: the high nibble picks the model through 0x611ED74C (2 -> 3, 3 -> 2, 5 -> 6
+#: with sub body+0x8B, 4 -> the 0x611FC0F0 special, else 1). The dresser then
+#: resolves record 0 in the vehicle frame tables (0x611AC780 -> 0x611A5130 ->
+#: 0x611A4BC0: 0x19 -> 0x613C1398, 0x29 -> 0x613C1448, 0x39 -> 0x613C0E14)
+#: and ORs 8 into records 1..9 (0x611F7187). Only these three are allowed,
+#: and only at index 0: 0x49 leaves the model path, 0x59 needs a sub id.
+POP_VEHICLE_KINDS = frozenset((0x19, 0x29, 0x39))
+#: KEY: THE ENEMY'S HP SCALE, body+0x125 (static 2026-09-30). The dresser
+#: 0x611F70A0 switches on client_kind (unit+4 = body+0x00) through 0x611F7704:
+#: kind 1 takes 0x611F7124, `movzx ecx, byte [esi+0x129]; ecx *= 10` (unit+X
+#: = body+X-4, so body+0x125), every other kind uses 100. Each of records
+#: 0..3 then gets HP = record HP * that / 100 (0x611F71CA), clamped to
+#: 1..0xFFFF, so a zero byte leaves every part of a client_kind 1 unit at 1 HP.
+#: 10 = 100%.
+POP_HP_SCALE = 0x125
 
 
 def pop_parts_block(parts):
@@ -879,7 +923,12 @@ def pop_parts_block(parts):
         if idx in seen:
             raise ValueError("part index %d given twice" % idx)
         seen.add(idx)
-        if kind not in POP_PART_KINDS:
+        if kind in POP_VEHICLE_KINDS and idx != 0:
+            raise ValueError(
+                "vehicle kind %#04x at index %d: only record 0's kind is the "
+                "model selector (0x611ED660); the dresser ORs 8 into records "
+                "1..9 itself" % (kind, idx))
+        if kind not in POP_PART_KINDS and kind not in POP_VEHICLE_KINDS:
             raise ValueError(
                 "part kind %#04x has no master table (0x611758E0 sends it to "
                 "the default arm), so slot %d would silently stay empty"

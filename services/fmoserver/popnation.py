@@ -88,7 +88,12 @@ NATION_SIDE = {1: 0, 2: 1}
 
 
 def battle_side_for(host_ip):
-    """(side, source) for this host's pilot on a battle pop, or (None, why)."""
+    """(side, source) for this host's pilot on a battle pop, or (None, why).
+    In an arena match the side is the pilot's TEAM, whatever its nation."""
+    from . import coliseum               # late: coliseum imports half the package
+    _team = coliseum.side_for_key(host_ip)
+    if _team is not None:
+        return _team, f"arena match team {_team} (coliseum.py)"
     if not charstore.CHAR_STORE:
         return None, "no character store"
     for c in charstore.load_roster(identity.account_for(host_ip)):

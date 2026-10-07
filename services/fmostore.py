@@ -236,6 +236,38 @@ def set_squadron_insignia(group_id, insignia, who=None):
     return int(insignia), 0
 
 
+def squadron_nation(group_id):
+    """The nation recorded for a POL group's squadron (1 or 2), or 0. Never
+    raises."""
+    if not group_id:
+        return 0
+    try:
+        ready()
+        row = db.query_one(
+            "SELECT nation FROM fmo_squadron_nation WHERE group_id = %s",
+            (int(group_id),))
+    except Exception:
+        return 0
+    return int(row["nation"]) if row else 0
+
+
+def set_squadron_nation(group_id, nation, who=None):
+    """Record a squadron's nation once. Returns the nation on file afterwards
+    (the earlier one when there was one: a squadron does not change army),
+    or 0 when nothing could be written."""
+    prev = squadron_nation(group_id)
+    if prev:
+        return prev
+    try:
+        ready()
+        db.upsert("fmo_squadron_nation",
+                  {"group_id": int(group_id), "nation": int(nation),
+                   "set_by": who, "set_at": _now()}, key="group_id")
+    except Exception:
+        return 0
+    return int(nation)
+
+
 def store_accounts():
     """Every account key with at least one character."""
     try:

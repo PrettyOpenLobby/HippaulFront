@@ -184,6 +184,8 @@ def msn_rows(category, mapkind=None):
         out.append(fmomsn.mission_record(name, category if cat is None else cat,
                                          mark=MSN_MARK, fields=fields.get(i),
                                          mid=mid))
+    # the open ORDERS (derived missions other pilots issued) are rows too
+    out += missionbook.order_list_records(category, _zq)
     return out
 
 
@@ -287,12 +289,16 @@ def group_board_rows():
         # bytes at +0x114 (live: `03 01`, read as Required B.G.Cost and the
         # continue flag). Echoing them back is the honest fill -- they are the
         # player's own choices, not invented numbers.
-        _f114 = rec.get("f114") or ""
-        _req = 0
-        try:
-            _req = int(_f114.split()[0], 16) if _f114 else 0
-        except (ValueError, IndexError):
-            _req = 0
+        # CORRECTED 2026-09-30: +0x114 is TOTAL BATTLES and +0x115 the
+        # Required B.G.Cost (the create form's combos, labelled 9:37 and
+        # 9:41; see battlegroups.CREATE_TOTAL). This read +0x114 as the cost.
+        # The platoon record (battlegroups.group_state) holds both, the
+        # bonus and the battles fought; members come from the live roster.
+        _st = battlegroups.group_state(gid) or {}
+        _req = int(_st.get("required") or 0)
+        _left = (max(0, int(_st["total"]) - int(_st.get("battles") or 0))
+                 if _st.get("total") else 0)
+        _nmem = len(groupchannel.GROUP_MEMBERS.get(gid, []))
         rows.append(fmomsn.group_record(
             gid, name=name, comment=comment,
             # State 0 = not sortied, which also makes column "T" read
@@ -302,11 +308,14 @@ def group_board_rows():
             # field or it is not the only input. FMO_GROUP_BOARD=mark is how
             # that gets answered rather than guessed at.
             state=int(rec.get("state") or 0),
-            members=max(1, int(rec.get("members") or 1)),
-            sorties=int(rec.get("sorties") or rec.get("total_battles") or 0),
-            cost_now=int(rec.get("cost_now") or 0),
+            members=max(1, _nmem or int(rec.get("members") or 1)),
+            sorties=_left,
+            # +0x120, the "Total B.G.Cost" column while standing by: the
+            # members' own costs summed (battlegroups.group_total_cost);
+            # 0 while any member's is unknown, as before.
+            cost_now=int(battlegroups.group_total_cost(gid) or rec.get("cost_now") or 0),
             cost_required=int(rec.get("cost_required") or _req),
-            bonus=int(rec.get("bonus") or 0),
+            bonus=int(_st.get("bonus") or rec.get("bonus") or 0),
             mark=GROUP_BOARD_MARK))
     return rows
 
@@ -393,6 +402,24 @@ def msn_reply(peer, op, body):
             f"NULL record (0x6118C650, 0x610E8130). FMO_WAR={warstate.WAR!r}; '0' is the "
             f"old silence. WARNING: NOT CONFIRMED IN A LIVE SESSION: no client has taken an 0x21 yet.")
         return out
+    if op == fmomsn.OP_ORDER_TEMPLATES and missionboard.ORDER:
+        # KEY: KIND 5 = THE ORDER TEMPLATES (fmomsn.OP_ORDER_TEMPLATES): the
+        # Accepted Mission row 0's +0x08..+0x14 ids, answered as op 0x21
+        # pages of 524-B records; the callback 0x611C9160 takes the END's
+        # NULL (0x611C918D).
+        q = fmomsn.SectorQuery(body)
+        recs = missionbook.order_template_records(q.ids)
+        out = []
+        per = fmomsn.max_sectors_per_page()
+        for i in range(0, len(recs), per):
+            out.append((fmomsn.OP_SECTOR_PAGE, fmomsn.sector_page(recs[i:i + per])))
+        out.append((fmomsn.OP_END, fmomsn.build(fmomsn.OP_END)))
+        log(f"{peer}   op 0x0E = KIND 5, THE ORDER TEMPLATES (0x611AF670 from "
+            f"0x611C9850): ids {[hex(i) for i in q.ids]} -> {len(recs)} template(s) "
+            f"of {fmomsn.TEMPLATE_LEN} B in {len(out) - 1} op 0x21 page(s), then "
+            f"0x1B END. Base Order MP {missionboard.ORDER_BASE_MP}, reward "
+            f"{missionboard.ORDER_REWARD_PCT}% of the source's (FMO_ORDER_*, ours).")
+        return out
     # The job's kind ([mgr+0x37D] = job[0]) picks the op, and the whole set is
     # known even though only kind 3's records are decoded. Naming them here is
     # what makes the log readable when a screen we have never served asks.
@@ -469,4 +496,5 @@ def msn_reply(peer, op, body):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import battlegroups, sectorwins, warstate, zoneentry  # noqa: E402
+from . import battlegroups, groupchannel, sectorwins, warstate, zoneentry  # noqa: E402
+from . import missionboard, missionbook  # noqa: E402  (orders)

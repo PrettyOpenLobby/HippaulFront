@@ -3,8 +3,67 @@ import os
 import struct
 import time
 from .deps import fmoworld
+from .knobs import _env_float
 from .wirelog import hexdump, log
 from . import wirelog
+
+
+#: KEY: WHERE A CHAT LINE GOES IS THE CLIENT'S CHOICE OF CHANNEL (static
+#: 2026-09-30). Every chat command ends in 0x611D5830(.., channel, text),
+#: which writes the channel into the cmd-115 body's +0x00 and picks the
+#: connection by it (jump table 0x611D5BD0):
+#:   0, 5  the lobby world channel, else the battle-group channel
+#:   2, 6  the lobby world channel only (/say is 2; "lobby only")
+#:   3     the battle-group channel only (/bg; also the default in a battle,
+#:         where the world manager [0x613CA470] is gone)
+#:   7, 8  the two mission-group connections [0x613CA400] / [0x613CA3FC]
+#:   9     /squadron: handed to POL ([0x613AE380]+0x6C0), never reaches us
+#:   1, 4  nothing
+#: /tell is not a channel at all: it is the TCP request 0x0181 (trade.py).
+#: So a world channel carries only room kinds, and a group channel only
+#: group kinds; anything else is dropped rather than shown to the wrong
+#: people. The battle-group channel's own cmd 18 arm (0x611E4A20) draws a
+#: channel-3 line in the group colour; channel 1 there is a HUD banner
+#: (0x610E6420), which is why group lines are echoed on channel 3.
+CHAT_ROOM_KINDS = (0, 2, 5, 6)
+CHAT_GROUP_KINDS = (0, 3, 5)
+CHAT_ROOM_CHANNEL = 1           # cmd 18 channel on a world channel (live since 08-22)
+CHAT_GROUP_CHANNEL = 3          # cmd 18 channel on a group channel
+#: FMO_CHAT_SAY_RADIUS: /say reaches room-mates within this many map units
+#: of the speaker (x/z distance, from each client's cmd 240 position); 0
+#: (default) = the whole room, as before. SE's manual says /say is heard
+#: "around you" but gives no distance, so the number is ours to tune.
+CHAT_SAY_RADIUS = _env_float("FMO_CHAT_SAY_RADIUS", "0")
+
+
+def chat_route(chan, kind):
+    """(listeners, cmd-18 channel, scope) for a cmd-115 line of channel
+    `kind` sent on `chan`, or None when that kind does not belong on this
+    channel. Listeners never include the sender (it gets its own echo).
+
+    A group line goes to the OTHER members of the sender's battle group, by
+    account, wherever they are (their group channels outlive the lobby world
+    manager, so this holds in a battle too). A room line goes to the room,
+    within CHAT_SAY_RADIUS when that is set. A mission-group connection
+    carries only its own command's channel (missiongroups)."""
+    if getattr(chan, "mission_type", None):
+        return missiongroups.mission_chat_route(chan, kind)
+    if chan.key == groupchannel.GROUP_KEY:
+        if kind not in CHAT_GROUP_KINDS:
+            return None
+        return groupchannel.group_chat_listeners(chan), CHAT_GROUP_CHANNEL, "battle group"
+    if kind not in CHAT_ROOM_KINDS:
+        return None
+    from . import coliseum               # late: coliseum imports half the package
+    if coliseum.spectator_of_chan(chan) is not None:
+        return None             # SE: a Coliseum spectator cannot chat
+    heard = [o for o in rooms.room_mates(chan) if coliseum.spectator_of_chan(o) is None]
+    if CHAT_SAY_RADIUS > 0 and getattr(chan, "pos", None):
+        r2 = CHAT_SAY_RADIUS * CHAT_SAY_RADIUS
+        heard = [o for o in heard if getattr(o, "pos", None)
+                 and (o.pos[0] - chan.pos[0]) ** 2
+                 + (o.pos[2] - chan.pos[2]) ** 2 <= r2]
+    return heard, CHAT_ROOM_CHANNEL, "room"
 
 
 def _serve_datagram(sock, peers, dg, addr):
@@ -17,8 +76,20 @@ def _serve_datagram(sock, peers, dg, addr):
     # one address, each with its own reliable window, so they must be two
     # channel objects: a datagram that verifies under "group" is routed to a
     # pre-latched sibling keyed (host, port, "group"), never to the lobby's.
-    if groupchannel.GROUP_TABLES is not None and len(dg) >= 0x1C \
-            and fmoworld.parse(*groupchannel.GROUP_TABLES, dg):
+    _gparsed = (fmoworld.parse(*groupchannel.GROUP_TABLES, dg)
+                if groupchannel.GROUP_TABLES is not None and len(dg) >= 0x1C else None)
+    # KEY: A MISSION GROUP'S CONNECTION verifies under the same "group" key from
+    # the same socket; its kind (6 member, 5 leader) and the attach we sent
+    # tell it apart (missiongroups.mission_channel_for). FMO_MISSION_GROUP=0
+    # (default) never takes this branch.
+    _mchan = missiongroups.mission_channel_for(peers, addr, _gparsed) if _gparsed else None
+    if _mchan is not None:
+        chan = _mchan
+        chan.seen_at = time.time()
+        got = fmoworld.parse(*chan.tables, dg)
+        if got and got.get("kind") is not None:
+            chan.group_kind = got["kind"]
+    elif _gparsed:
         gkey = (addr[0], addr[1], "group")
         chan = peers.get(gkey)
         if chan is None:
@@ -126,7 +197,11 @@ def _serve_datagram(sock, peers, dg, addr):
             + ". The once-per-channel probes are re-armed for it.")
         chan.expect_restart = False
         _was_acct = chan.account
-        if chan.key == groupchannel.GROUP_KEY:
+        if getattr(chan, "mission_type", None):
+            # a restarted mission connection has a fresh self peer, and /mgl
+            # and /mgm send nothing until it holds the member blob again
+            chan.group_popped = False
+        elif chan.key == groupchannel.GROUP_KEY:
             # A GROUP channel restarts a second after the 0x0156/0x0157 that
             # re-armed it (live 09-27 21:28Z: the channels survived from before
             # the create/join, so their CREATION claimed nothing). Its own
@@ -342,8 +417,22 @@ def _serve_datagram(sock, peers, dg, addr):
                     f"sender would not have managed to send")
                 continue
             _who = " ".join(x for x in (_c["name1"], _c["name2"]) if x)
+            # KEY: WHO HEARS IT is decided by the channel kind and by identity,
+            # never by "everyone in the room" (see chat_route).
+            _route = chat_route(chan, _c["kind"])
+            if _route is None:
+                log(f"[udp {addr[0]}:{addr[1]}] CHAT from UnitID "
+                    f"{_c['unitid']} ({_who or 'unnamed'}) on channel kind "
+                    f"{_c['kind']}, {len(_c['text'])} chars: NOT relayed -- "
+                    f"that kind does not belong on this "
+                    f"{'group' if chan.key == groupchannel.GROUP_KEY else 'world'} "
+                    f"channel (see CHAT_ROOM_KINDS / CHAT_GROUP_KINDS)")
+                continue
+            _heard, _chat_ch, _scope = _route
             log(f"[udp {addr[0]}:{addr[1]}] CHAT from UnitID {_c['unitid']} "
-                f"({_who or 'unnamed'}, kind {_c['kind']}): {_c['text']!r}")
+                f"({_who or 'unnamed'}, kind {_c['kind']}, {_scope}): "
+                + (repr(_c['text']) if _scope == "room" else
+                   f"{len(_c['text'])} chars (group lines are not logged)"))
             # WARNING: THE SENDER FIRST, THEN THE ROOM. Chat down (cmd 18) rides
             # each listener's OWN stream, not an alias stream: 0x611E7480
             # formats "<name>: <text>" straight into the chat sink and never
@@ -366,18 +455,19 @@ def _serve_datagram(sock, peers, dg, addr):
                     f"(chat arm 3 reads them from the group member-info blob "
                     f"at +0x1C/+0x2D, which we serve as zeros) -- echoing as "
                     f"{_name!r} from {_nsrc}")
-            _line = fmoworld.record_chat(_c["text"], _name)
+            _line = fmoworld.record_chat(_c["text"], _name, channel=_chat_ch)
             chan.pending.append(_line)
-            _heard = [o for o in rooms.room_mates(chan)]
             for _o in _heard:
                 _o.pending.append(_line)
-            log(f"[udp {addr[0]}:{addr[1]}]   -> cmd {fmoworld.CMD_CHAT} to the "
-                f"sender as record {chan.tx_base + len(chan.pending) - 1}"
-                + (f" and relayed to {len(_heard)} other client(s) in the room: "
+            log(f"[udp {addr[0]}:{addr[1]}]   -> cmd {fmoworld.CMD_CHAT} "
+                f"(channel {_chat_ch}) to the sender as record "
+                f"{chan.tx_base + len(chan.pending) - 1}"
+                + (f" and relayed to {len(_heard)} other client(s) "
+                   f"({_scope}): "
                    + ", ".join(f"{o.addr[0]}:{o.addr[1]}" for o in _heard)
                    if _heard else
-                   " -- nobody else is in this room, so echoing to the sender "
-                   "IS the whole relay"))
+                   f" -- nobody else is in this {_scope}, so echoing to the "
+                   f"sender IS the whole relay"))
 
     # A pure ACK: no records of our own (FROM == TO), and +0x20 carries the
     # client's own TO so it can retire its backlog. flag=0 is deliberate --
@@ -429,7 +519,9 @@ def _serve_datagram(sock, peers, dg, addr):
         _guid = groupchannel.GROUP_POP_KEY or _cid or (popsweep.POP[0] if popsweep.POP else 1)
         _body = bytearray(0x1C8)
         struct.pack_into("<I", _body, 0x00, _guid)             # peer key -> peer+0x10
-        _lead, _lead_why = groupchannel.group_leader_for(addr[0])
+        _lead, _lead_why = (missiongroups.mission_leader_byte(chan)
+                            if getattr(chan, "mission_type", None)
+                            else groupchannel.group_leader_for(addr[0]))
         struct.pack_into("<I", _body, groupchannel.GROUP_POP_LEADER_OFF, _lead)
         struct.pack_into("<I", _body, groupchannel.GROUP_POP_FLAGS_OFF, groupchannel.GROUP_POP_FLAGS)
         # KEY: THE NAMES, and they are the same two fields the CHAT path already
@@ -465,6 +557,14 @@ def _serve_datagram(sock, peers, dg, addr):
             f"Leave for a solo test. Bar: the member is named, not '-'.")
     # A battle-group channel ("...group") carries no world: no self-POP, and
     # therefore none of the NPC/relook pops that key off chan.popped.
+    from . import coliseum               # late: coliseum imports half the package
+    if (not chan.popped and not coliseum.SPECTATE_SELF and chan.key
+            and chan.key.endswith(b"battle") and coliseum.spectator_of_chan(chan) is not None):
+        # FMO_COLISEUM_SPECTATE_SELF=0: a Coliseum spectator gets no unit of
+        # its own; marked popped so the fighters are still popped to it
+        chan.popped = True
+        log(f"[udp {addr[0]}:{addr[1]}] COLISEUM SPECTATOR: no own unit "
+            f"(FMO_COLISEUM_SPECTATE_SELF=0); the fighters follow")
     if (popsweep.POP and not chan.popped and chan.seen >= popself.POP_AFTER
             and not (chan.key and chan.key.endswith(b"group"))):
         uid, utype = popsweep.POP
@@ -679,6 +779,13 @@ def _serve_datagram(sock, peers, dg, addr):
             if uid >= 10 and rooms._is_battle_chan(chan):     # battle units only
                 chan.pop_args["extra"] = {
                     battlepop.POP_AI_OWNER: struct.pack("<I", uid & 0xFFFFFFFF)}
+            # PENALTY LEVEL (popself.penalty_pop_extra): the in-battle ammo/BP
+            # cut for a pilot holding 2+ penalty points; kept in pop_args so
+            # every re-POP carries it too
+            if _battle_pop:
+                _pen = popself.penalty_pop_extra(chan)
+                if _pen:
+                    chan.pop_args.setdefault("extra", {}).update(_pen)
             chan.pending.append(fmoworld.record_pop(
                 uid, look=_lk_now, **chan.pop_args))
         except ValueError as e:
@@ -783,34 +890,53 @@ def _serve_datagram(sock, peers, dg, addr):
                  or popsweep.next_pop_pos(rooms.WORLD_MAPS.get(addr[0]))[0])
         _snat = battlepop.BATTLE_DUMMY_NATION or {1: 2, 2: 1}.get(
             popnation.pop_nation_for(addr[0])[0], 2)
+        # the pilot's parts are only the fallback now: each enemy is dressed
+        # from its NPC loadout (squad.squad_loadouts) when the table has one
         _sparts = popparts.pop_parts_for(addr[0])[0]
-        _sq, _och = squad.battle_squad_for(chan, _base, _snat, _sparts)
+        _bst = referee.battle_state(referee.bkey(addr[0]))
+        # SOLO AREA (solo.py): the sortie grant marked this battle; the squad
+        # opens with SE's two enemies and the first ally (Assault)
+        _solo = _bst.get("solo")
+        _sq, _och = squad.battle_squad_for(chan, _base, _snat, _sparts,
+                                           n=solo.solo_on_field(_solo))
         _mine = _sq["owner"] == referee.bkey(addr[0])
         _owner = squad.squad_owner_uid(chan, _mine, _och)
-        _bst = referee.battle_state(referee.bkey(addr[0]))
+        if _solo and _mine:
+            solo.solo_squad_setup(_sq, _solo, _base)
         _bst["squad"] = _sq
         _bst.setdefault("enemies", set())
         for _i, (_eid, _epos) in enumerate(zip(_sq["ids"], _sq["pos"])):
             if _eid == _selfuid or _eid in _sq["dead"]:
                 continue
             try:
-                chan.pending.append(fmoworld.record_pop(
-                    _eid, unit_type=battlepop.BATTLE_DUMMY[1], pos=_epos, client_kind=1,
-                    name1="Enemy", name2=str(_i + 1), nation=_sq["nation"],
-                    side=popnation.enemy_side_for(addr[0])[0],
-                    parts=(_sq["parts"] or None),
-                    extra={battlepop.POP_AI_OWNER: struct.pack("<I", _owner),
-                           battlepop.POP_AI_BRAIN: struct.pack("<I", battlepop.BATTLE_DUMMY_AI)}))
+                # dressed from its NPC loadout, part HP scaled (squad.enemy_pop)
+                chan.pending.append(squad.enemy_pop(
+                    _sq, _i, _eid, _epos, _owner, popnation.enemy_side_for(addr[0])[0],
+                    battlepop.BATTLE_DUMMY[1], battlepop.BATTLE_DUMMY_AI))
             except ValueError as e:
                 log(f"[udp {addr[0]}:{addr[1]}] WARNING: SQUAD POP {_eid:#x} REFUSED "
                     f"BY OUR OWN GUARD: {e}")
                 continue
             _bst["enemies"].add(_eid)
+        _allies = solo.pop_allies(chan, _sq, _owner) if _sq.get("solo") else []
+        if _allies:
+            log(f"[udp {addr[0]}:{addr[1]}] -> SOLO AREA: ally "
+                + ", ".join(f"{u:#x} ({_sq['ally_info'][u]['role']}, "
+                            f"{(_sq['ally_info'][u]['loadout'] or {}).get('name', 'pilot parts')})"
+                            for u in _allies)
+                + f" on the pilot's side (body+0x27 -> unit+0x80, the AI target "
+                f"scan's skip 0x610A4C89); win at {_sq['solo']['kills']} kills, "
+                f"lose at {_sq['solo']['ally_losses']} allies lost")
         chan.dummy_id = _sq["ids"][0]
         chan.dummy_pos = tuple(_sq["pos"][0][:3])
         log(f"[udp {addr[0]}:{addr[1]}] -> ENEMY SQUAD: {len(_sq['ids'])} AI "
             f"wanzer(s) {', '.join(f'{i:#x}' for i in _sq['ids'])} (nation "
             f"{_sq['nation']}, brain {battlepop.BATTLE_DUMMY_AI}) round {tuple(_base[:3])}; "
+            + (f"NPC level {_sq['level']} ({_sq.get('level_src') or 'given'}), loadouts "
+               + ", ".join((lo['name'] if lo else "pilot's parts")
+                           for lo in _sq['loadouts'])
+               if _sq.get("loadouts") is not None else "dressed in the pilot's parts")
+            + f", part HP {squad.enemy_hp_scale() * 10}% (body+0x125); "
             + ("THIS client OWNS them (body+0x2C = its own id "
                f"{_selfuid:#x}): it runs the brains, its cmd 23/24/30/29 about "
                "them are relayed to the rest of the room."
@@ -1185,6 +1311,7 @@ def _serve_datagram(sock, peers, dg, addr):
     # rides this datagram rather than the next one -- see room_queue.
     roomrelay.room_queue(chan)
     groupchannel.group_queue(chan)          # a group channel: the OTHER members, by cmd 190
+    loot.loot_tick(chan, got)               # a group channel: spoils (cmds 214/215, 0xD8/0xD9/0xDB)
     chan.retire(got["ack"])
     # WARNING: Only as many records as fit the client's 1,400-B recv buffer (see
     # UDP_MAX_DATAGRAM). TO covers the slice, not the tail; the rest waits for
@@ -1233,7 +1360,8 @@ def _serve_datagram(sock, peers, dg, addr):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    battleend, battlepop, charlist, groupchannel, missionblock, npcroster, peerlink, poplook,
-    popnames, popnation, popparts, popself, popsweep, referee, room, roomrelay, rooms, squad,
-    udpconfig, warmap, worldchannel,
+    battleend, battlepop, charlist, groupchannel, loot, missionblock, missiongroups, npcroster,
+    peerlink, poplook,
+    popnames, popnation, popparts, popself, popsweep, referee, room, roomrelay, rooms, solo,
+    squad, udpconfig, warmap, worldchannel,
 )

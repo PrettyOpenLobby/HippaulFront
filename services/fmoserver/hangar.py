@@ -116,6 +116,87 @@ def hangar_resident_units(host_ip, place):
 HANGAR_REQUIRED_KEYS = (0x82080D00, 0x82080C00, 0x82080C01)
 
 
+#: KEY: HANGAR RANK (2026-09-30). SE, update 050628 lines 71-72:
+#:     ハンガーランクとアイテム所持数が、規定のジョブレベルに達したジョブ数に応じて
+#:     増加するようになりました。
+#:     ※既に規定のジョブレベルに達したジョブがある方は、バージョンアップ後に一度
+#:       戦闘を行った時点で変更が適用されます。
+#: -- hangar rank and item capacity grow with the number of jobs at a set job
+#: level, and the change lands after a battle. We served the byte as 0 in both
+#: places the client reads it.
+#:
+#: THE BYTE is lobby+0x8BD = 0x014A payload+0x39 (block+0x31). The client never
+#: uses it raw: 0x611E3F20 / 0x611E3F50 index a 16-row table at 0x61399988
+#: (rank clamped to 15), {u16 wanzers, u16 item capacity}, read from the image:
+#:     rank 0: 2/80   1: 2/100   2: 4/120   3: 4/140   4: 6/160   5: 6/180
+#:     6: 6/200   7: 8/220   8: 8/240   9..15: 8/250
+#: Rank 0 IS AI/F00/D94 record 3, 初期状態では、最大2つのヴァンツァーをセット
+#: アップすることができます. The capacity is the shop gate's bar (0x611785D0:
+#: item count lobby+0x10D5 >= cap refuses with -6, kind 0x14 exempt) and the
+#: loot check at 0x6117EDEE (count > cap -> 2:104 "You are carrying more
+#: items than the limit allows"); the wanzer count feeds the Select Wanzer
+#: screen (0x611755D0 at 0x6109F966). All of it runs only while 0x611F1660()
+#: returns 0, the header byte +4 of resource 0x14502 (AI/F32/D02.DAT), which
+#: is 0 in both the shipped and the English file; otherwise the client uses
+#: lobby+0xE24 instead.
+#:
+#: 0x014C +0x0F5 SETS the byte (0x6117E409 writes it whenever it differs) and
+#: announces 8:63 "Your hangar rank is now %d." / 8:64 "Your maximum item
+#: capacity is now %d." when the table's wanzer or capacity column changes --
+#: the %d is the table value, so the screen says "hangar rank 4" at byte 2.
+#: So both messages must carry the same stored rank or every battle end would
+#: reset it.
+#:
+#: SE never published the job level. FMO_HANGAR_JOB_LEVEL (ours, to tune,
+#: default 10): hangar rank = how many of jobs 1..8 are at that level or
+#: above. 0 = the old behaviour, 0 everywhere.
+HANGAR_JOB_LEVEL = _env_int("FMO_HANGAR_JOB_LEVEL", "10")
+HANGAR_TABLE = ((2, 80), (2, 100), (4, 120), (4, 140), (6, 160), (6, 180), (6, 200),
+                (8, 220), (8, 240), (8, 250), (8, 250), (8, 250), (8, 250), (8, 250),
+                (8, 250), (8, 250))
+HANGAR_JOBS = range(1, 9)                     # Assault .. Joker; 9-11 reserved, 12 Pilot
+
+
+def hangar_capacity(rank):
+    """(wanzers, item capacity) the client derives from a hangar rank byte."""
+    return HANGAR_TABLE[min(max(int(rank), 0), 15)]
+
+
+def hangar_rank_earned(char, level=None):
+    """Jobs 1..8 at or above the job level; 0 when the knob is 0. Pure."""
+    level = HANGAR_JOB_LEVEL if level is None else level
+    if level <= 0:
+        return 0
+    exp = classes.class_exp_of(char)
+    return sum(1 for k in HANGAR_JOBS if classes.class_level(exp.get(k, 0)) >= level)
+
+
+def hangar_rank_stored(char):
+    """The rank a battle end last banked (what 0x014A serves); 0 when none."""
+    if HANGAR_JOB_LEVEL <= 0:
+        return 0
+    v = (char or {}).get("hangar_rank")
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def hangar_rank_at_battle_end(char):
+    """(rank, line, changed): SE applies the change after a battle, so the
+    battle end banks the earned rank on the character (the caller commits
+    when `changed`) and serves it in 0x014C +0x0F5."""
+    if char is None:
+        return 0, "hangar rank: no pilot, +0x0F5 = 0", False
+    if HANGAR_JOB_LEVEL <= 0:
+        return 0, "hangar rank: FMO_HANGAR_JOB_LEVEL=0, +0x0F5 = 0 (the old behaviour)", False
+    was, new = hangar_rank_stored(char), hangar_rank_earned(char)
+    changed = char.get("hangar_rank") != new
+    char["hangar_rank"] = new
+    w, cap = hangar_capacity(new)
+    return new, (f"hangar rank {was} -> {new} ({new} job(s) at Lv {HANGAR_JOB_LEVEL}+, "
+                 f"FMO_HANGAR_JOB_LEVEL): {w} wanzers, {cap} items"
+                 + (" -- the client announces 8:63/8:64 where the table value changed"
+                    if hangar_capacity(was) != (w, cap) else "")), changed
+
+
 def hangar_owner_password(host):
     """The stored hangar password of the character `host` is playing, or None."""
     n1, n2, _src = popnames.pop_names_for(host)
@@ -127,4 +208,4 @@ def hangar_owner_password(host):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import charstore, identity, inventory, move, popnames, popsweep  # noqa: E402
+from . import charstore, classes, identity, inventory, move, popnames, popsweep  # noqa: E402

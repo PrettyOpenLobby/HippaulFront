@@ -558,6 +558,16 @@ class Layout:
         b = self.band(band)
         return rows_ckinds(b["npcs"]) if b else {}
 
+    def heights(self, band):
+        """{key: height} overrides for a band, {} when none."""
+        b = self.band(band)
+        return rows_heights(b["npcs"]) if b else {}
+
+    def poses(self, band):
+        """{key: pose} overrides for a band, {} when none."""
+        b = self.band(band)
+        return rows_poses(b["npcs"]) if b else {}
+
     def roster(self, band, sign=-1):
         """(roster, names) in the server's own shape -- [(uid, utype,
         (x, y, z, w), cat)], {uid: (name1, name2)} -- or None."""
@@ -603,9 +613,15 @@ def validate_row(r):
            "face": None if r.get("face") is None else round(float(r["face"]) % 360.0, 1),
            "cat": None if r.get("cat") is None else int(r["cat"]),
            "label": (str(r["label"]) if r.get("label") else None),
-           "ckind": None if r.get("ckind") in (None, "") else int(r["ckind"])}
+           "ckind": None if r.get("ckind") in (None, "") else int(r["ckind"]),
+           "height": None if r.get("height") in (None, "") else round(float(r["height"]), 2),
+           "pose": None if r.get("pose") in (None, "", 0) else int(r["pose"])}
     if out["ckind"] is not None and out["ckind"] not in (0, 1, 2, 3):
         raise ValueError("ckind wants 0..3 (fmoworld.record_pop refuses the rest)")
+    if out["height"] is not None and not 0 < out["height"] <= 20:
+        raise ValueError("height wants 0..20 m (0 = the client's 1.6 default; omit it instead)")
+    if out["pose"] is not None and not 1 <= out["pose"] <= 7:
+        raise ValueError("pose wants 1..7 (fmoworld.POP_POSE; 8 overruns the client's table)")
     if not out["key"]:
         raise ValueError("a row needs an entity key")
     if out["label"] is not None:
@@ -636,6 +652,16 @@ def rows_to_roster(rows, sign=-1):
 def rows_ckinds(rows):
     """{key: client_kind} for the rows that override it. Pure."""
     return {int(r["key"]): int(r["ckind"]) for r in rows if r.get("ckind") is not None}
+
+
+def rows_heights(rows):
+    """{key: height} for the rows that set one (fmoworld.POP_HEIGHT). Pure."""
+    return {int(r["key"]): float(r["height"]) for r in rows if r.get("height") not in (None, "")}
+
+
+def rows_poses(rows):
+    """{key: pose} for the rows that set one (fmoworld.POP_POSE). Pure."""
+    return {int(r["key"]): int(r["pose"]) for r in rows if r.get("pose") not in (None, "", 0)}
 
 
 def roster_to_rows(roster, names, sign=-1):

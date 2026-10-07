@@ -1,7 +1,8 @@
-"""Player trade: the trade messages, records and the trade service between two pilots."""
+"""Player to player: the trade service, the /tell service, and the per-session push queue they share."""
 import os
 import struct
 import time
+import weakref
 from .knobs import _env_int
 from .wirelog import log
 
@@ -441,7 +442,22 @@ class SessionTrade:
             q = self.trade_pushes = []
         q.append((body, what))
 
+    def queue_push(self, mid, body, what):
+        """Any catalogued push for THIS session, delivered on its next
+        keepalive with the trade pushes (a tell, a kick notice). Refused here,
+        not at delivery, when the dispatcher would drop the id in silence."""
+        if mid not in pushes.LOBBY_PUSH_ALL:
+            raise ValueError(f"0x{mid:04X} is not in the lobby push catalogue")
+        q = getattr(self, "other_pushes", None)
+        if q is None:
+            q = self.other_pushes = []
+        q.append((mid, bytes(body), what))
+
     def trade_pushes_due(self, conn_id):
+        """Every push queued for this session, on its keepalive. Also marks
+        the session as heard from now (see pilot_online)."""
+        self.keepalive_at = time.time()
+        LIVE_PILOTS.add(self)
         out = []
         for body, what in getattr(self, "trade_pushes", None) or ():
             out.append(packet.build(MSG_TRADE_PUSH, body, pushes.QUEUE_SEQ, conn_id))
@@ -449,7 +465,54 @@ class SessionTrade:
                 f"(mode {body[TRADE_STATE_OFF]}) on queue seq "
                 f"0x{pushes.QUEUE_SEQ:08X}: {what}")
         self.trade_pushes = []
+        for mid, body, what in getattr(self, "other_pushes", None) or ():
+            out.append(packet.build(mid, body, pushes.QUEUE_SEQ, conn_id))
+            log(f"{self.peer}   -> 0x{mid:04X} push, {len(body)}B on queue seq "
+                f"0x{pushes.QUEUE_SEQ:08X}: {what}")
+        self.other_pushes = []
+        # a relogged member of a still-standing battle group goes back into it
+        _ra = groupchannel.group_reattach(self, conn_id)
+        if _ra is not None:
+            out.append(_ra)
+        # the mission groups this pilot leads or belongs to (FMO_MISSION_GROUP)
+        try:
+            out += missiongroups.mission_attach_due(self, conn_id)
+        except Exception as e:                   # noqa: BLE001
+            log(f"{self.peer}   WARNING: mission group attach failed ({e!r})")
         return out
+
+    def on_tell(self, p, first, last, text):
+        """0x0181 carrying text: a /tell. Delivered to the named pilot only,
+        as a 0x014B kind 3 on THEIR next keepalive; refused (0x0185 with a
+        code) when nobody of that name is online or they are in the enemy
+        army. The text is never logged: a tell is between two people."""
+        target, why, code = tell_target(self, first, last)
+        if target is None:
+            log(f"{self.peer}   /tell to {first}.{last} ({len(text)} chars) "
+                f"REFUSED: {why} -> 0x{MSG_TELL_RESULT:04X} code {code}")
+            return [packet.build(MSG_TELL_RESULT, tell_result_body(code),
+                                 self.reply_seq(), p["conn"])]
+        # The sender's OWN pilot, not the names its address resolves to:
+        # two devices behind one router share an address.
+        _me = self.playing_char() if charstore.CHAR_STORE else None
+        n1, n2 = ((_me.get("first") or "", _me.get("last") or "") if _me
+                  else self.trade_names())
+        try:
+            body = lobbymessage.lobby_message_body(
+                text, kind=TELL_KIND, flag=0, first=n1, last=n2,
+                sender=int(getattr(self, "playing", 0) or 0))
+        except ValueError as e:
+            log(f"{self.peer}   /tell to {first}.{last} not built: {e}")
+            return [packet.build(MSG_TELL_RESULT,
+                                 tell_result_body(TELL_CODE_OFFLINE),
+                                 self.reply_seq(), p["conn"])]
+        target.queue_push(lobbymessage.MSG_LOBBY_MESSAGE, body,
+                          f"a tell from {n1}.{n2} ({len(text)} chars)")
+        log(f"{self.peer}   /tell from {n1}.{n2} to {first}.{last} "
+            f"({len(text)} chars): queued for {target.peer} only, as 0x014B "
+            f"kind {TELL_KIND} on its next keepalive -> message 1 (delivered)")
+        return [packet.build(handshake.MSG_SESSION_START, b"", self.reply_seq(),
+                             p["conn"])]
 
     def trade_cancel(self, t, why):
         """End an open or offered trade as cancelled. The partner learns it
@@ -512,7 +575,137 @@ class SessionTrade:
             f"0x017D mode 2 queued for each (per recipient: give / receive).")
 
 
+# --------------------------------------------------------------------------- #
+# /tell -- ONE PILOT TO ONE NAMED PILOT (static 2026-09-30)
+# --------------------------------------------------------------------------- #
+#: KEY: A TELL IS A LOBBY TCP REQUEST, NOT A WORLD-CHANNEL LINE. The /tell
+#: handler 0x611DD940 splits "first.last text", prints the sender's own
+#: ">> first.last: text" locally (0x611D4EF0 kind 3, or 7 for a GM), and builds
+#: message 0x0181 (0x61162F00, the second builder, 0x41A bytes):
+#:   +0x09  u8   the sender's GM flag (globals+0x31CA)
+#:   +0x10  17B  the recipient's first name
+#:   +0x21  17B  the recipient's last name
+#:   +0x32       the text, NUL-terminated
+#: Its poll (vtable 0x6133A058, update 0x61162FD0) takes message 1 as
+#: delivered and says nothing; 0x0185 with +0x04 == 0 is also success; 0x0185
+#: with +0x04 != 0, or any other id, draws the code's line from the client's
+#: table at 0x613955F0 (0x6116CE10). The room-member "Login Check" sends the
+#: same id from 0x61179AB8 with the two names and NO text, which is how the
+#: two are told apart.
+#: The recipient's side is the lobby push 0x014B kind 3 (arm 0x6117E03E):
+#: " <<first.last: text" in the chat window, after the ignore filter
+#: 0x610DE8C0(sender id +0x410, names +0x3EC/+0x3FD).
+#: Before this, 0x0181 with text was answered as a Login Check: the sender
+#: saw its own ">>" line and nothing reached anybody. Nothing leaked; the
+#: tell was dropped.
+MSG_TELL = 0x0181
+Q181_GM = 0x09
+Q181_FIRST, Q181_LAST, Q181_TEXT = 0x10, 0x21, 0x32
+Q181_NAME_LEN = 0x11
+MSG_TELL_RESULT = 0x0185
+S185_CODE = 0x04
+#: 2:64 "The player with that name is not logged in." / 2:57 "The player with
+#: that name is not in your army." (rows of the table at 0x613955F0).
+TELL_CODE_OFFLINE = -14070
+TELL_CODE_ENEMY = -14061
+TELL_KIND = 3
+#: FMO_TELL=1 (default): deliver tells. 0 = the old answer (a Login Check).
+TELL = _env_int("FMO_TELL", "1") != 0
+#: FMO_TELL_ONLINE_S: a pilot counts as online while its keepalive (every
+#: 15 s) was heard within this many seconds. Ours.
+TELL_ONLINE_S = _env_int("FMO_TELL_ONLINE_S", "60")
+#: Every game session that has sent a keepalive. Weak: a closed connection's
+#: session drops out once nothing else holds it, and pilot_online ages out the
+#: rest. Keyed by the session object, not the address, so two devices behind
+#: one router are two entries (LIVE_SESSIONS keeps only one of them).
+LIVE_PILOTS = weakref.WeakSet()
+
+
+def parse_tell(payload):
+    """(first, last, text) from a 0x0181 body, or None when it carries no
+    text (a Login Check, or a short body). Pure."""
+    if len(payload) <= Q181_TEXT:
+        return None
+
+    def _s(off, n):
+        return payload[off:off + n].split(b"\0")[0].decode("cp932", "replace")
+
+    text = _s(Q181_TEXT, len(payload) - Q181_TEXT)
+    if not text.strip():
+        return None
+    return _s(Q181_FIRST, Q181_NAME_LEN), _s(Q181_LAST, Q181_NAME_LEN), text
+
+
+def tell_result_body(code):
+    """The 0x0185 refusal: +0x04 s32 = the code (0 would read as success)."""
+    return struct.pack("<Ii", 0, int(code))
+
+
+def live_pilots(now=None):
+    """The game sessions heard from within TELL_ONLINE_S, each once."""
+    now = time.time() if now is None else now
+    seen, out = set(), []
+    for s in list(LIVE_PILOTS) + list(LIVE_SESSIONS.values()):
+        if s is None or id(s) in seen:
+            continue
+        seen.add(id(s))
+        if now - (getattr(s, "keepalive_at", 0) or 0) <= TELL_ONLINE_S:
+            out.append(s)
+    return out
+
+
+def session_for_account(account, now=None):
+    """The live game session playing `account`, or None."""
+    if not account:
+        return None
+    for s in live_pilots(now):
+        try:
+            if s.account == account:
+                return s
+        except Exception:
+            continue
+    return None
+
+
+def _pilot_names(s):
+    try:
+        c = s.playing_char() if charstore.CHAR_STORE else None
+    except Exception:
+        c = None
+    if not c:
+        return None
+    return ((c.get("first") or "").strip().lower(),
+            (c.get("last") or "").strip().lower())
+
+
+def _nation(s):
+    try:
+        n = s.grant_nation()[0]
+    except Exception:
+        return None
+    return n if n in (1, 2) else None
+
+
+def tell_target(sender, first, last, now=None):
+    """(session, why, code) for a tell to first.last: the session when it may
+    be delivered, else None with the reason and the client's code. Matched by
+    the pilot's stored name, case-insensitive (the client already refused
+    anything but single-byte letters); an enemy is refused as SE did, never
+    told it was offline."""
+    want = ((first or "").strip().lower(), (last or "").strip().lower())
+    hits = [s for s in live_pilots(now) if _pilot_names(s) == want]
+    if not hits:
+        return None, "no pilot of that name is online", TELL_CODE_OFFLINE
+    mine = _nation(sender)
+    target = hits[0]
+    theirs = _nation(target)
+    if mine and theirs and mine != theirs:
+        return None, f"{first}.{last} is in the other army", TELL_CODE_ENEMY
+    return target, "", 0
+
+
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    charstore, economy, groupchannel, inventory, packet, popnames, pushes, shop,
+    charstore, economy, groupchannel, handshake, inventory, lobbymessage, missiongroups, packet,
+    popnames, pushes, shop,
 )

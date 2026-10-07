@@ -5,7 +5,7 @@ import os
 import struct
 import threading
 import time
-from .deps import fmostore
+from .deps import fmostore, fmoworld
 from .wirelog import log
 
 
@@ -41,6 +41,71 @@ TRAINING_GATE = (os.environ.get("FMO_TRAINING_GATE", "").strip() or "1") != "0"
 #: name." -- the ONE refusal code on that screen that draws a real message.
 NAME_UNIQUE = (os.environ.get("FMO_NAME_UNIQUE", "").strip() or "1") != "0"
 NAME_TAKEN_CODE = 0xC43B
+#: KEY: RESERVED NAMES (2026-09-30). Manual p.38: the name check answers
+#: either "already in use" or "This name cannot be used". The second is SE's
+#: code 0xC90E (also 0xC8F9), which the error table 0x613955F0 maps to 17:118
+#: "That name cannot be used. Please choose a different name."; it is one of
+#: the two codes the name step's failure arm tests by value (0x61178CDE).
+#: Refused: any first/last pair a lobby NPC carries (the client's own person
+#: catalogue, fmoworld.NPC_CATALOGUE, and the `=First.Last` labels of
+#: FMO_UDP_POP_NPC), and any name whose first name, last name or the two run
+#: together is one of FMO_NAME_RESERVED (comma list, case-insensitive) --
+#: staff-like words, so no pilot can pass for a GM. FMO_NAME_RESERVED=0 turns
+#: the whole check off.
+NAME_RESERVED_CODE = 0xC90E
+NAME_RESERVED_RAW = os.environ.get("FMO_NAME_RESERVED", "").strip() or (
+    "gm,gamemaster,admin,administrator,moderator,staff,support,system,sysop,"
+    "squareenix,squaresoft,playonline,official,server")
+NAME_RESERVED_ON = NAME_RESERVED_RAW != "0"
+NAME_RESERVED_WORDS = frozenset(w.strip().lower() for w in NAME_RESERVED_RAW.split(",")
+                                if w.strip() and NAME_RESERVED_ON)
+
+
+def _npc_name_pairs():
+    """Every (first, last) a lobby NPC carries, lower-cased."""
+    out = set()
+    for r in (getattr(fmoworld, "NPC_CATALOGUE", None) or {}).values():
+        if r and not str(r[0]).upper().startswith("NPC"):
+            out.add((str(r[0]).lower(), str(r[1]).lower()))
+    for tok in os.environ.get("FMO_UDP_POP_NPC", "").split(";"):
+        _, _, label = tok.partition("=")
+        first, dot, last = label.strip().partition(".")
+        if dot and first and last:
+            out.add((first.lower(), last.lower()))
+    return out
+
+
+NPC_NAME_PAIRS = _npc_name_pairs()
+
+
+def name_reserved(first, last, words=None, pairs=None):
+    """A reason string when (first, last) may not be used, else None. Pure
+    apart from the module tables it defaults to."""
+    if not NAME_RESERVED_ON and words is None:
+        return None
+    words = NAME_RESERVED_WORDS if words is None else words
+    pairs = NPC_NAME_PAIRS if pairs is None else pairs
+    f, l = (first or "").strip().lower(), (last or "").strip().lower()
+    if (f, l) in pairs:
+        return (f"{first!r} {last!r} is a lobby NPC's name -- refused with code "
+                f"0xC90E = 17:118 'That name cannot be used'")
+    for part in (f, l, f + l):
+        if part and part in words:
+            return (f"{first!r} {last!r}: {part!r} is reserved (FMO_NAME_RESERVED) "
+                    f"-- refused with code 0xC90E = 17:118 'That name cannot be used'")
+    return None
+
+
+def name_refusal(first, last, taken):
+    """(code, why) for a name a pilot may not take, or (None, None). `taken`
+    is the uniqueness clash string (or None); the reserved check runs first,
+    since an NPC's name is refused whether or not a pilot holds it."""
+    why = name_reserved(first, last)
+    if why:
+        return NAME_RESERVED_CODE, why
+    if taken and NAME_UNIQUE:
+        return NAME_TAKEN_CODE, taken
+    return None, None
 
 # --------------------------------------------------------------------------- #
 # THE CHARACTER STORE

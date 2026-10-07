@@ -17,7 +17,11 @@ The client loads it at 0x611E4440 and parses it at 0x611E4270 into the object at
                            "GenOff"), i (1000..73000: a cap, unread), 4c, 7i
                            (the last = display order)
     +0x1760  4 groups x 8 classes x 100 u32  EXP THRESHOLDS, [group][class][level-1]
-    +0x4960  100 u32  the "%di" tail (unread)
+    +0x4960  100 x 4 bytes, one row per level (the "%di" tail, [obj+0x1C]):
+                           byte 3 is the AREA TIER 0x611E4000 returns for
+                           Change Area (1-4 -> 1, 5-9 -> 2, 10-14 -> 3,
+                           15-19 -> 4, 20-50 -> 5, 51+ -> 6), held as
+                           fmoserver.permits.AREA_TIER_BANDS
 
 THE LEVEL FUNCTION 0x611E40A0(group, class, exp) -> level:
     threshold(L) = table[group][class][L-1]; L = 1 is the floor and L in

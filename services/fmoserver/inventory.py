@@ -515,6 +515,28 @@ SETUP_ITEM_OFF = 0x28                  # where the 21 equipped-item records star
 SETUP_ITEMS = 21                       # (0x220 - 0x28) / 24, exactly
 SETUP_TAIL_OFF = 0x1100                # 8 * 544 -- the u32 read at 0x6117B8A5
 REPLY_0166_LEN = SETUP_TAIL_OFF + 5    # 4357: the block, then a u32 and a byte
+#: KEY: THE TAIL IS THE SET JOBS (2026-09-30). lobby+0x3669..+0x366D, five job
+#: kinds, slot 0 the MAIN job (script getter 0x610F93DE), 0 = empty. The client
+#: sends them in 0x0167 at payload+0x1108 (0x6117857A) = our stored block's
+#: +0x1100, and reads them back from 0x0166 +0x1100 (0x6117B8A5). Only the Job
+#: List window (0x611AB0D9) and two per-slot setters write them.
+SETUP_JOBS_LEN = 5
+
+
+def set_jobs(char):
+    """The pilot's set jobs from its stored garage block, main first: job
+    kinds 1..8, empty and repeated slots dropped. [] when nothing is stored."""
+    try:
+        block = bytes.fromhex((char or {}).get("setups") or "")
+    except ValueError:
+        return []
+    if len(block) < SETUP_TAIL_OFF + SETUP_JOBS_LEN:
+        return []
+    out = []
+    for k in block[SETUP_TAIL_OFF:SETUP_TAIL_OFF + SETUP_JOBS_LEN]:
+        if 1 <= k <= 8 and k not in out:
+            out.append(k)
+    return out
 
 #: `kind:id` pairs for setup 1's equipped list, kind in HEX. EMPTY (the default)
 #: serves the all-zero block this message served before -- see reply_0166.

@@ -88,6 +88,12 @@ def main():
                       "--out", os.path.join(args.out, "fmo-insignia.tsv")])
     step("progression", [PY, os.path.join(GEN, "fmoprogression.py"), *client,
                          "--out", args.out])
+    # after progression: the gate catalogue, and fmo-missions.tsv's mission
+    # bytes corrected from it (fmoprogression still writes its older guesses)
+    step("gates", [PY, os.path.join(GEN, "fmogates.py"), *client, "--data", args.out,
+                   "--out", args.out, "--fix-missions"])
+    step("part-levels", [PY, os.path.join(GEN, "fmopartlevels.py"), *client,
+                         "--out", os.path.join(args.out, "fmo-part-levels.tsv")])
     step("floorplans", [PY, os.path.join(HERE, "fmo_floorplans.py"), *client,
                         "--out", os.path.join(args.out, "floorplans")])
     step("npc-keys", [PY, os.path.join(HERE, "fmo_npc_keys.py"), *client,

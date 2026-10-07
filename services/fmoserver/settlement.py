@@ -3,7 +3,38 @@ battle end and result pushes."""
 import struct
 import time
 from .deps import fmosectors, fmowar
+from .knobs import _env_int
 from .wirelog import log
+
+
+#: KEY: FMO_ARENA_NO_PAY -- a Coliseum battle pays no contribution and no MP
+#: (default 1; 0 = pay it like any battle). Playing Manual p.45: 「アリーナでの
+#: 戦闘では、貢献値やMPは獲得できません」 ("battles in an Arena do not earn
+#: contribution value or MP"). So in the Coliseum zones the settlement credits
+#: no contribution (sortie, kill or win) and no mission is settled by the
+#: battle (a met battle-map mission's share pays MP). H$ is not named by the
+#: manual and is still paid.
+ARENA_NO_PAY = _env_int("FMO_ARENA_NO_PAY", 1) != 0
+#: The Coliseum zone band (zoneentry's 600..607, the arena MapKinds).
+ARENA_ZONES = (600, 607)
+#: FMO_ARENA_EXP_PCT -- class exp an arena battle pays, percent of a normal
+#: battle's. SE 2005-12-20: "arenas now give experience, less than a normal
+#: sector".
+ARENA_EXP_PCT = _env_int("FMO_ARENA_EXP_PCT", 50)
+
+
+def arena_exp_rows(rows, pct=None):
+    """`rows` [(kind, amount)] cut to ARENA_EXP_PCT; a row that had exp keeps 1."""
+    pct = ARENA_EXP_PCT if pct is None else pct
+    return [(k, max(1, a * pct // 100) if a > 0 else a) for k, a in rows]
+
+
+def arena_zone(zone):
+    """Is `zone` (a zone id / MapKind) one of the Coliseum's? Pure."""
+    try:
+        return ARENA_ZONES[0] <= int(zone) <= ARENA_ZONES[1]
+    except (TypeError, ValueError):
+        return False
 
 
 class SessionSettlement:
@@ -43,6 +74,41 @@ class SessionSettlement:
         except ValueError as e:
             log(f"{self.peer}   WARNING: FMO_BATTLE_END_EXP: {e} -- no class exp this battle")
             rows = []
+        # FMO_EXP_PACE: exp sized to the pilot's Pilot level (battleend's note)
+        if battleend.EXP_PACE > 0:
+            _pc = self.playing_char() if charstore.CHAR_STORE else None
+            _jobs = inventory.set_jobs(_pc) if _pc is not None else []
+            _src = "the pilot's set jobs (main first)"
+            if not _jobs:
+                _src = "FMO_EXP_JOBS (no job set on this pilot)"
+                try:
+                    _jobs = battleend.parse_exp_jobs(battleend.EXP_JOBS)
+                except ValueError as e:
+                    log(f"{self.peer}   WARNING: FMO_EXP_JOBS: {e} -- no paced exp this battle")
+                    _jobs = []
+            if _pc is not None:
+                _lv = progress.pilot_level(_pc)
+                _paced = battleend.paced_exp_rows(_lv, _won, classes.CLASS_CURVE, _jobs)
+                # FMO_EXP_SECTOR_PCT / FMO_EXP_FRONT_PCT: SE's exp grew with
+                # the sector (battleend's note); the Arena has its own cut
+                if _paced and not self.in_arena() and (
+                        battleend.EXP_SECTOR_PCT != 100 or battleend.EXP_FRONT_PCT != 100):
+                    _zone = getattr(self, "sector_zone", None)
+                    try:
+                        _nl, _nsrc = squad.enemy_level_for(getattr(self, "ip", None))
+                        _pct = battleend.sector_exp_pct(_nl, _zone)
+                    except Exception as e:      # never cost the pilot the battle's pay
+                        _nl, _nsrc, _pct = None, f"lookup failed: {e!r}", 100
+                    _paced = [(k, a * _pct // 100) for k, a in _paced]
+                    _paced = [(k, a) for k, a in _paced if a > 0]
+                    log(f"{self.peer}   sector exp {_pct}% (NPC level {_nl}: {_nsrc}; "
+                        f"zone {_zone}; FMO_EXP_SECTOR_PCT={battleend.EXP_SECTOR_PCT}, "
+                        f"FMO_EXP_FRONT_PCT={battleend.EXP_FRONT_PCT})")
+                if _paced:
+                    log(f"{self.peer}   paced exp (FMO_EXP_PACE={battleend.EXP_PACE}, Pilot "
+                        f"Lv{_lv}, {'win' if _won else 'loss'}, to {_src}): "
+                        + ", ".join(f"{classes.CLASS_NAMES.get(k, k)} +{a}" for k, a in _paced))
+                rows = list(rows) + _paced
         contrib = resultpush.RESULT_CONTRIB or battleend.BATTLE_END_CONTRIB
         if resultpush.RESULT_CONTRIB and battleend.BATTLE_END_CONTRIB and resultpush.RESULT_CONTRIB != battleend.BATTLE_END_CONTRIB:
             log(f"{self.peer}   WARNING: FMO_RESULT_CONTRIB={resultpush.RESULT_CONTRIB} and "
@@ -57,6 +123,20 @@ class SessionSettlement:
             pay = battleend.battle_pay(len(kills), _won, money=resultpush.RESULT_MONEY,
                                        contrib=contrib, exp_rows=rows, kill_exp=())
         money, contrib, rows = pay["money"], pay["contribution"], pay["exp_rows"]
+        if contrib and self.in_arena():
+            # Playing Manual p.45: no contribution in an Arena (FMO_ARENA_NO_PAY)
+            log(f"{self.peer}   ARENA: zone {rooms.WORLD_ZONES.get(self.ip)} is the "
+                f"Coliseum -- contribution {contrib:+d} NOT paid (FMO_ARENA_NO_PAY; "
+                f"Playing Manual p.45)")
+            contrib = 0
+            pay["contribution"] = 0
+        if rows and self.in_arena():
+            rows = arena_exp_rows(rows)
+            log(f"{self.peer}   ARENA: class exp cut to {ARENA_EXP_PCT}% "
+                f"(FMO_ARENA_EXP_PCT): {rows}")
+        # PLATOON (battle groups, 2026-09-30): exp bonus, B.G.Bonus share,
+        # join-in percent, auto-disband -- see platoon_battle_settle.
+        money, rows = self.platoon_battle_settle(_won, money, rows, pay)
         mc = self.stored_money()
         old_money = mc[0] if mc else 0
         old = mc[1] if mc else 0
@@ -92,6 +172,109 @@ class SessionSettlement:
             f"{'BANKED on the pilot' if banked else 'NOT banked (no pilot in the store): the pushes move the display only'}"
             f"; both 0x014C and 0x015A are built from these numbers.")
         return self.battle_settlement
+
+    def in_arena(self):
+        """Is this connection's battle a Coliseum (Arena) one that pays no
+        contribution or MP? The zone its last 0x0153 granted decides; the
+        war map's sector_zone is not used, as a Coliseum sortie opens no war
+        map and an older one would still be on the session."""
+        # a Coliseum MATCH (coliseum.py) is an arena battle wherever the
+        # pilot stood
+        if not ARENA_NO_PAY:
+            return False
+        try:
+            _st = referee.BATTLE_STATE.get(self.battle_key()) or {}
+        except Exception:
+            _st = {}
+        return bool(_st.get("arena_match")) or arena_zone(
+            rooms.WORLD_ZONES.get(getattr(self, "ip", None)))
+
+    def platoon_battle_settle(self, won, money, rows, pay):
+        """The battle-group half of one settlement (2026-09-30). Returns the
+        (money, exp rows) to bank and sets self.platoon_end, the 0x014C
+        fields battle_end_push adds:
+          * platoon exp bonus: every exp row x battlegroups.platoon_exp_pct
+            on a win (+0x0F2 -> 8:45 when > 100);
+          * the B.G.Bonus share, win or lose (AH/F98/D92 235): paid into the
+            wallet here, named by +0x2EC / +0x2E8 (8:61, or 8:72 for the
+            leader, whose own share -- and the split's remainder -- comes back);
+          * auto-disband: +0x0F4 (8:58) on the battle that leaves one to go,
+            and the group is dropped after its last (AH/F98/D92 210);
+          * join-in percent (update 050628 22-24): the kill bonus of a pilot
+            who joined the enemy's map late scales with self.join_pct, and
+            +0x2DF carries it (8:65 prints when > 100)."""
+        _pc = self.playing_char() if charstore.CHAR_STORE else None
+        _own = charlist.to_wire(_pc["id"]) if _pc and _pc.get("id") else None
+        pl = battlegroups.platoon_settle(getattr(self, "account", None), won,
+                                        own_id=_own)
+        end = {}
+        if pl:
+            if pl["exp_pct"] != 100 and rows:
+                _was = list(rows)
+                rows = battleend.platoon_exp_rows(rows, pl["exp_pct"])
+                log(f"{self.peer}   PLATOON EXP: {pl['n']} member(s) of group "
+                    f"{pl['gid']} in this battle -> {pl['exp_pct']}% on every "
+                    f"row (FMO_PLATOON_EXP_PER/_MAX, ours): {_was} -> {rows}")
+            end["platoon_pct"] = pl["exp_pct"] if pl["exp_pct"] > 100 else 0
+            if pl["share"]:
+                money += pl["share"]
+                end["platoon_money"] = pl["share"]
+                end["platoon_payer"] = pl["payer_id"]
+                log(f"{self.peer}   B.G.BONUS: H$ {pl['share']} to this pilot, "
+                    f"its even share of group {pl['gid']}'s bonus among "
+                    f"{pl['n']} (AH/F98/D92 235), {'WON' if won else 'LOST'}; "
+                    f"+0x2E8 payer {pl['payer_id']:#x}")
+            if pl["auto_disband"]:
+                end["auto_disband"] = 1
+                log(f"{self.peer}   group {pl['gid']}: one battle left before it "
+                    f"auto-disbands -> +0x0F4 = 1 (8:58)")
+        jp = getattr(self, "join_pct", None)
+        if jp is not None and jp != 100:
+            if pay.get("kill_bonus_hs"):
+                _kb = pay["kill_bonus_hs"]
+                pay["kill_bonus_hs"] = _kb * jp // 100
+                log(f"{self.peer}   JOIN-IN TIME: kill bonus H$ {_kb} x {jp}% = "
+                    f"H$ {pay['kill_bonus_hs']} (update 050628 22-24)")
+            end["join_pct"] = jp
+        self.platoon_end = end
+        return money, rows
+
+    def loot_battle_settle(self, won, now=None, rnd=None):
+        """SPOILS (loot.py): on a WIN fought with the pilot's battle group,
+        open that group battle's loot round -- once per battle, whichever
+        member settles first. The drops are OURS (SE's tables are not in the
+        client): FMO_LOOT_DROPS of them, from the parts the defeated squad
+        wore (fmo-npc-loadouts.tsv, NPC-only frames excluded) and from any
+        part in the FMO_LOOT_BAND levels up to the battle's NPC level
+        (fmo-part-levels.tsv). Called from loot.loot_pushes_due on the
+        keepalive after settle_battle, so no existing settlement changes.
+        Returns the round, or None."""
+        if not (loot.LOOT and won and loot.LOOT_DROPS):
+            return None
+        acct = getattr(self, "account", None)
+        found = loot.group_battle_of(acct, now)
+        if found is None:
+            return None                      # a solo win: SE gives spoils to groups
+        gid, rec = found
+        sq = loot.battle_squad({self.battle_key(), self.ip})
+        level = (sq or {}).get("level")
+        src = "the squad's own level"
+        if level is None:
+            level, src = squad.enemy_level_for(self.ip)
+        los = [lo for lo in (sq or {}).get("loadouts") or () if lo]
+        enemy, near = loot.drop_pool(level, npc_names=loot.npc_only_names(squad.NPC_LOADOUTS),
+                                     loadouts=los)
+        items = loot.draw_drops(loot.LOOT_DROPS, enemy, near, rnd)
+        rd = loot.open_round(gid, rec, items, now)
+        log(f"{self.peer}   LOOT: group {gid} WON battle {rec.get('n')} with "
+            f"{rec.get('joined')}; NPC level {level} ({src}); pools: {len(enemy)} "
+            f"part(s) off {len(los)} defeated loadout(s), {len(near)} in the level "
+            f"band -> "
+            + (f"round open, {len(rd['items'])} drop(s): "
+               + ", ".join(f"kind 0x{k:02X} id {i}" for k, i in rd["items"])
+               if rd else "no round (nothing to drop, or this battle's round "
+               "already closed)"))
+        return rd
 
     def warmap_entry(self, row):
         """One 0x015F row's count, minutes and bar from who is fighting on
@@ -280,6 +463,13 @@ class SessionSettlement:
         mission_battle_apply). None when off or there is no pilot."""
         if not missionboard.MISSION_REPORT:
             return None
+        if self.in_arena():
+            # Playing Manual p.45: an Arena battle earns no MP, and a met
+            # mission's share is MP -- so it settles no mission (FMO_ARENA_NO_PAY)
+            log(f"{self.peer}   MISSION: an Arena battle (zone "
+                f"{rooms.WORLD_ZONES.get(self.ip)}) settles no mission "
+                f"(FMO_ARENA_NO_PAY; Playing Manual p.45)")
+            return None
         char = self.playing_char() if charstore.CHAR_STORE else None
         if char is None:
             log(f"{self.peer}   WARNING: MISSION: battle ended "
@@ -327,11 +517,85 @@ class SessionSettlement:
                    f"missions are not judged by one battle)" if _open else "")
                 + ".")
             return moved
+        # KEY: THE MISSION SHARE BONUS (FMO_MISSION_SHARE). SE, guide/mission:
+        # 「戦闘に参加したバトルグループのメンバー全員に「ミッション分配ボーナス」が
+        # 支払われます」, paid by the Personnel Officer. A battle-map mission met
+        # by THIS win owes every member of the taker's battle group one kind-3
+        # line (11:3 "Mission participation bonus"); the taker's own rides the
+        # commit below, the others' are written onto their own records.
+        _shares = []
+        if won and missionboard.MISSION_SHARE:
+            _reqs = missionbook.mission_requirements()
+            for m, s in moved:
+                if s != "met" or m.get("cat") not in (None, 1):
+                    continue
+                e = missionbook.mission_share_entry(m, _reqs.get(int(m.get("id", -1))))
+                if e is not None:
+                    _shares.append(e)
+        if _shares:
+            prev = char.get("mission_pay")
+            char["mission_pay"] = (prev if isinstance(prev, list) else []) + [
+                dict(e) for e in _shares]
         try:
             self.commit("battle end settled mission(s): " + ", ".join(
-                f"{m.get('id')} {m.get('name')!r} -> {s}" for m, s in moved))
+                f"{m.get('id')} {m.get('name')!r} -> {s}" for m, s in moved)
+                + (f"; mission share owed: " + ", ".join(
+                    f"H$ {e['hs']}/MP {e['mp']}" for e in _shares) if _shares else ""))
         except Exception as e:
             log(f"{self.peer}   WARNING: mission settlement NOT banked ({e!r})")
+        if _shares:
+            from . import groupchannel, trade   # the group and its live sessions
+            try:
+                _me = self.account
+            except AttributeError:
+                _me = None                      # a bare test Session
+            _gid = groupchannel.GROUP_OF.get(_me) if _me else None
+            _others = [a for a in groupchannel.GROUP_MEMBERS.get(_gid, [])
+                       if a and a != _me] if _gid else []
+            _paid = []
+            for _acct in _others:
+                # a member with a LIVE session is written through it, so its
+                # in-memory roster (which its next commit saves whole) holds
+                # the line; anyone else is written on disk directly
+                _live = next((s for s in list(trade.LIVE_SESSIONS.values())
+                              if s is not self and getattr(s, "account", None) == _acct),
+                             None)
+                try:
+                    if _live is not None:
+                        _mc = _live.playing_char() if charstore.CHAR_STORE else None
+                        _roster = None
+                    else:
+                        _roster = charstore.load_roster(_acct)
+                        _mc = next((c for c in _roster if c.get("first") or c.get("last")),
+                                   None)
+                    if _mc is None:
+                        log(f"{self.peer}   WARNING: MISSION SHARE: battle-group member "
+                            f"{_acct} has no pilot on file -- not paid")
+                        continue
+                    _prev = _mc.get("mission_pay")
+                    _mc["mission_pay"] = (_prev if isinstance(_prev, list) else []) + [
+                        dict(e) for e in _shares]
+                    _why = (f"mission share owed from {_me}'s win: "
+                            + ", ".join(f"H$ {e['hs']}/MP {e['mp']}" for e in _shares))
+                    if _live is not None:
+                        _live.commit(_why)
+                    else:
+                        charstore.save_roster(_acct, _roster)
+                    _paid.append(_acct)
+                except Exception as _e:
+                    log(f"{self.peer}   WARNING: MISSION SHARE for member {_acct} NOT "
+                        f"banked ({_e!r})")
+            log(f"{self.peer}   MISSION SHARE: "
+                + "; ".join(f"{e['name']!r} H$ {e['hs']} / MP {e['mp']}" for e in _shares)
+                + f" owed to the taker"
+                + (f" and {len(_paid)} battle-group member(s) {_paid} (group {_gid})"
+                   if _paid else " (no other battle-group member on file)")
+                + f" as a kind-{missionboard.PAY_SHARE} paybook line at the Personnel "
+                f"Officer. MP = the row's Distribution (+0x1C8), H$ = "
+                f"{missionboard.MISSION_SHARE_HS_PCT:g}% of the reward "
+                f"(FMO_MISSION_SHARE_HS_PCT, OURS). WARNING: paid to the whole "
+                f"group; SE paid the members who fought, and this does not check "
+                f"who sortied.")
         log(f"{self.peer}   MISSION: battle ended {'WON' if won else 'LOST'} -> "
             + "; ".join(f"{m.get('name')!r} (id {m.get('id')}) {s}"
                         for m, s in moved)
@@ -344,14 +608,30 @@ class SessionSettlement:
         """Move the war state for the sector this connection sortied into
         (self.sector, set by the 0x015E that opened the war map). ONE call
         per battle end; a sortie with no sector (the FMO_SORTIE_MAPNO /
-        resume path) moves nothing. Returns the sector dict or None."""
+        resume path) moves nothing. A LOSS settles too: against NPCs it fills
+        the enemy's counter (fmowar FMO_WAR_LOSS, AI/F00/D08 78: 「敗北する
+        ことで制圧率が減少」). Returns the sector dict or None."""
         sector = getattr(self, "sector", None)
         if warstate.WAR == "0" or fmowar is None or not sector:
+            return None
+        if self.in_arena():
+            # an arena battle is fought for no sector; a war-map sector this
+            # session opened earlier must not be settled by it
             return None
         st = warstate.war_state()
         if st is None:
             return None
         if getattr(self, "war_settled", None) == sector:
+            return None
+        # SE (Map Selector help, AH/F98/D64 86): 「統制区は、戦局が安定しているため
+        # セクターの制圧状況は変化しません」 -- in a Controlled Zone (zone kinds 1
+        # and 3, selectors 1xx / 3xx) sector control never changes. Tiles are
+        # shared between selectors, so settling one there moved a front tile.
+        _zone = getattr(self, "sector_zone", None)
+        if _zone is not None and int(_zone) // 100 in (1, 3):
+            self.war_settled = sector
+            log(f"{self.peer}   WAR STATE: selector {_zone} is a Controlled Zone -- "
+                f"sector control does not change there; tile {sector[0]} untouched")
             return None
         self.war_settled = sector
         warstate._war_tick(st)
@@ -372,7 +652,8 @@ class SessionSettlement:
             f"once FMO_WAR_MAP binds the fields.")
         return s
 
-    def battle_end_push(self, conn_id, why="the FMO_BATTLE_END timer", won=None):
+    def battle_end_push(self, conn_id, why="the FMO_BATTLE_END timer", won=None,
+                        next_battle=False):
         """ONE 0x014C from the battle settlement (settle_battle), which is
         where the pay is banked -- this push only SHOWS it."""
         st = self.settle_battle(f"battle end ({why})", won=won)
@@ -380,9 +661,22 @@ class SessionSettlement:
         _won = st["won"]
         self.war_settle(_won)
         self.mission_battle_settle(_won)
-        pkt = battleend.battle_end_packet(conn_id, contrib_new=new, contrib_old=old,
+        # HANGAR RANK (hangar.HANGAR_JOB_LEVEL): banked here, after the exp
+        # above, and served in +0x0F5 -- the same value the next 0x014A serves.
+        _hc = self.playing_char() if charstore.CHAR_STORE else None
+        _hr, _hline, _hchanged = hangar.hangar_rank_at_battle_end(_hc)
+        log(f"{self.peer}   {_hline}")
+        if _hchanged:
+            try:
+                self.commit(_hline)
+            except Exception as _e:
+                log(f"{self.peer}   WARNING: {_hline} -- NOT banked ({_e!r}); the "
+                    f"next 0x014A serves the old rank and the next battle end sets it again")
+        pkt = battleend.battle_end_packet(conn_id, hangar_rank=_hr, contrib_new=new, contrib_old=old,
                                           exp_rows=rows, won=_won,
-                                          victory=_won and bool(st["contribution"]))
+                                          victory=_won and bool(st["contribution"]),
+                                          next_battle=next_battle,
+                                          **(getattr(self, "platoon_end", None) or {}))
         log(f"{self.peer}   -> 0x{battleend.MSG_BATTLE_END:04X} BATTLE END push, "
             f"{battleend.S14C_LEN}B on queue seq 0x{pushes.QUEUE_SEQ:08X}, trigger: {why}: "
             f"{'WON' if _won else 'LOST'} "
@@ -393,6 +687,22 @@ class SessionSettlement:
             f"skips the block. Bar: the reward lines, then the client is back "
             f"in the lobby with NO 0x013D on the wire.")
         return pkt
+
+    def penalty_report_push(self, conn_id):
+        """The FRIENDLY-FIRE report (0x017B) for this pilot's battle, or None.
+        Sent just BEFORE the 0x014C: its arm 0x6117ECE4 only acts under the
+        battle gate 0x611734E0, and after the battle the client asks 11:9 per
+        row (0x61191E80). See penalty.report_push."""
+        try:
+            return penalty.report_push(self, conn_id)
+        except Exception as e:           # a report must never cost the battle end
+            log(f"{self.peer}   WARNING: 0x{penalty.MSG_PENALTY_REPORT:04X} not built ({e!r})")
+            return None
+
+    def on_penalty_give(self, p):
+        """0x017C: YES on 11:9 -- one penalty point for the pilot at +0x00.
+        Fire-and-forget (0x61174480 queues it and reads no reply)."""
+        return penalty.on_give(self, p)
 
     def battle_result_push(self, conn_id, occasion, won=None):
         """A 0x015A RESULT push, or None when FMO_RESULT_PUSH is off.
@@ -450,7 +760,7 @@ class SessionSettlement:
         pkt = resultpush.result_push_packet(conn_id, record=record,
                                             money=_money,
                                             contribution=_contrib,
-                                            owned=owned)
+                                            owned=owned, pilot=_char)
         _fl = owned[status.S14A_FLAGS11 - status.S14A_OWNED:
                     status.S14A_FLAGS11 - status.S14A_OWNED + status.S14A_FLAGS11_LEN]
         _nz = ", ".join("%d=%#04x" % (i, _fl[i]) for i in range(len(_fl))
@@ -485,7 +795,12 @@ class SessionSettlement:
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    areatargets, battleend, charstore, community, missionblock, missionboard, missionbook,
-    popnation, pushes, referee, resultpush, rooms, sectorwins, servicerecord, status, warmap,
+    areatargets, battleend, charstore, classes, community, inventory, missionblock,
+    missionboard,
+    missionbook, popnation, progress, pushes, referee, resultpush, rooms, sectorwins, servicerecord, status, warmap,
     warstate, zoneentry,
 )
+from . import battlegroups, charlist  # noqa: E402  (platoon_battle_settle)
+from . import hangar  # noqa: E402  (hangar rank at the battle end)
+from . import penalty  # noqa: E402  (the friendly-fire report and vote)
+from . import loot, squad  # noqa: E402  (loot_battle_settle)

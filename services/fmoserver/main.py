@@ -269,6 +269,17 @@ def run():
                 f"dword = N - {_b}, payload byte = 4 x that. WARNING: PROBE ONLY: "
                 f"to the client these bytes are counts, indices and set "
                 f"bits. Clear FMO_LOBAPI_MARK when the reading is taken.")
+    if squadron._BATTLE_FEE_ERR:
+        log(f"WARNING: FMO_BATTLE_FEE_RATES ignored: {squadron._BATTLE_FEE_ERR}; "
+            f"the eight rates go out as zeros")
+    elif any(squadron.BATTLE_FEE_RATES):
+        log(f"KEY: BATTLE FEE RATES {list(squadron.BATTLE_FEE_RATES)} ride the 0x019F "
+            f"block at +0x{squadron.BATTLE_FEE_RATES_OFF:02X} (FMO_BATTLE_FEE_RATES): the "
+            f"setup screen's Battle Fee is the client's own sum; nothing is debited")
+    if missiongroups.MISSION_GROUP:
+        log("KEY: MISSION GROUPS ON (FMO_MISSION_GROUP=1): a derived mission's "
+            "issuer and takers are attached by 0x0174 type 3 / type 2 on their "
+            "keepalive; /mgl and /mgm are relayed. Not live-tested.")
     # Report live FMO world sessions to the deploy gate so a push does not
     # bounce fmo mid-sortie. Each session is one thread; name it so the count
     # is a thread-name scan (naming a thread changes no behaviour).
@@ -287,7 +298,7 @@ def run():
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    addressing, charlist, charstore, devtool, identity, lobapi, move, popself, popsweep, resume,
-    room, sectorwins, sortie, sortiepush, status, tcpserver, udpconfig, warstate,
-    worldchannel, zonecontrol, zoneentry,
+    addressing, charlist, charstore, devtool, identity, lobapi, missiongroups, move, popself,
+    popsweep, resume, room, sectorwins, sortie, sortiepush, squadron, status, tcpserver,
+    udpconfig, warstate, worldchannel, zonecontrol, zoneentry,
 )

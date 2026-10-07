@@ -375,3 +375,8 @@ _LAYOUT_ERR = [None]
 #: 2026-09-05). Rebuilt by band_rosters(); consulted by _npc_pop_record. Keyed
 #: by entity key alone, so a key that appears in two bands shares one override.
 NPC_CKIND_OVERRIDE = {}
+#: key -> height (fmoworld.POP_HEIGHT), from layout rows that carry `height`.
+#: Rebuilt by band_rosters() beside NPC_CKIND_OVERRIDE, same keying.
+NPC_HEIGHT_OVERRIDE = {}
+#: key -> pose (fmoworld.POP_POSE), from layout rows that carry `pose`.
+NPC_POSE_OVERRIDE = {}

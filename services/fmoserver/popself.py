@@ -288,5 +288,17 @@ MEMBER_CHECK_HIT = _env_int("FMO_MEMBER_CHECK_HIT", "1")
 MEMBER_CHECK_MISS = _env_int("FMO_MEMBER_CHECK_MISS", "0")
 
 
+
+#: KEY: THE PENALTY LEVEL (body+0x1C2 -> unit+0x1C6, read by 0x611F7475 on
+#: the pilot's own battle unit): level L >= 2 cuts ammo and BP by
+#: min(100, 12(L-1)) % and the client says 32:13. The level is the pilot's
+#: penalty points (penalty.pop_level; FMO_PENALTY_BATTLE_CUT=0 sends none).
+def penalty_pop_extra(chan):
+    """The {offset: bytes} a battle self-POP adds for the penalty level; {}
+    for a pilot with fewer than 2 points."""
+    from . import penalty
+    return penalty.pop_extra_for(chan)
+
+
 # Called at run time only; imported last so that import cycles resolve.
 from . import charstore, identity  # noqa: E402

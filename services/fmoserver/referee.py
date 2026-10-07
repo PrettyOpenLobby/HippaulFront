@@ -188,6 +188,11 @@ def battle_end_trigger(st, triggers, now, limit_secs):
     (why, won) -- or None. Pure, so the selftest can drive every arm."""
     if not st or st.get("ended") or not triggers:
         return None
+    # the SOLO AREA's own verdict (solo.py: SE's 10 kills / 3 allies lost),
+    # whatever FMO_BATTLE_END lists: SE's page makes both an end
+    _solo = solo.solo_verdict(st)
+    if _solo:
+        return _solo
     if "objective" in triggers and st.get("objective_done"):
         return f"the objective ({st['objective_done'][0]})", True
     if "escape" in triggers and st.get("escaped"):
@@ -254,6 +259,28 @@ def _note_battle_record(chan, addr, cmd, body):
             f"{battlepop.BATTLE_DUMMY_AI} drives it. Logged "
             f"once per battle.")
     if cmd in (fmoworld.CLI_ESCAPE, fmoworld.CLI_ESCAPE_B):
+        # WARNING: THE TWO BATTLE-MAP MENU ITEMS ARE NOT ONE ACTION (static
+        # 2026-09-30, menu table 0x613952F0). "Leave the Front" (0:13, menu
+        # command 0x1002, handler 0x6115FAA5) calls 0x61173F90 and leaves by the
+        # TCP withdraw 0x013D -> 0x0150 0xFFFD -> 0x0153 (on_battle_withdraw):
+        # back to the lobby, as the manual's p.57 says. "Emergency Escape"
+        # (0:12, command 0x1050, handler 0x6115FBDB) calls 0x61054850, which
+        # asks the support system 0x61050770(unit, 2) for a slot (else 32:0
+        # "Another friendly unit is requesting support"), runs 0x61050600 with
+        # mode 2 ON THE CLIENT, and only then sends this cmd 139 with reason
+        # 0x49895963. The manual says it returns you to where you entered the
+        # battle map -- the battle goes on. FMO_BATTLE_END's 'escape' trigger
+        # ends the battle as a loss here instead (the 2026-09-10 live loop); it
+        # left the release default and prod's profile on 2026-10-01 to match
+        # retail. Still unmeasured: whether the client completes the
+        # relocation without an answer from the BM is unmeasured (the live run
+        # logged cmd 139 three times, which may be resends waiting for one).
+        # The capture that decides it: one battle with FMO_BATTLE_END=limit,
+        # press Emergency Escape, and watch (a) the wanzer reappear at the
+        # entry point and keep playing -> drop 'escape' from the default, or
+        # (b) a stall / repeated cmd 139 -> the BM owes an answer; read
+        # 0x61050600 mode 2 and the 0x6104C0F4 follow-up (reason 0x24360679
+        # plus cmd 111) for it.
         esc = fmoworld.parse_escape(body)
         st = battle_state(bkey(addr[0]))
         if esc and not st["escaped"]:
@@ -302,6 +329,14 @@ def _note_battle_record(chan, addr, cmd, body):
                                 f"{h['target']:#x} DESTROYED, kill credited to "
                                 f"{_who} (fired last); "
                                 f"{len(_sq['dead'])}/{len(_sq['ids'])} down")
+                        # SOLO AREA: the next enemy arrives, or the tenth wins
+                        solo.unit_died(chan, addr, _sq, h["target"])
+                    continue
+                if _sq and h["target"] in (_sq.get("allies") or ()):
+                    # SOLO AREA: an ally fell; the next role arrives, or the
+                    # third loss loses (solo.on_death). Never a pilot's kill.
+                    if _sq["owner"] == bkey(addr[0]):
+                        solo.unit_died(chan, addr, _sq, h["target"])
                     continue
                 st["kills"].append((h["target"], time.time()))
                 if h["target"] == chan.self_unit():
@@ -344,6 +379,9 @@ def _relay_battle_record(chan, addr, cmd, body, alias_stream):
     the record); a field sync must ride the SENDER's alias stream on the other
     clients, because the receive arm applies it to the unit the datagram
     names -- which on the self stream is the listener itself."""
+    from . import coliseum
+    if coliseum.spectator_of_chan(chan) is not None:
+        return                  # a Coliseum spectator's records go nowhere
     rec = fmoworld.record(cmd, body)
     chan.pending.append(rec)
     n = 0
@@ -366,5 +404,5 @@ def _relay_battle_record(chan, addr, cmd, body, alias_stream):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    battleend, battlepop, groupchannel, identity, rooms, squad, worldchannel,
+    battleend, battlepop, groupchannel, identity, rooms, solo, squad, worldchannel,
 )
