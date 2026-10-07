@@ -583,8 +583,9 @@ _sweep_n = [0]
 #:     tutorial's;
 #:   * no FMO_MAPKIND_SWEEP.
 #: The MapNo is then picked for that zone the same way as any world entry
-#: (FMO_ZONE_MAPNO). Default '0' (code and release): a world entry into a
-#: non-default zone has not been seen on a screen yet.
+#: (FMO_ZONE_MAPNO). Code default '0'; the release default (defaults.py) is
+#: '1', and prod has resumed pilots into zone 509 at world entry and at a
+#: lobby Move since 2026-10-06 (fmo.log "zone 200 -> 509: FMO_RESUME_ZONE").
 RESUME_ZONE = (os.environ.get("FMO_RESUME_ZONE", "").strip() or "0") != "0"
 RESUME_EXCLUDE = (600, 607)
 

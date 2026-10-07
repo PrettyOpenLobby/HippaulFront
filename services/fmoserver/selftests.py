@@ -1267,6 +1267,65 @@ def _manual_pilot_pins():
     return ok
 
 
+def _char_lifecycle_arm_pins():
+    """A CREATION THROUGH THE ARM (2026-10-07): the name step 0x0177 seeds the
+    record (born_at, base money), the create submit 0x013E pays the head-count
+    starting money for the nation it names ONCE (a repeat submit pays nothing
+    more), the 24-hour lock then refuses 0x013F with 0xC8E6, and a pilot of
+    the larger nation gets the base. The pure halves are pinned in
+    _manual_pilot_pins; this is the wiring between them."""
+    from . import defaults
+    _rd = defaults.RELEASE_DEFAULTS
+    _others = ("other", [{"id": i, "first": "O%d" % i, "last": "Cu", "nation_byte": 1}
+                         for i in (1, 2, 3)]
+               + [{"id": 4, "first": "U", "last": "Sn", "nation_byte": 2}])
+
+    def _names(msg, first, last, nation=0):
+        b = bytearray(0x3C if msg == 0x013E else 0x26)
+        struct.pack_into("<I", b, 0, 1)
+        b[0x04:0x04 + len(first)], b[0x15:0x15 + len(last)] = first, last
+        if msg == 0x013E:
+            b[0x26], b[0x28] = 1, nation
+        return bytes(b)
+
+    _sv = (economy.START_MONEY, charselect.DELETE_LOCK_HOURS, charstore.CHAR_STORE)
+    _got = {}
+    try:
+        economy.START_MONEY = economy.parse_start_money(_rd["FMO_START_MONEY"])
+        charselect.DELETE_LOCK_HOURS = int(_rd["FMO_DELETE_LOCK_HOURS"])
+        flat_globals()["CHAR_STORE"] = ""
+        for _nat in (2, 1):
+            _s = session.Session("lifecycle:%d" % _nat)
+            _s._roster = []
+            _s.all_rosters = lambda _s=_s: [(_s.account, _s._roster), _others]
+            _w = [_s.apply_charsel(0x0177, _names(0x0177, b"Lyle", b"Kersey"), 1),
+                  _s.apply_charsel(0x013E, _names(0x013E, b"Lyle", b"Kersey", _nat), 1)]
+            _paid = _s._roster[0].get("money") if _s._roster else None
+            if _s._roster:
+                _s._roster[0]["money"] = 500           # spent some
+            _w.append(_s.apply_charsel(0x013E, _names(0x013E, b"Lyle", b"Kersey", _nat), 1))
+            _after = _s._roster[0].get("money") if _s._roster else None
+            _s.fail_code = None
+            _del = _s.apply_charsel(0x013F, struct.pack("<I", 1), 1)
+            _got[_nat] = (_w, _paid, _after, len(_s._roster), _del, _s.fail_code,
+                          _s._roster[0].get("born_at") if _s._roster else None,
+                          _s._roster[0].get("start_money_nation") if _s._roster else None)
+    finally:
+        economy.START_MONEY, charselect.DELETE_LOCK_HOURS = _sv[0], _sv[1]
+        flat_globals()["CHAR_STORE"] = _sv[2]
+    # 3 O.C.U. to 1 U.S.N. = a 66% gap: U.S.N. gets 10000 + 100 x 66 = 16600
+    _u, _o = _got.get(2, ()), _got.get(1, ())
+    _ok = (len(_u) == 8 and len(_o) == 8
+           and _u[0] == [None, None, None] and _u[1] == 16600 and _u[2] == 500
+           and _u[3] == 1 and isinstance(_u[4], str)
+           and _u[5] == charselect.DELETE_LOCK_CODE and isinstance(_u[6], int) and _u[7] == 2
+           and _o[0] == [None, None, None] and _o[1] == 10000 and _o[7] == 1)
+    print(f"  creation arm: 0x0177 seeds, 0x013E pays U.S.N. (the smaller side, 1 to 3) "
+          f"16600 H$ and O.C.U. 10000 once, a repeat submit pays nothing, and the new "
+          f"pilot cannot be deleted (0xC8E6): {'OK' if _ok else 'FAIL ' + str(_got)}")
+    return _ok
+
+
 def _manual_social_pins():
     """THE PLAYING MANUAL'S SOCIAL RULES (2026-09-30; pp.40-42, 47, 50, 54):
     /tell reaches its one recipient (never the room, never the enemy army,
@@ -13562,6 +13621,7 @@ def _selftest_run(test_db):
     ok &= _spoils_order_pins()      # spoils + ordered missions (loot.py, missionbook)
     ok &= _manual_missions_pins()   # the Playing Manual's mission rules (pp.45, 59-60)
     ok &= _manual_pilot_pins()      # the Playing Manual's pilot rules (pp.37-38, 42, 44)
+    ok &= _char_lifecycle_arm_pins()  # creation through the arm: start money once, delete lock
     ok &= _manual_social_pins()     # tells, chat routing, targeting, battle group ops (pp.40-54)
     ok &= _mission_group_fee_pins()  # mission groups (p.61) and the Battle Fee rates (p.62)
     ok &= _coliseum_pins()          # the Coliseum desks (coliseum.py)
