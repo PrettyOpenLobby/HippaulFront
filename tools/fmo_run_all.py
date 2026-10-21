@@ -55,6 +55,8 @@ SUITES = [
     ("fmolayout",  [PY, "fmolayout.py", "--selftest"],  SERVICES),
     # the City Control board and its place in the boards host
     ("fmo_board",  [PY, "fmo_board_test.py"],           HERE),
+    # the Coliseum and war pages on the tool port, over HTTP with the token
+    ("fmo_admin",  [PY, os.path.join(HERE, "fmo_admin_pages_test.py")], SERVICES),
     # the title plugin: the Viewer's profile out of the pilot database
     ("fmo_title",  [PY, "fmo_title_test.py"],           HERE),
     # every patch a test makes through fmo.py reaches the fmoserver module

@@ -78,7 +78,8 @@ def devtool_start():
             lambda band=None, qs=None: fmodevtool.build_state(
                 devtool_ctx(), band, want_plan=bool(qs and qs.get("plan"))),
             lambda op: fmodevtool.apply_edit(devtool_ctx(), op),
-            page=fmodevtool.PAGE, name="fmo-devtool", routes=gatetool.routes())
+            page=fmodevtool.PAGE, name="fmo-devtool",
+            routes={**gatetool.routes(), **coliseumtool.routes(), **wartool.routes()})
     except SystemExit as e:
         log(f"WARNING: lobby NPC editor REFUSED to start: {e} -- the world door "
             f"serves without it")
@@ -95,11 +96,14 @@ def devtool_start():
         f"{'?t=<FMO_DEVTOOL_TOKEN>' if token else ''} -- layout file "
         f"{npccast.NPC_LAYOUT.path} ({', '.join(bands) if bands else 'no bands yet: every band is served from the env'}); "
         f"floor plans ship for maps {fmolayout.plans_available()}; story gates at /gates"
-        f"{'' if gatetool.fmogates else ' UNAVAILABLE (fmogates did not import)'}")
+        f"{'' if gatetool.fmogates else ' UNAVAILABLE (fmogates did not import)'}; "
+        f"the Coliseum at /coliseum, the war at /war"
+        f"{'' if wartool.boardfmo else ' UNAVAILABLE (boardfmo did not import)'}")
     return srv
 
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    areachange, gatetool, groupchannel, move, npccast, npcroster, popsweep, roomcast, rooms, zoneentry,
+    areachange, coliseumtool, gatetool, groupchannel, move, npccast, npcroster, popsweep, roomcast, rooms, wartool,
+    zoneentry,
 )

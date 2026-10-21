@@ -1797,6 +1797,8 @@ _MODULES = {m: importlib.import_module("fmoserver." + m) for m in (
     'datagram',
     'devtool',
     'gatetool',
+    'coliseumtool',
+    'wartool',
     'loot',
     'penalty',
     'solo',

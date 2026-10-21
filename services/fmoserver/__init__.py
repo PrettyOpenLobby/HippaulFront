@@ -139,6 +139,10 @@
     datagram.py       _serve_datagram: one inbound world-channel datagram, decoded and answered.
     devtool.py        The lobby NPC editor hook (FMO_DEVTOOL_PORT).
     gatetool.py       The story gates tool's live side: pilots, online sessions, queued edits.
+    coliseumtool.py   The Coliseum page on the tool port: arenas, registrations, matches,
+                      streak records and the Clash of Iron standings, read only.
+    wartool.py        The war page on the tool port: the phase, city control and the score
+                      (boardfmo's readers), and the phase clock run on demand.
     loot.py           Spoils: the battle group's loot window after a win (group cmds 214/215,
                       the Need/Want/Pass choices) and the items it grants (0x016B).
     penalty.py        Friendly-fire penalty points and retraining: the 0x017B report, the 0x017C
@@ -170,7 +174,7 @@ from . import (
     npccast, npcroster, room, worldchannel, groupchannel, missiongroups, rooms, squad, roomrelay,
     peerlink,
     referee,
-    datagram, devtool, gatetool, loot, penalty, solo, defection, main, selftests,
+    datagram, devtool, gatetool, coliseumtool, wartool, loot, penalty, solo, defection, main, selftests,
 )
 
 __all__ = [
@@ -185,5 +189,5 @@ __all__ = [
     'tcpserver', 'community', 'udpconfig', 'popself', 'popnames', 'poplook', 'popnation',
     'popparts', 'popsweep', 'battlepop', 'roomcast', 'npccast', 'npcroster', 'room', 'worldchannel',
     'groupchannel', 'missiongroups', 'rooms', 'squad', 'roomrelay', 'peerlink', 'referee', 'datagram', 'devtool',
-    'gatetool', 'loot', 'penalty', 'solo', 'defection', 'main', 'selftests',
+    'gatetool', 'coliseumtool', 'wartool', 'loot', 'penalty', 'solo', 'defection', 'main', 'selftests',
 ]
