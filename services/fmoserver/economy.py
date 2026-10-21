@@ -219,5 +219,215 @@ def spend_mp(char, amount):
     return was, char["mp"]
 
 
+# --------------------------------------------------------------------------- #
+# THE HANGAR ECONOMY: the shop table, the remodel cost and the Battle Fee
+# --------------------------------------------------------------------------- #
+#: KEY: THE SHOP TABLE IS SE'S OWN (static 2026-10-08). Every master table's
+#: fourth file is a 0x1C-byte row per id (0x611A4760 / 0x611A4B30): +0x00 the
+#: BUY price, +0x04 the SELL price (75%, rounded down, on every priced row),
+#: +0x08 the nation/tier restriction, +0x09 a category, +0x0C the maximum
+#: total remodel rank, +0x0E + 2*i the per-stat remodel cap. Banked per
+#: deployment as fmodata/fmo-part-shop.tsv by tools/fmodatagen/fmopartshop.py.
+#: Absent = every rule below that needs a price falls back (stored purchase
+#: price, then "unknown") and says so; nothing is invented.
+_FMODATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fmodata")
+PART_SHOP_TSV = os.path.join(_FMODATA, "fmo-part-shop.tsv")
+
+
+def load_part_shop(path=PART_SHOP_TSV):
+    """{(kind, id): {level, buy, sell, restrict, cat, max_rank, caps}} from
+    fmo-part-shop.tsv; {} when it is absent or unreadable."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            head = f.readline().rstrip("\r\n").split("\t")
+            col = {h: i for i, h in enumerate(head)}
+            for line in f:
+                c = line.rstrip("\r\n").split("\t")
+                if len(c) < len(head) - 1:
+                    continue
+                out[(int(c[col["kind"]], 0), int(c[col["id"]]))] = {
+                    "level": int(c[col["level"]]), "buy": int(c[col["buy"]]),
+                    "sell": int(c[col["sell"]]), "restrict": int(c[col["restrict"]]),
+                    "cat": int(c[col["cat"]]), "max_rank": int(c[col["max_rank"]]),
+                    "caps": tuple(int(c[col["cap%d" % i]]) for i in range(REMODEL_STATS))}
+    except (OSError, ValueError, KeyError):
+        return {}
+    return out
+
+
+#: the six remodel rank bytes of a 24-byte item record (+0x0C..+0x11): the
+#: remodel window raises record+0x0C+i (0x610411A0), the Battle Fee walks
+#: them (0x61175D03 `movzx ebx, byte [esi+edi+2]`, esi = record+0x0A)
+REMODEL_RANKS_OFF = 0x0C
+REMODEL_STATS = 6
+PART_SHOP = load_part_shop()
+
+
+def part_row(kind, item_id, table=None):
+    """The shop row for (kind, id), or None when the table is absent or lacks it."""
+    table = PART_SHOP if table is None else table
+    return table.get((int(kind), int(item_id)))
+
+
+def row_nation(row):
+    """The nation a shop row is sold to: restriction % 10 (0x6102FCDF), 0 =
+    both. None for no row."""
+    return None if row is None else row["restrict"] % 10
+
+
+def record_ranks(rec):
+    """The six remodel ranks of a 24-byte item record."""
+    return tuple(bytes(rec)[REMODEL_RANKS_OFF:REMODEL_RANKS_OFF + REMODEL_STATS])
+
+
+#: KEY: SE'S REMODEL COST, read off the client (static 2026-10-08). The window
+#: checks `0x6103FA70() <= lobby+0x88C` before it lets a rank be bought
+#: (0x61036FFD) and builds the 0x017E with that same figure at pending+0x18
+#: (0x6102F200 <- 0x61037213). 0x6103FA70 calls 0x611E1D80, which returns
+#:     (price * 25 / 100000) * (to - from)      when to > from, else 0
+#: with price = shop row +0x00 (0x6103FA98 `mov edi,[eax]`), 25 = `push 0x19`
+#: at 0x611E1DBA and 100000 = `push 0x186A0` at 0x611E1DC9 (64-bit _allmul /
+#: _alldiv), the division done once, before the multiply by the steps. So a
+#: rank step costs a 4000th of the part's price; lowering a rank is free (SE
+#: update 2005-09-06: 「ランクを上げる際には費用が発生します」).
+REMODEL_RATE = 25
+REMODEL_DIVISOR = 100000
+
+
+def remodel_step_cost(price):
+    """H$ for one remodel rank step of a part priced `price` (0x611E1D80)."""
+    return int(price) * REMODEL_RATE // REMODEL_DIVISOR
+
+
+def remodel_cost(price, old_ranks, new_ranks):
+    """H$ the client charges for raising `old_ranks` to `new_ranks` (six
+    each): the sum of the raises times remodel_step_cost. Pure."""
+    raises = sum(max(0, int(n) - int(o)) for o, n in zip(old_ranks, new_ranks))
+    return remodel_step_cost(price) * raises
+
+
+def remodel_check(row, new_ranks):
+    """(ok, why) for a record's new ranks against its shop row: each rank at
+    most its stat's cap (+0x0E + 2*i), the total at most the part's maximum
+    remodel rank (+0x0C; SE 2005-09-06 「要素ごとのランクの合計値が最大改造
+    ランクを上回ることはできません」). A part whose maximum is 0 cannot be
+    remodelled at all (17:183). No row = not checked (the table is absent)."""
+    if row is None:
+        return True, "no shop row to check against (fmo-part-shop.tsv absent)"
+    ranks = [int(r) for r in new_ranks]
+    if any(ranks) and row["max_rank"] <= 0:
+        return False, "this part cannot be remodelled (maximum rank 0)"
+    for i, r in enumerate(ranks):
+        cap = row["caps"][i]
+        if r > max(0, cap):
+            return False, f"stat {i} rank {r} is over its cap {max(0, cap)}"
+    if sum(ranks) > row["max_rank"]:
+        return False, f"total rank {sum(ranks)} is over the maximum {row['max_rank']}"
+    return True, "ok"
+
+
+def part_price(kind, item_id, char=None, serial=None, table=None):
+    """(price, source) of a part: the shop row's buy price, else the price the
+    pilot paid for this serial (stored with the purchase), else (0, why)."""
+    row = part_row(kind, item_id, table)
+    if row is not None and row["buy"]:
+        return row["buy"], "shop row"
+    for it in inventory.stored_items(char) if char else ():
+        if serial is not None and it["serial"] == int(serial) and it.get("price"):
+            return int(it["price"]), "price paid"
+    return 0, "unknown (no shop row, no purchase price)"
+
+
+#: KEY: THE BATTLE FEE, read off the client (static 2026-10-01 / 2026-10-08).
+#: 0x61175CB0 walks a setup's 21 item records and, for every non-zero rank
+#: byte i of a record, adds
+#:     price * rank * rate[type] / 100000                     (0x611E1F60)
+#: price = the shop row +0x00 (0x61175CFF: the same 0x611A4760 row the shop
+#: and the remodel cost read), type = 0x611E1C20(kind, i) from the per-kind
+#: tables below (read out of 0x613998D0..0x61399960, -1 = that stat has no
+#: fee), rate[type] = lobby+0x7E0D + type*4 = the 0x019F block +0x18
+#: (squadron.BATTLE_FEE_RATES). The types follow the remodel help lines
+#: 18:59..66: 0 HP, 1 weight, 2 defence, 3 top speed, 4 ammo, 5 damage,
+#: 6 range, 7 recoil.
+FEE_TYPES = {
+    0x11: (0, 1, 2, 3, -1, -1),            # body: HP, weight, defence, speed
+    0x21: (0, 1, 2, -1, -1, -1), 0x31: (0, 1, 2, -1, -1, -1),
+    0x41: (1, -1, -1, -1, -1, -1),         # backpack: weight
+    0x12: (4, 1, 5, 6, 7, -1), 0x22: (4, 1, 5, 6, 7, -1),
+    0x32: (4, 1, 5, 6, 7, -1), 0x42: (4, 1, 5, 6, 7, -1),
+    0xD2: (4, 1, 5, 6, 7, -1),
+    0x52: (4, 1, 5, 6, -1, -1), 0x62: (4, 1, 5, 6, -1, -1),
+    0x72: (4, 1, 5, 6, -1, -1),
+    0x82: (1, 5, -1, -1, -1, -1), 0x92: (1, 5, -1, -1, -1, -1),
+    0xA2: (1, 5, -1, -1, -1, -1), 0xB2: (1, 5, -1, -1, -1, -1),
+    0xC2: (0, 1, -1, -1, -1, -1),
+}
+FEE_DIVISOR = 100000                      # 0x186A0 at 0x611E1F7D
+
+
+def fee_type(kind, stat):
+    """0x611E1C20(kind, stat): the Battle Fee rate index 0..7, or -1."""
+    return FEE_TYPES.get(int(kind), (-1,) * REMODEL_STATS)[int(stat)]
+
+
+def setup_battle_fee(block, setup_no, rates, char=None, table=None):
+    """(fee, lines) for setup `setup_no` (1-based) of a 0x0166-shaped block:
+    the client's own 0x61175CB0 sum over its 21 equipped records. `rates` =
+    the eight 0x019F rates. A record whose price is unknown adds nothing and
+    is named in `lines`. Pure apart from reading `char`'s stored items."""
+    fee, lines = 0, []
+    if not any(rates) or not 1 <= setup_no <= inventory.SETUP_SLOTS:
+        return 0, lines
+    base = (setup_no - 1) * inventory.SETUP_ENTRY_LEN
+    for i in range(inventory.SETUP_ITEMS):
+        off = base + inventory.SETUP_ITEM_OFF + i * inventory.INV_ENTRY_LEN
+        rec = block[off:off + inventory.INV_ENTRY_LEN]
+        if len(rec) < inventory.INV_ENTRY_LEN or not rec[inventory.ITEM_KIND]:
+            continue
+        ranks = record_ranks(rec)
+        if not any(ranks):
+            continue
+        kind = rec[inventory.ITEM_KIND]
+        iid = struct.unpack_from("<H", rec, inventory.ITEM_ID)[0]
+        price, src = part_price(kind, iid, char, struct.unpack_from("<Q", rec, 0)[0], table)
+        part = 0
+        for stat, rank in enumerate(ranks):
+            t = fee_type(kind, stat)
+            if rank and t >= 0:
+                part += int(price) * int(rank) * int(rates[t]) // FEE_DIVISOR
+        fee += part
+        lines.append(f"item {i} kind 0x{kind:02X} id {iid} ranks {list(ranks)} "
+                     f"price {price} ({src}) -> {part}")
+    return fee, lines
+
+
+#: FMO_BATTLE_FEE_MIN_BG -- SE update 2005-09-06: 「最低BGコスト12以上のセクター
+#: のみ改造武器・パーツで出撃可能です」. A battle in a sector whose minimum B.G.
+#: cost is KNOWN and below this runs with the remodel ranks disabled: no fee,
+#: and the client prints 8:75 instead of 8:74 (0x01A1 +0x08 = 1). SE lowered
+#: the bar on 2005-10-31 without a number; 12 is the one they published.
+#: The war state does not fill a sector's minimum yet (sortie.py), so today
+#: this only applies where an operator has set one. 0 = never disable.
+BATTLE_FEE_MIN_BG = int(os.environ.get("FMO_BATTLE_FEE_MIN_BG", "").strip() or 12)
+
+
+def battle_fee_verdict(fee, in_arena=False, sector_min_bg=0, min_bg=None):
+    """(charge, disabled, why) for a fee at the battle end. The Coliseum
+    (OURS: every arena counts as one that forbids modified units, 88:11) and
+    a sector below the B.G. bar disable the ranks: nothing is charged and
+    0x01A1 says so (8:85 / 8:75). Pure."""
+    min_bg = BATTLE_FEE_MIN_BG if min_bg is None else min_bg
+    if fee <= 0:
+        return 0, False, "no remodelled part on the setup"
+    if in_arena:
+        return 0, True, "an Arena battle: modified units are not allowed (8:85)"
+    if min_bg and 0 < int(sector_min_bg or 0) < min_bg:
+        return 0, True, (f"the sector's minimum B.G. cost {sector_min_bg} is below "
+                         f"{min_bg} (8:75)")
+    return int(fee), False, "charged (8:74)"
+
+
 # Called at run time only; imported last so that import cycles resolve.
-from . import charselect, status  # noqa: E402
+import struct  # noqa: E402
+from . import charselect, inventory, status  # noqa: E402

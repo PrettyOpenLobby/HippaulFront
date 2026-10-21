@@ -156,10 +156,28 @@ def parts_stock_payload(stock):
     return bytes(b)
 
 
-#: Default EMPTY = no push at all, i.e. exactly today's behaviour. A bad spec is
-#: fatal at import on purpose: a shop knob that silently parses to "nothing" is
-#: indistinguishable from the bug it is meant to fix.
-PARTS_STOCK_SPEC = os.environ.get("FMO_PARTS_STOCK", "").strip()
+#: KEY: DEFAULT 'all' since 2026-10-08 -- THE RETAIL STOCK RULE IS THE CLIENT'S.
+#: Every row the list loop 0x61033CE0 offers passes, after this bitmap, four
+#: tests the client makes itself out of SE's own tables (static 2026-10-08):
+#:   * a part object exists with a non-zero +4 (0x61033D44);
+#:   * the part's level is inside the shop level window
+#:     max(shop level - 3, 1) .. shop level (0x61033D4F..0x61033D61), the
+#:     shop level following the job level (SE's shop guide);
+#:   * 0x6102FCB0 on the shop row: price non-zero, restriction < 100, the
+#:     row's nation digit (restriction % 10) 0 or the pilot's nation
+#:     (lobby+0x8B4) -- another nation's row only when the 0x019F list at
+#:     +0x710 names it (foreign_sale_list) -- and the part's level within the
+#:     job tier restriction / 10 names (0x61174BA0, 0x611782B0);
+#:   * for a weapon mount, 0x6102FC50 (the mount takes that weapon kind).
+#: So "every id of every kind" here IS the retail shop by rank, level and
+#: nation: SE's 050628 page and the shop guide describe exactly those rules,
+#: and the client applies them. A narrower spec ('0x13', '0x11:1-50') still
+#: works as an override. 'none' sends no push (the empty shop). A bad spec is
+#: fatal at import on purpose: a shop knob that silently parses to "nothing"
+#: is indistinguishable from the bug it is meant to fix.
+PARTS_STOCK_SPEC = os.environ.get("FMO_PARTS_STOCK", "all").strip() or "all"
+if PARTS_STOCK_SPEC.lower() == "none":
+    PARTS_STOCK_SPEC = ""
 try:
     PARTS_STOCK = parse_parts_stock(PARTS_STOCK_SPEC)
 except ValueError as _e:
@@ -286,6 +304,64 @@ def parts_stock_push(conn_id, nation=None):
                         pushes.QUEUE_SEQ, conn_id)
 
 
+#: KEY: ANOTHER NATION'S PARTS NEED A LIST, NOT JUST THE BITMAP (static
+#: 2026-10-08). 0x6102FCB0 hides a shop row whose nation digit (row +0x08 %
+#: 10) is neither 0 nor the pilot's nation unless 0x611757F0(kind, id) finds
+#: it in the list at lobby+0x8505: a u32 count, then 4-byte rows {u16 id,
+#: u8 kind, u8 0} (0x61175805 `lea eax,[ecx+0x8509]`, `add eax,4`). Nothing
+#: in the image writes that address directly; it lies inside the 0x019F block
+#: (arm 0x6117F693 copies 0x5AD dwords to lobby+0x7DF5), at block +0x710. So
+#: SE's victory reward 「それまで購入できなかった相手陣営のヴァンツァー」 reached
+#: the shop through 0x019F, and the stock bitmap alone could never show it.
+FOREIGN_SALE_OFF = 0x8505 - 0x7DF5      # 0x710
+FOREIGN_SALE_ROW = 4
+FOREIGN_SALE_MAX = (0x5AD * 4 - FOREIGN_SALE_OFF - 4) // FOREIGN_SALE_ROW
+
+
+def earned_series(nation):
+    """{kind: set(ids)}: the victory reward parts `nation` has on sale (the
+    phase-00 series of VICTORY_SERIES, and fmowar's per-phase rewards)."""
+    if not VICTORY_PARTS or nation not in VICTORY_SERIES:
+        return {}
+    war = warstate.war_state() if warstate.WAR != "0" else None
+    phases = (war.data.get("phases") if war is not None else None) or {}
+    legacy = {k: r for k, r in phases.items() if not (isinstance(r, dict) and "reward" in r)}
+    out = {}
+    if nation in victory_unlocked(legacy):
+        for kind in VICTORY_KINDS:
+            out.setdefault(kind, set()).update(VICTORY_SERIES[nation])
+    fw = warstate.fmowar
+    if fw is not None and len(legacy) < len(phases):
+        for kind, ids in (fw.reward_unlocked(phases).get(int(nation)) or {}).items():
+            out.setdefault(kind, set()).update(ids)
+    return out
+
+
+def foreign_sale_list(nation, earned=None, table=None):
+    """[(id, kind)] for the 0x019F +0x710 list: every earned reward part
+    whose shop row belongs to the OTHER nation (a row of the pilot's own
+    nation, or of both, is listed by the client without it). Without the shop
+    table every earned part is listed, which costs nothing for a row the
+    client would show anyway. Pure apart from earned_series."""
+    earned = earned_series(nation) if earned is None else earned
+    out = []
+    for kind in sorted(earned):
+        for i in sorted(earned[kind]):
+            nat = economy.row_nation(economy.part_row(kind, i, table))
+            if nat is not None and nat in (0, nation):
+                continue
+            out.append((int(i), int(kind)))
+    return out[:FOREIGN_SALE_MAX]
+
+
+def put_foreign_sale_list(block, rows):
+    """Write `rows` ([(id, kind)]) into a bytearray 0x019F block at +0x710."""
+    struct.pack_into("<I", block, FOREIGN_SALE_OFF, len(rows))
+    for n, (i, kind) in enumerate(rows):
+        off = FOREIGN_SALE_OFF + 4 + n * FOREIGN_SALE_ROW
+        struct.pack_into("<HBB", block, off, i & 0xFFFF, kind & 0xFF, 0)
+
+
 # Called at run time only; imported last so that import cycles resolve.
-from . import packet, pushes, warstate  # noqa: E402
+from . import economy, packet, pushes, warstate  # noqa: E402
 from .wirelog import log  # noqa: E402

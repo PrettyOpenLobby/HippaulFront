@@ -31,4 +31,8 @@ if not os.path.exists("fmodata/fmo-ranks.tsv"):
           "ladder, the class curve and the catalogues", file=sys.stderr)
 EOF
 
+# The game port (61300) and the board are above 1024, so the services run as
+# the unprivileged uid that owns the /data and /logs bind mounts (the core
+# image creates it).
+USER 1000
 ENTRYPOINT ["python", "fmo.py"]

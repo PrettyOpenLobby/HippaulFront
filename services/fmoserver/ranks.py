@@ -81,7 +81,11 @@ RANK_MAX_EARNABLE = 20                 # Captain: SE's contribution ceiling (abo
 #: insignia push), which serves ZERO today, so on the wire B = 0 and EVERY
 #: rank change is an order (pending whenever A != C). servicerecord keys its
 #: delivery rule on this value; change both together.
-RANK_ORDER_FLOOR = 0                   # what 0x019F +0x14 carries today (SE: 21)
+#: 2026-10-07: served as SE's 21 (squadron.insignia_payload writes it at
+#: 0x019F +0x14). With 0 on the wire the 0x0176 arm clamped contribution to
+#: -41 after every officer visit and Personal Ratings drew no gauge.
+#: FMO_RANK_ORDER_FLOOR=0 restores the old byte.
+RANK_ORDER_FLOOR = _env_int("FMO_RANK_ORDER_FLOOR", "21")
 
 
 def orders_pending(rank, floor, ordered):

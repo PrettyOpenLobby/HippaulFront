@@ -23,6 +23,8 @@ was produced):
                  (the City Control board's satellite image; needs Pillow)
   9. spawns      every battle MAP container's placement table
                                               -> fmo-battle-spawns.tsv
+ 10. story-battles AI/F00/D16+D18 win/loss conditions + fmo-missions.tsv
+                                              -> fmo-story-battles.tsv
 
 The install directory is the one holding PolBoot.exe, FrontMissionOnline.dll
 and Data/; the Data directory itself is accepted too. Nothing is decrypted:
@@ -43,7 +45,8 @@ results = []
 
 EXPECTED = ["fmo-class-exp.tsv", "fmo-ranks.tsv", "fmo-cosmetics.tsv",
             "fmo-insignia.tsv", "fmo-missions.tsv", "fmo-cutscenes.tsv",
-            "fmo-npc-keys.tsv", "fmo-script-marks.json", "fmo-battle-spawns.tsv"]
+            "fmo-npc-keys.tsv", "fmo-script-marks.json", "fmo-battle-spawns.tsv",
+            "fmo-part-shop.tsv", "fmo-story-battles.tsv"]
 LOBBY_MAPNOS = (101, 102, 121, 122, 123, 124, 141, 142, 143, 144, 151, 161)
 
 
@@ -94,8 +97,17 @@ def main():
     # bytes corrected from it (fmoprogression still writes its older guesses)
     step("gates", [PY, os.path.join(GEN, "fmogates.py"), *client, "--data", args.out,
                    "--out", args.out, "--fix-missions"])
+    # after gates: each story mission's own battle (its conditions from the
+    # catalogue, its own byte from the corrected fmo-missions.tsv)
+    step("story-battles", [PY, os.path.join(GEN, "fmostorybattles.py"), *client,
+                           "--missions", os.path.join(args.out, "fmo-missions.tsv"),
+                           "--out", args.out])
     step("part-levels", [PY, os.path.join(GEN, "fmopartlevels.py"), *client,
                          "--out", os.path.join(args.out, "fmo-part-levels.tsv")])
+    # prices, sell prices, nation/tier restriction and remodel caps: the shop,
+    # the remodel cost and the Battle Fee (fmoserver/economy.py)
+    step("part-shop", [PY, os.path.join(GEN, "fmopartshop.py"), *client,
+                       "--out", os.path.join(args.out, "fmo-part-shop.tsv")])
     step("floorplans", [PY, os.path.join(HERE, "fmo_floorplans.py"), *client,
                         "--out", os.path.join(args.out, "floorplans")])
     step("npc-keys", [PY, os.path.join(HERE, "fmo_npc_keys.py"), *client,

@@ -2,6 +2,7 @@
 import os
 import struct
 from . import status
+from .knobs import _env_int
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +85,51 @@ def load_class_curve(path=None):
 
 
 CLASS_CURVE = load_class_curve()
+#: KEY: THE LEVEL CAP (2026-10-08). SE capped the Pilot level and raised the
+#: cap over the service: 19 on 2005-05-20 (polnews/news4632), then 39, then
+#: 50 on 2005-09-06 (update/050906ap6wh2: "the level cap is lifted, the level
+#: ceiling goes from 39 to 50"; announced topics/050819), and no later page
+#: raises it again. Every story row's level window ends at 50 and the last
+#: offer (New High-Mobility Weapon Sighted, 0x80cb) wants exactly 50. The
+#: client has no cap below its 100-row curve (0x611E4040 returns INT_MAX past
+#: level 100), so an uncapped pilot walks to Lv51 and every story row shuts.
+#: FMO_PILOT_LEVEL_CAP (default 50, SE's) caps the stored Pilot (class 12)
+#: exp at that level's threshold, so Job Status reads Lv50 with an empty bar,
+#: and the battle's exp rows are cut to the room left so the EXP Gain screen
+#: and the store agree. The jobs (kinds 1..8) are capped at the curve's last
+#: row, the client's own table length (Lv100): SE's pages name no job cap, so
+#: that one is OURS.
+PILOT_LEVEL_CAP = _env_int("FMO_PILOT_LEVEL_CAP", "50")
+PILOT_KIND = 12
+
+
+def exp_cap(kind, curve=None, cap=None):
+    """The highest stored exp for class `kind`: the threshold of the cap level
+    (PILOT_LEVEL_CAP for the Pilot, the curve's last row for a job), or None
+    when there is no curve. Pure."""
+    curve = CLASS_CURVE if curve is None else curve
+    if not curve:
+        return None
+    lv = (PILOT_LEVEL_CAP if cap is None else cap) if int(kind) == PILOT_KIND else len(curve)
+    lv = max(1, min(int(lv), len(curve)))
+    return curve[lv - 1]
+
+
+def cap_exp_rows(exp, rows, curve=None, cap=None):
+    """Clip battle exp rows (kind, amount) to the room each class has left
+    under its cap, given the pilot's current {kind: exp}. A row with no room
+    is dropped. -> (rows, [(kind, amount dropped)]). Pure."""
+    out, cut = [], []
+    for kind, amount in rows:
+        kind, amount = int(kind), int(amount)
+        top = exp_cap(kind, curve, cap)
+        room = amount if top is None else max(0, top - int(exp.get(kind, 0)))
+        keep = min(amount, room)
+        if keep != amount:
+            cut.append((kind, amount - keep))
+        if keep > 0:
+            out.append((kind, keep))
+    return out, cut
 
 
 def class_level(exp, curve=None):

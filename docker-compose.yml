@@ -6,7 +6,7 @@
 #
 #   1. python tools/gen_blowfish_tables.py                        (once)
 #   2. python tools/fmodata_build.py --client <your FMO install>  (once)
-#   3. cp .env.example .env    # set POL_ADVERTISE to your server's LAN/VPN IP
+#   3. cp .env.example .env    # POL_ADVERTISE stays in ../openlobby/.env
 #      docker compose --project-directory ../openlobby \
 #          --env-file ../openlobby/.env --env-file .env \
 #          -f ../openlobby/docker-compose.yml -f docker-compose.yml \
@@ -96,7 +96,7 @@ services:
   # cities, who holds them, the phase clock), read-only over the war state.
   # The backdrop needs art baked from your own client (README.md).
   #   add --profile board to the command above
-  board:
+  fmoboard:
     <<: *fmo
     profiles: ["board"]
     entrypoint: ["python", "polboards.py", "--bind", "0.0.0.0",

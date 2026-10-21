@@ -31,8 +31,9 @@ event	p1	answer	set	note
 #
 # What the captures say (logs/captures/fmo-0159-*.bin, 2026-09-05..09-11):
 #   101  []               at lobby entry (srv_101 in every script's helper
-#                         library, AI/F00/D87.DAT 0x740): the script tests the
-#                         answered p1 != 0 and only then runs a second call.
+#                         library, AI/F00/D87.DAT 0x52a): the helper returns
+#                         answered p1 != 0, and its callers discard it (see
+#                         the 101 row below; corrected 2026-10-08).
 #   104  [130]            Kwangsu Son: 130 = own_byte of "Enemy Unit
 #                         Annihilation" (fmo-missions.tsv). srv_104(p) RETURNS
 #                         the answered p1 to its caller. Candidate: the server
@@ -70,6 +71,15 @@ event	p1	answer	set	note
 # (scriptcall.REGISTRATION_BYTE): 104 0 -> 1 at the sergeant, 1 -> 2 at the
 # training-success scene 0x8084, 105 2 -> 99 when he says "cleared to sortie".
 # 201 is a plain ack. To go back: restore `201	*		128=p1`.
+# 2026-10-08, 101 (srv_101, D87 0x52a): every LEV entry script (0x8070, 0x8048,
+# 0x802a, 0x800d) calls it once per run (LobbyEntry_t at the end of Son's welcome,
+# 0x81ca, before its closing map attach), and both 0x8070 call sites discard
+# the answer (0x81d4 / 0xc148 overwrite R0), so p1 stays a plain echo. INFERRED:
+# it is how SE's server learned the zone's entry scene had played; @visited sets
+# that zone's LEV visited bit (8..13, zoneentry.lev_visited_bit of the last
+# 0x0153), so the scene plays once. FMO_VISITED_ON_ENTRY=0 or commenting the row
+# makes 101 a plain ack again.
+101	*		@visited	the zone's entry scene is playing: mark the zone visited (LEV bits 8..13)
 200	*		p1	a script marks flag bit p1 (Map Selector 16, training ground 32)
 201	*			the training job the sergeant picked (1..3); nothing to store
 205	*		p1	a script marks flag bit p1 (34 the sergeant, story arcs 42..128)

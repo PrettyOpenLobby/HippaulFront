@@ -46,11 +46,13 @@ MSG_LOCAL_HELLO = 0x012D
 #: QUEUE_SEQ from that handler.
 MSG_TIME_SYNC = 0x0199
 S199_LEN = 0x10
-#: FMO_TIME_SYNC: '0' (default) = keepalives stay unanswered, as they always
-#: have. '1' = every 0x0198 gets a 0x0199 with its own stamp echoed. Scene 4
-#: only by the arm's own gate; in the lobby it is dropped, so the risk is
-#: confined to battles, where the clock is what mission timers run on.
-TIME_SYNC = (os.environ.get("FMO_TIME_SYNC", "").strip() or "0") != "0"
+#: FMO_TIME_SYNC: '1' (default since 2026-10-08: the client has the arm,
+#: 0x6117F25C, and its only stamp source is the keepalive, so SE's server
+#: answered it) = every 0x0198 gets a 0x0199 with its own stamp echoed. Scene 4
+#: only by the arm's own gate; in the lobby it is dropped. The client ignores
+#: one whose echo is more than 1500 ms off its clock, so a bad one changes
+#: nothing. '0' = keepalives stay unanswered (the pre-10-08 wire).
+TIME_SYNC = (os.environ.get("FMO_TIME_SYNC", "").strip() or "1") != "0"
 
 
 def time_sync_body(echo_sec, echo_usec, now=None):

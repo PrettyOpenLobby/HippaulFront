@@ -6,6 +6,7 @@ import struct
 import time
 from .deps import fmosectors, fmoworld
 from .knobs import _env_int
+from .wirelog import log
 
 
 #: KEY: COM ENEMIES ARE DRESSED FROM SE's NPC SETS, not from the pilot's garage
@@ -69,7 +70,7 @@ def load_npc_loadouts(path=None):
                 try:
                     rows.append({"kind": r["kind"], "level": int(r["level"]),
                                  "nation": int(r["nation"]), "role": r["role"],
-                                 "name": r["name"],
+                                 "name": r["name"], "hp": int(r.get("hp") or 0),
                                  "parts": parse_loadout_parts(r["parts"])})
                 except (KeyError, ValueError):
                     continue
@@ -90,10 +91,20 @@ def enemy_level_for(host):
     WARNING: rank = B.G.Cost is OURS. The client only draws the rank; SE's
     050719 note ties level to B.G.Cost, and the NPC loadouts' levels (1..60 =
     5 x 1..12, SE's "minimum B.G.Cost 12" sectors) fit the same x5 scale."""
+    # a training sortie (training.ENEMY_LEVEL, OURS) is fought for no sector
+    if ((referee.BATTLE_STATE.get(referee.bkey(host)) or referee.BATTLE_STATE.get(host)
+         or {}).get("training")):
+        from . import training
+        return training.ENEMY_LEVEL, "FMO_TRAINING_ENEMY_LEVEL (a training sortie)"
     sess = trade.LIVE_SESSIONS.get(host)
     tile = (getattr(sess, "sector", None) or (None,))[0]
     if tile is None:
         return ENEMY_LEVEL, "FMO_ENEMY_LEVEL (no sector)"
+    # an EVENT BATTLE running on this sector sets its own level (events.py)
+    from . import events
+    _ev = events.event_for(tile)
+    if _ev is not None and _ev["enemy_level"] > 0:
+        return _ev["enemy_level"], f"event battle {_ev['name']!r} on sector {tile}"
     try:
         ws = warstate.war_state()
         sec = ((ws.data.get("sectors") or {}).get(str(tile)) or {}) if ws is not None else {}
@@ -184,13 +195,19 @@ def npc_paint(nation, unit_type):
 
 def enemy_pop(sq, i, uid, pos, owner, side, unit_type, brain):
     """The cmd-7 POP of squad unit `i` (id `uid`): an AI unit (client_kind 1)
-    owned by `owner`, dressed from its loadout, with the HP scale byte."""
+    owned by `owner`, dressed from its loadout, with the HP scale byte. A
+    story mission battle (storybattle.py) may name a unit (sq["names"]) and
+    mark it as the objective's target (sq["targets"], storybattle's
+    POP_OBJECTIVE_UNIT flag)."""
+    _flag = ({storybattle.POP_OBJECTIVE_UNIT: b""}
+             if i in (sq.get("targets") or ()) else {})
     return fmoworld.record_pop(
         uid, unit_type=unit_type, pos=pos, client_kind=1,
-        name1=NPC_NAME_BY_NATION.get(sq["nation"], "Unit"), name2=str(i + 1),
+        name1=NPC_NAME_BY_NATION.get(sq["nation"], "Unit"),
+        name2=(sq.get("names") or {}).get(i) or str(i + 1),
         nation=sq["nation"], side=side,
         parts=enemy_parts(sq, i),
-        extra={**npc_paint(sq["nation"], unit_type),
+        extra={**npc_paint(sq["nation"], unit_type), **_flag,
                battlepop.POP_AI_OWNER: struct.pack("<I", owner),
                battlepop.POP_AI_BRAIN: struct.pack("<I", brain),
                # client_kind 1 scales part HP by this byte x 10 % (0x611F7124);
@@ -520,6 +537,137 @@ def fire_relay(chan, addr, body, arg8):
     return n
 
 
+#: KEY: THE UNHANDLED BATTLE COMMANDS (static, checked against captured
+#: bodies). Each was opened at its sender; what the server does with it:
+#:   cmd 14  (0x0E) 12-B body, zeros, from the peer object itself
+#:           (0x611E2D60 {arg, 0, 0}; 0x611E2FD8 zeros + [peer+0x1118]):
+#:           the link-level family 9/10/11/14/15/16 of the stream, next to
+#:           the seven cmd 15 that open every battle. No BM arm (cmd - 0x12 is
+#:           negative). Named, not acted on.
+#:   cmd 21  (0x15) 16-B body {u32 a, u32 self, u32 target, u32 b}, e.g.
+#:           {0x63, 0x1001, 0x2224, 5}: a UNIT EVENT about the sender's own
+#:           unit. The receive arm 0x611EE900 (BM_RECV 21) looks the unit up
+#:           by the record HEADER +0x08, and, when it is not the viewer's own
+#:           unit, calls 0x611F2360(unit, byte rec+5); the body is not read.
+#:           Relayed like a shot (fire_relay): to each room mate on the
+#:           sender's alias stream, header +0x08 = that alias.
+#:   cmd 111 (0x6F) 12-B body {u32 0, u32 unit, u32 requester (= unit)}
+#:           from 0x611D3660, the sibling of 112 below; its one caller is the
+#:           Emergency Escape object's +12 s step (0x6104C11A, after cmd 139
+#:           reason 0x24360679): "the escape finished". No reply is polled.
+#:           Never seen in a capture; named, logged whole.
+#:   cmd 112 (0x70) 16-B body {u32 target, u32 requester, 1, 0} from
+#:           0x611D35D0, whose debug prints are SE's own
+#:           "%x was depopped by %x" / "...tried to depop but the packet
+#:           buffer is full": a DEPOP REQUEST. Callers: a countdown object
+#:           (0x610CA08C, when [obj+0x24] runs out, once) and a unit's list
+#:           walker (0x610D0240); live, each destroyed squad enemy
+#:           (0x2222..0x2224) was asked for by its owner some minutes after
+#:           its wreck. Answered with the battle manager's cmd 8
+#:           RecvDepop(target, requester, 3 = REMOVE) to the requester and
+#:           every battle room mate, for a squad unit the requester OWNS --
+#:           OURS: retail's status byte for a wreck removal is not in the
+#:           client (it only reads what it is sent). FMO_BATTLE_DEPOP_REQ=0
+#:           logs instead.
+CMD_BM_UNIT_EVENT = 21
+CMD_BM_DEPOP_REQ = 112
+CMD_BM_DEPOP_SIB = 111
+CMD_PEER_LINK_14 = 14
+DEPOP_REQ = (os.environ.get("FMO_BATTLE_DEPOP_REQ", "").strip() or "1") != "0"
+BATTLE_CMD_NOTES = {
+    CMD_PEER_LINK_14: "peer-stream link command (0x611E2D60 / 0x611E2FD8, the "
+                      "9..16 family beside cmd 15; no battle-manager arm) -- noted, "
+                      "not acted on",
+    CMD_BM_DEPOP_SIB: "the 12-B sibling of the depop request (0x611D3660, sent by "
+                      "the Emergency Escape follow-up 0x6104C0F4) -- logged whole, "
+                      "meaning unread",
+}
+
+
+def battle_cmd_note(chan, addr, cmd, body):
+    """Name a battle command this server reads but does not act on, once per
+    channel per command. Returns True when a line was written."""
+    note = BATTLE_CMD_NOTES.get(cmd)
+    if note is None:
+        return False
+    said = getattr(chan, "_cmd_noted", None)
+    if said is None:
+        said = chan._cmd_noted = set()
+    if cmd in said:
+        return False
+    said.add(cmd)
+    log(f"[udp {addr[0]}:{addr[1]}]   cmd {cmd} = {note}; body {len(body)}B "
+        f"{body[:16].hex(' ')}")
+    return True
+
+
+def unit_event_relay(chan, addr, cmd, body, arg8):
+    """A pilot's own cmd 21 (header +0x08 = its own unit) to every other
+    battle pilot in the room, on the sender's alias stream there, the header
+    rewritten to that alias and the body's self / target ids to what the
+    viewer calls them. Returns how many got it."""
+    if cmd != CMD_BM_UNIT_EVENT or arg8 is None or arg8 != chan.self_unit():
+        return 0
+    n = 0
+    for o in rooms.room_mates(chan):
+        if not rooms._is_battle_chan(o):
+            continue
+        _mine = getattr(chan, "remotes", {}).get(
+            getattr(chan, "alias_of", {}).get(o.addr))
+        if room.PEER_LINK and _mine is not None and getattr(_mine, "linked", False):
+            continue            # the client sends it on the link itself
+        alias = o.alias_for(chan.addr)
+        rs = o.remotes.get(alias)
+        if rs is None or not rs.popped:
+            continue
+        nb = bytearray(body)
+        for at in (4, 8):
+            if at + 4 <= len(nb):
+                struct.pack_into("<I", nb, at, id_for_viewer(
+                    struct.unpack_from("<I", nb, at)[0], chan, o) & 0xFFFFFFFF)
+        rs.pending.append(fmoworld.record(cmd, bytes(nb), arg8=alias))
+        n += 1
+    if n and chan.cmd_seen.get(cmd, 0) <= 3:
+        log(f"[udp {addr[0]}:{addr[1]}]   cmd 21 = UNIT EVENT on {arg8:#x} "
+            f"{body[:16].hex(' ')} -> {n} room mate(s), on the sender's alias "
+            f"stream (0x611EE900 reads the header unit)")
+    return n
+
+
+def depop_request(chan, addr, body):
+    """cmd 112, the client's DEPOP REQUEST {target, requester, 1, 0}: answer
+    with cmd 8 RecvDepop(target, requester, REMOVE) to the requester and the
+    room when the target is a squad unit this pilot's battle owns. Returns
+    how many channels got the depop (the requester counts)."""
+    if len(body) < 8:
+        return 0
+    target, who = struct.unpack_from("<II", body, 0)
+    bk = referee.chan_bkey(chan)
+    sq = (referee.BATTLE_STATE.get(bk) or {}).get("squad")
+    owned = bool(sq) and sq["owner"] == bk and target in set(sq["ids"])
+    if not owned or not DEPOP_REQ:
+        log(f"[udp {addr[0]}:{addr[1]}]   cmd 112 = DEPOP REQUEST: unit {target:#x} "
+            f"by {who:#x} (0x611D35D0, SE: '%x was depopped by %x'): "
+            + ("FMO_BATTLE_DEPOP_REQ=0, not acted on" if owned else
+               "not a squad unit this pilot owns, not acted on"))
+        return 0
+    rec = fmoworld.record_depop(target, from_id=who, status=fmoworld.DEPOP_REMOVE)
+    chan.pending.append(rec)
+    n = 1
+    for o in rooms.room_mates(chan):
+        if not rooms._is_battle_chan(o):
+            continue
+        o.pending.append(fmoworld.record_depop(
+            id_for_viewer(target, chan, o), from_id=id_for_viewer(who, chan, o),
+            status=fmoworld.DEPOP_REMOVE))
+        n += 1
+    log(f"[udp {addr[0]}:{addr[1]}]   cmd 112 = DEPOP REQUEST: squad unit {target:#x} "
+        f"by {who:#x} (0x611D35D0, SE: '%x was depopped by %x') -> cmd 8 "
+        f"RecvDepop status {fmoworld.DEPOP_REMOVE} (REMOVE) to the requester + "
+        f"{n - 1} room mate(s)")
+    return n
+
+
 def squad_note_hits(chan, body, arg8):
     """Remember who last HIT each squad unit, from a cmd-43 hit list: a squad
     id (an enemy hit its own side) or the host whose pilot fired. Returns
@@ -589,5 +737,6 @@ def squad_credit_kill(sq, target, reporter, now=None, chans=None):
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    battlepop, groupchannel, move, penalty, referee, room, rooms, trade, warstate, worldchannel,
+    battlepop, groupchannel, move, penalty, referee, room, rooms, storybattle, trade, warstate,
+    worldchannel,
 )

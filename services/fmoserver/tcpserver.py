@@ -101,7 +101,7 @@ def serve_client(conn, addr):
                         f"the cipher is wrong, or the streams are out of step. "
                         f"This is the signal that the RC4 model is broken; do not "
                         f"read it as a transient.")
-                if p["payload"]:
+                if p["payload"] and wirelog.WIRE_HEXDUMP:
                     log(hexdump(p["payload"]))
                 if not p["chk_ok"]:
                     log(f"{peer} WARNING: checksum mismatch -- our reading of the "

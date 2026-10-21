@@ -74,12 +74,16 @@ WARMAP_ENTRY = (os.environ.get("FMO_WARMAP_ENTRY", "").strip() or "1") != "0"
 #: "Running" here = an enemy-side pilot is fighting on that map now
 #: (warmap_census) AND that pilot holds an open battle-map mission whose
 #: battlefield is that (zone, tile). The bonus is OURS to size: SE's amount is
-#: not on the site. FMO_COUNTER_BONUS_HS (default 0 = log only) is owed to the
-#: winning pilot as a kind-2 line at the Personnel Officer.
+#: not on the site. FMO_COUNTER_BONUS_HS is owed to the winning pilot as a
+#: kind-2 line at the Personnel Officer; 0 = log only. SE paid one
+#: (update/050628gp4sc1:86-88: "the same amount to every participant, then the
+#: platoon bonus"); the amount is OURS: 1000 H$ (default since 2026-10-08),
+#: under one battle's flat pay. FMO_COUNTER_MISSION defaults to 3, the
+#: release value since 09-30 (0 = no counter icon).
 COUNTER_MISSION = int(os.environ.get("FMO_COUNTER_MISSION", "").strip()
-                      or "0", 0)
+                      or "3", 0)
 COUNTER_BONUS_HS = int(os.environ.get("FMO_COUNTER_BONUS_HS", "").strip()
-                       or "0", 0)
+                       or "1000", 0)
 PAY_KILL = 2                   #: paybook kind 2 = "Kill bonus" (0x61191420)
 
 #: KEY: SECTOR MISSIONS, category 2 (static 2026-09-12, NOT LIVE). SE
@@ -361,19 +365,164 @@ def warmap_sector_for(body, selector=None):
         f"(fmosectors.py, from the client's own ARE table)")
 
 
+#: KEY: THE 0x0161 PLAYER INFORMATION ROWS (static 2026-10-08). The 0x1450 arm
+#: 0x6118EBA7 reads the reply frame: count = [frame+0x14] (payload+0x00),
+#: rows from frame+0x28 (payload+0x14), and calls 0x6118D360(rows, count).
+#: That consumer walks the rows at STRIDE 0x40 (`add esi, 0x40` at
+#: 0x6118D42A), keeps a row only when row+0x22 == byte[lobby+0x8B4] (the
+#: viewer's nation, 0x6118D3F5), copies 0x10 dwords of it to item+0x8F and
+#: numbers the item; when no row passes it makes ONE item with +0x60 = -2,
+#: which the painter 0x6118BA20 draws as 10:48 "[NO PLAYER]". The painter
+#: reads item+0x8F = row+0x00 (name 1) and +0x11 (name 2) through the
+#: "%s %s" formatter 0x6118F640 and the loadout fields below.
+#: KEY: THE LOADOUT FIELDS (static 2026-10-08, the painter 0x6118BA20 opened):
+#:   +0x24 u16      the equipped BACKPACK's part id (kind 0x41). 0 draws
+#:                  nothing; else 0x6117B010(id, 0) draws its name (text
+#:                  resource 0xA, key (id << 16) | 0x41) and 0x61175A10(id)
+#:                  its type label: byte +6 of the kind-0x41 master record
+#:                  (table 0x613C0F48 = Data/AG/F21/D97, 48-B records, 1-based)
+#:                  indexes 14 systext ids at 0x613954F8 = 102:0..13 (Item,
+#:                  Jetpack, Turbo, Repair, ...); the client resolves both.
+#:   +0x26..+0x2D   u16[4] the four WEAPON part ids (setup items 4..7)
+#:   +0x2E..+0x31   u8[4]  their full kind bytes (0x12 .. 0xD2; 0 = empty
+#:                  slot). kind >> 4 picks the master table (0x611A3FE0);
+#:                  the slot with the highest part level (record +1) is
+#:                  printed as 10:47 "%s Lv:%2d" with the class name 104:n
+#:                  (MG, SG, RF, ...), so the server sends ids, not levels.
+#:   +0x32 u16      a sprite id in the image registry [0x613CC56C], drawn
+#:                  64x64 when the list's +0x16A flag is set; that registry is
+#:                  indexed by D31 insignia id (the squadron insignia
+#:                  picker's own preview draws through it, 0x611BAFEF).
+#:                  INFERRED, not proved: the pilot's squadron insignia.
+#:   +0x3C bit 0    the row background (0x80606060 set, 0x80303030 clear);
+#:                  meaning unread, served 0.
+#: The rows are the same 0x40-B Player List rows the 0x0158 / 0x0163 battle
+#: group replies carry (groupchannel.group_member_row: names + nation).
+#: Who is listed: the pilots whose battle state names the requested battle
+#: map and is not ended (the same census the 0x015F entry draws from).
+#: WARNING: the 0x0160 body (+0x00 / +0x04, two u32 from the war map's
+#: list item, 0x6118D75C / 0x6118DF6C) has never been seen in a capture; +0x00 is
+#: read as the battle map id, and a body naming no map lists nobody.
+S161_ROW_LEN = 0x40
+S161_ROW_NAME1 = 0x00
+S161_ROW_NAME2 = 0x11
+S161_ROW_NATION = 0x22
+S161_ROW_BACKPACK = 0x24
+S161_ROW_WEAPONS = 0x26
+S161_ROW_KINDS = 0x2E
+S161_ROW_INSIGNIA = 0x32
+S161_ROW_MAX = 20                #: the group Player List's cap, kept here
+#: the setup item slots the world unit builds its weapons from, and the
+#: backpack's (inventory.SETUP_ITEM_OFF records, 24 B each)
+S161_WEAPON_SLOTS = (4, 5, 6, 7)
+S161_BACKPACK_SLOT = 10
+BACKPACK_KIND = 0x41
+
+
+def player_loadout(char):
+    """{"backpack", "weapons": [(id, kind)] x4} from the pilot's sortie setup
+    (inventory.active_setup_no), zeros where a slot is empty. Pure."""
+    out = {"backpack": 0, "weapons": [(0, 0)] * 4}
+    try:
+        block = bytes.fromhex((char or {}).get("setups") or "")
+    except (TypeError, ValueError):
+        return out
+    no, _why = inventory.active_setup_no(char, block)
+    base = (no - 1) * inventory.SETUP_ENTRY_LEN
+    if base + inventory.SETUP_ENTRY_LEN > len(block):
+        return out
+
+    def item(slot):
+        at = base + inventory.SETUP_ITEM_OFF + slot * inventory.INV_ENTRY_LEN
+        return (struct.unpack_from("<H", block, at + inventory.ITEM_ID)[0],
+                block[at + inventory.ITEM_KIND])
+    bid, bkind = item(S161_BACKPACK_SLOT)
+    if bid and bkind == BACKPACK_KIND:
+        out["backpack"] = bid
+    out["weapons"] = [(i, k) if i and k else (0, 0)
+                      for i, k in (item(s) for s in S161_WEAPON_SLOTS)]
+    return out
+
+
+def player_row(first, last, nation, loadout=None, insignia=0):
+    """One 0x40-B Player List row: names (cp932, 16 + NUL), the nation byte at
+    +0x22 the consumer filters on, and the loadout fields (player_loadout)."""
+    row = bytearray(S161_ROW_LEN)
+    for off, txt in ((S161_ROW_NAME1, first), (S161_ROW_NAME2, last)):
+        s = (txt or "").encode("cp932", "replace")[:0x10]
+        row[off:off + len(s)] = s
+    row[S161_ROW_NATION] = int(nation or 0) & 0xFF
+    lo = loadout or {}
+    struct.pack_into("<H", row, S161_ROW_BACKPACK, int(lo.get("backpack") or 0) & 0xFFFF)
+    for i, (wid, kind) in enumerate((lo.get("weapons") or [])[:4]):
+        struct.pack_into("<H", row, S161_ROW_WEAPONS + 2 * i, int(wid) & 0xFFFF)
+        row[S161_ROW_KINDS + i] = int(kind) & 0xFF
+    struct.pack_into("<H", row, S161_ROW_INSIGNIA, int(insignia or 0) & 0xFFFF)
+    return bytes(row)
+
+
+def squadron_insignia_of(sess):
+    """The registered insignia of the first of `sess`'s POL groups that has
+    one, else 0 (+0x32, inferred)."""
+    if fmostore is None:
+        return 0
+    for gid in sorted(getattr(sess, "pol_groups", None) or ()):
+        try:
+            got = fmostore.squadron_insignia(gid)
+        except Exception:
+            got = None
+        if got:
+            return int(got)
+    return 0
+
+
+def session_nation(s):
+    """A game session's granted nation, 1 / 2 or None (the row's +0x22)."""
+    try:
+        n = s.grant_nation()[0]
+    except Exception:
+        return None
+    return n if n in (1, 2) else None
+
+
+def player_rows_for_map(mapno, pilots, states, now, limit, nation_of):
+    """The 0x0161 rows for battle map `mapno`: one per live pilot whose
+    battle state (`states`, by its battle key) is on that map and not
+    ended, sorted by name, at most `limit`. `pilots` are sessions
+    (trade.live_pilots), `nation_of(session)` -> 1 / 2 / None. Pure."""
+    out = []
+    for s in pilots:
+        try:
+            st = states.get(s.battle_key())
+            c = s.playing_char()
+        except Exception:
+            continue
+        if not isinstance(st, dict) or st.get("mapno") != mapno or st.get("ended"):
+            continue
+        if not c or not (c.get("first") or c.get("last")):
+            continue
+        first, last = (c.get("first") or "").strip(), (c.get("last") or "").strip()
+        out.append(((first.lower(), last.lower()),
+                    player_row(first, last, nation_of(s), player_loadout(c),
+                               squadron_insignia_of(s))))
+    out.sort(key=lambda r: r[0])
+    return [r for _k, r in out[:max(0, limit)]]
+
+
 def reply_warmap_list(count=0, rows=None):
-    """The 0x015F / 0x0161 body: u32 count at +0x00, rows from +0x14.
+    """The 0x015F / 0x0161 body: u32 count at +0x00, rows from +0x14, each
+    row at its own length (0x6C for 0x015F, 0x40 for 0x0161).
 
     count defaults to 0 = the empty, provably safe answer (both consumers guard
     their row loop with `count > 0`)."""
     rows = rows or []
-    body = bytearray(S15F_HEAD_LEN + S15F_ROW_LEN * len(rows))
+    body = bytearray(S15F_HEAD_LEN)
     struct.pack_into("<I", body, 0, len(rows) if rows else count)
-    for i, row in enumerate(rows):
-        body[S15F_HEAD_LEN + i * S15F_ROW_LEN:
-             S15F_HEAD_LEN + (i + 1) * S15F_ROW_LEN] = row
+    for row in rows:
+        body += bytes(row)
     return bytes(body)
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import missionlist, popnames, rooms, zoneentry  # noqa: E402
+from . import inventory, missionlist, popnames, rooms, zoneentry  # noqa: E402
+from .deps import fmostore  # noqa: E402  (the squadron insignia, 0x0161 +0x32)

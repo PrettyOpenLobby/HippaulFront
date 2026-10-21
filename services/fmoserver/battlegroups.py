@@ -627,20 +627,29 @@ def group_battle_join(gid, account, mapno, window, now=None):
 #: KEY: THE PLATOON EXP BONUS (systext 8:45 "経験値を入手しました（小隊ボーナス
 #: %d%%）", 0x014C +0x0F2, printed on a WIN when > 100). SE never published the
 #: rule; polnews 8696 only says fighting together adds a platoon bonus so you
-#: gain exp faster. OURS, TO TUNE: +FMO_PLATOON_EXP_PER percent (default 10)
-#: for each group member in the battle beyond the first, capped at
-#: FMO_PLATOON_EXP_MAX percent (default 150). Paid on a win, the only time the
-#: client says so. FMO_PLATOON_EXP_PER=0 = off (100%, +0x0F2 = 0 as before).
-PLATOON_EXP_PER = _env_int("FMO_PLATOON_EXP_PER", "10")
+#: gain exp faster. KEY: SE's one number (2026-10-08): BOOT CAMP Lesson 4
+#: (pcd/topics/fmo/detail/1420, image 1420_15) charts the exp per NPC unit for
+#: a Controlled Zone win at 1.0 alone and about 1.3 for ten pilots who all
+#: survive ("戦闘終了時の戦闘不能になっていない味方ヴァンツァーの数に応じて").
+#: So the default is FMO_PLATOON_EXP_AT10 = 130: +30% spread evenly over the
+#: nine extra pilots (+3.3% each). The straight line between 1 and 10 and
+#: counting the group members in the battle rather than the survivors are
+#: OURS. FMO_PLATOON_EXP_PER (percent per extra member, capped at
+#: FMO_PLATOON_EXP_MAX) replaces the chart when set; 0 = off (100%).
+PLATOON_EXP_AT10 = _env_int("FMO_PLATOON_EXP_AT10", "130")
+PLATOON_EXP_PER = _env_int("FMO_PLATOON_EXP_PER", "-1")
 PLATOON_EXP_MAX = _env_int("FMO_PLATOON_EXP_MAX", "150")
 
 
-def platoon_exp_pct(n, per=None, cap=None):
+def platoon_exp_pct(n, per=None, cap=None, at10=None):
     """The exp percent for a battle fought by `n` members of one group. Pure."""
     per = PLATOON_EXP_PER if per is None else per
     cap = PLATOON_EXP_MAX if cap is None else cap
-    if per <= 0 or n <= 1:
+    at10 = PLATOON_EXP_AT10 if at10 is None else at10
+    if n <= 1 or per == 0:
         return 100
+    if per < 0:
+        return max(100, min(at10, 100 + (at10 - 100) * (min(n, 10) - 1) // 9))
     return max(100, min(cap, 100 + per * (n - 1)))
 
 

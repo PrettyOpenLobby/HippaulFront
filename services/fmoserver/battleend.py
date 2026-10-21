@@ -335,7 +335,8 @@ KILL_EXP = os.environ.get("FMO_KILL_EXP", "").strip()
 PILOT_EXP_PCT = _env_int("FMO_PILOT_EXP_PCT", "100")
 PILOT_KIND = 12
 JOB_KINDS = range(1, 9)
-#: FMO_EXP_PACE (battles per level; 0 = off, the old flat rows only). The D15
+#: FMO_EXP_PACE (battles per level; 0 = off). Since 2026-10-08 an OVERRIDE:
+#: when it is above 0 it replaces the exp formula below (EXP_FORMULA). The D15
 #: curve's steps grow from 82,800 (Lv 2) to ~19M (Lv 50), so no flat amount can
 #: carry a pilot through the campaign; SE's exp grew with the fight (their 2005
 #: notes tune it by sector and zone). OUR stand-in: a WIN pays the jobs one
@@ -369,6 +370,49 @@ EXP_SECTOR_PCT = _env_int("FMO_EXP_SECTOR_PCT", "100")
 EXP_FRONT_PCT = _env_int("FMO_EXP_FRONT_PCT", "100")
 SECTOR_EXP_CAP_LEVEL = 25
 FRONTLINE_ZONE_KIND = 5
+#: KEY: THE BATTLE EXP FORMULA, the default since
+#: FMO_EXP_PACE became an override. What SE published about battle exp:
+#:   * intro/flow3.html 17 (and gamesystem/job/game3): three kinds. DIRECT exp
+#:     is shared out to the units involved when an enemy unit is destroyed;
+#:     INDIRECT exp goes to units that supported the unit that acted; ACTION
+#:     exp comes from acting in the set job's role. The pilot's set jobs earn
+#:     it ("セットしているジョブの役割を果たせばより多くの経験値").
+#:   * BOOT CAMP Lesson 4 (pcd/topics/fmo/detail/1420, archived 2007-05-23):
+#:     the battle group chart is "exp obtainable PER NPC UNIT" (NPC1機あたり
+#:     から取得できる経験値): 1.0 for one pilot winning alone, about 1.3 for ten
+#:     who all survive (the platoon bonus, battlegroups.platoon_exp_pct). The
+#:     drill sergeant: as you level up the same kills pay you less.
+#:   * BOOT CAMP Lesson 5 (detail/1462): a special mission (story mission)
+#:     pays more exp and contribution than an ordinary battle when it succeeds.
+#:   * update 050628 / 050815: up to about x2 by sector, more on the Frontline
+#:     (FMO_EXP_SECTOR_PCT / FMO_EXP_FRONT_PCT above).
+#: The client computes none of it: the EXP Gain screen and the Job Status page
+#: show the 0x014C rows the server sends and add them to lobby+0xF08
+#: (0x6117E52C); the only per-hit report the client makes is cmd 100
+#: (0x611F0CD0, sent when it hits a unit of the other side: the target's top
+#: job level x 1000 scaled by the hit), which SE's battle server will have
+#: tallied, and which is not decoded far enough to pay from. SE's amounts are on
+#: no page we hold. So the SHAPE is SE's and every number is OURS:
+#:   per battle, in thousandths of the Pilot level step at the pilot's level
+#:   (the D15 curve), FMO_EXP_SORTIE_PM for sortieing (the action exp we cannot
+#:   see), + FMO_EXP_KILL_PM per enemy this pilot destroyed (direct), +
+#:   FMO_EXP_ASSIST_PM per enemy a room-mate destroyed (indirect), +
+#:   FMO_EXP_WIN_PM on a win; divided by (1 + (level - 1) / FMO_EXP_TAPER) so
+#:   higher levels take more battles; x FMO_EXP_STORY_PCT on a won story
+#:   mission battle. With the defaults a solo three-kill win is a third of a
+#:   level at Lv1: Pilot Lv3 in about 7 such wins (an evening), Lv6 in 20,
+#:   Lv10 in 50, Lv20 in about 140 (fewer in harder sectors), the cap Lv50 in
+#:   about 730. The total is split over the set jobs exactly as the pace was
+#:   (FMO_EXP_MAIN_PCT), and the Pilot row is FMO_PILOT_EXP_PCT of it.
+#: FMO_EXP_FORMULA=0 turns it off; FMO_EXP_PACE > 0 replaces it with the old
+#: flat "pace battles per level".
+EXP_FORMULA = _env_int("FMO_EXP_FORMULA", "1") != 0
+EXP_SORTIE_PM = _env_int("FMO_EXP_SORTIE_PM", "40")
+EXP_KILL_PM = _env_int("FMO_EXP_KILL_PM", "80")
+EXP_ASSIST_PM = _env_int("FMO_EXP_ASSIST_PM", "20")
+EXP_WIN_PM = _env_int("FMO_EXP_WIN_PM", "50")
+EXP_TAPER = _env_int("FMO_EXP_TAPER", "6")
+EXP_STORY_PCT = _env_int("FMO_EXP_STORY_PCT", "150")
 
 
 def parse_exp_jobs(spec):
@@ -397,6 +441,49 @@ def paced_exp_rows(level, won, curve, jobs, pace=None, main_pct=None):
         return []
     step = curve[level] - curve[level - 1] if level >= 1 else curve[0]
     total = step // pace if won else step // (2 * pace)
+    return split_job_exp(total, jobs, main_pct)
+
+
+def formula_exp_total(level, won, kills, assists, curve, story=False, sortie_pm=None,
+                      kill_pm=None, assist_pm=None, win_pm=None, taper=None,
+                      story_pct=None):
+    """The battle exp total (before the sector, arena and platoon scales) for a
+    pilot at Pilot `level` under the exp formula (see EXP_FORMULA). Pure."""
+    sp = EXP_SORTIE_PM if sortie_pm is None else sortie_pm
+    kp = EXP_KILL_PM if kill_pm is None else kill_pm
+    ap = EXP_ASSIST_PM if assist_pm is None else assist_pm
+    wp = EXP_WIN_PM if win_pm is None else win_pm
+    tp = EXP_TAPER if taper is None else taper
+    stp = EXP_STORY_PCT if story_pct is None else story_pct
+    if not curve or level >= len(curve) or level < 1:
+        return 0
+    step = curve[level] - curve[level - 1]
+    pm = max(0, sp) + max(0, kp) * max(0, int(kills)) + max(0, ap) * max(0, int(assists))
+    if won:
+        pm += max(0, wp)
+    total = step * pm // 1000
+    if tp > 0:
+        total = total * tp // (tp + level - 1)
+    if story and won:
+        total = total * max(0, stp) // 100
+    return max(0, total)
+
+
+def formula_exp_rows(level, won, kills, assists, curve, jobs, story=False, main_pct=None,
+                     **kw):
+    """formula_exp_total split over `jobs` (main first). Pure. -> [(kind, amount)]."""
+    main_pct = EXP_MAIN_PCT if main_pct is None else main_pct
+    if not jobs:
+        return []
+    return split_job_exp(formula_exp_total(level, won, kills, assists, curve, story, **kw),
+                         jobs, main_pct)
+
+
+def split_job_exp(total, jobs, main_pct):
+    """`total` split over the set jobs: the main job takes main_pct percent and
+    the rest share the remainder evenly (a lone job takes all). Pure."""
+    if not jobs or total <= 0:
+        return []
     if len(jobs) == 1:
         rows = [(jobs[0], total)]
     else:

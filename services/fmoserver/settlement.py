@@ -29,6 +29,17 @@ def arena_exp_rows(rows, pct=None):
     return [(k, max(1, a * pct // 100) if a > 0 else a) for k, a in rows]
 
 
+def exp_kill_counts(st):
+    """(own kills, room-mates' kills) for the exp formula, from one battle
+    state: the pilot's own credited kills (battleend.battle_kills) and the
+    squad units destroyed by anyone else in the room (the squad's dead, less
+    friendly fire, less the pilot's own). Pure."""
+    own = len(battleend.battle_kills(st))
+    sq = (st or {}).get("squad") or {}
+    down = len(set(sq.get("dead") or ()) - {t for t, _s in sq.get("friendly_fire") or ()})
+    return own, max(0, down - own)
+
+
 def arena_zone(zone):
     """Is `zone` (a zone id / MapKind) one of the Coliseum's? Pure."""
     try:
@@ -74,8 +85,9 @@ class SessionSettlement:
         except ValueError as e:
             log(f"{self.peer}   WARNING: FMO_BATTLE_END_EXP: {e} -- no class exp this battle")
             rows = []
-        # FMO_EXP_PACE: exp sized to the pilot's Pilot level (battleend's note)
-        if battleend.EXP_PACE > 0:
+        # THE EXP FORMULA (battleend.EXP_FORMULA, the default) or the
+        # FMO_EXP_PACE override: exp sized to the pilot's Pilot level
+        if battleend.EXP_PACE > 0 or battleend.EXP_FORMULA:
             _pc = self.playing_char() if charstore.CHAR_STORE else None
             _jobs = inventory.set_jobs(_pc) if _pc is not None else []
             _src = "the pilot's set jobs (main first)"
@@ -88,7 +100,18 @@ class SessionSettlement:
                     _jobs = []
             if _pc is not None:
                 _lv = progress.pilot_level(_pc)
-                _paced = battleend.paced_exp_rows(_lv, _won, classes.CLASS_CURVE, _jobs)
+                if battleend.EXP_PACE > 0:
+                    _paced = battleend.paced_exp_rows(_lv, _won, classes.CLASS_CURVE, _jobs)
+                    _how = f"FMO_EXP_PACE={battleend.EXP_PACE}"
+                else:
+                    _bst_x = referee.BATTLE_STATE.get(self.battle_key()) or {}
+                    _own_k, _assist_k = exp_kill_counts(_bst_x)
+                    _story_x = bool(_bst_x.get("story"))
+                    _paced = battleend.formula_exp_rows(
+                        _lv, _won, _own_k, _assist_k, classes.CLASS_CURVE, _jobs,
+                        story=_story_x)
+                    _how = (f"exp formula: {_own_k} kill(s), {_assist_k} by room-mates"
+                            + (", a story mission battle" if _story_x else ""))
                 # FMO_EXP_SECTOR_PCT / FMO_EXP_FRONT_PCT: SE's exp grew with
                 # the sector (battleend's note); the Arena has its own cut
                 if _paced and not self.in_arena() and (
@@ -105,7 +128,7 @@ class SessionSettlement:
                         f"zone {_zone}; FMO_EXP_SECTOR_PCT={battleend.EXP_SECTOR_PCT}, "
                         f"FMO_EXP_FRONT_PCT={battleend.EXP_FRONT_PCT})")
                 if _paced:
-                    log(f"{self.peer}   paced exp (FMO_EXP_PACE={battleend.EXP_PACE}, Pilot "
+                    log(f"{self.peer}   paced exp ({_how}, Pilot "
                         f"Lv{_lv}, {'win' if _won else 'loss'}, to {_src}): "
                         + ", ".join(f"{classes.CLASS_NAMES.get(k, k)} +{a}" for k, a in _paced))
                 rows = list(rows) + _paced
@@ -137,6 +160,31 @@ class SessionSettlement:
         # PLATOON (battle groups, 2026-09-30): exp bonus, B.G.Bonus share,
         # join-in percent, auto-disband -- see platoon_battle_settle.
         money, rows = self.platoon_battle_settle(_won, money, rows, pay)
+        # THE TRAINING GROUND PAYS NOTHING (2026-10-08). SE's BOOT CAMP Lesson 6
+        # (pcd/topics/fmo/detail/1601:45): "訓練場の戦闘では、経験値や貢献値
+        # などの報酬は得られません" -- no exp, contribution or other reward
+        # from a training-ground battle. Every training sortie (create 3, or 2
+        # for the penalty retraining, training.CREATE_KINDS) is one; its own
+        # results are the Training Result window and the client's ranking file
+        # (training.py), and the registration still steps byte 128 through its
+        # end scene. FMO_TRAINING_PAY=1 pays it like any battle (the pre-10-08 wire).
+        if not training.TRAINING_PAY and (referee.BATTLE_STATE.get(self.battle_key())
+                                          or {}).get("training"):
+            if money or contrib or rows or pay.get("kill_bonus_hs"):
+                log(f"{self.peer}   TRAINING GROUND: no reward (SE BOOT CAMP Lesson 6): "
+                    f"money {money:+d}, contribution {contrib:+d}, exp {rows or 'none'}, "
+                    f"kill bonus {pay.get('kill_bonus_hs') or 0} NOT paid (FMO_TRAINING_PAY=0)")
+            money, contrib, rows = 0, 0, []
+            pay["contribution"] = 0
+            pay["kill_bonus_hs"] = 0
+        elif kills and charstore.CHAR_STORE:
+            # THE CAREER KILL COUNT (SE 050628gp4sc1:54: the accessory shop's
+            # kill-count gates count a kill for every member of the battle
+            # group; cosmetics.GATES). Banked with the pay commit below; a
+            # training battle is no battle record.
+            _kc = self.playing_char()
+            if _kc is not None:
+                _kc["kill_count"] = cosmetics.pilot_kills(_kc) + len(kills)
         mc = self.stored_money()
         old_money = mc[0] if mc else 0
         old = mc[1] if mc else 0
@@ -149,6 +197,27 @@ class SessionSettlement:
                 banked = True
         if pay["kill_bonus_hs"]:
             self.owe_kill_bonus(pay["kill_bonus_hs"], len(kills))
+        # THE BATTLE FEE: a remodelled setup pays per sortie, once, here
+        try:
+            battle_fee, _fee_now = self.battle_fee_settle(why)
+        except Exception as e:           # never cost the pilot the battle's pay
+            log(f"{self.peer}   WARNING: Battle Fee not settled ({e!r})")
+            battle_fee, _fee_now = 0, None
+        if _fee_now is not None:
+            new_money = _fee_now[0]
+        if rows and charstore.CHAR_STORE:
+            # THE LEVEL CAP (classes.PILOT_LEVEL_CAP, SE's 50): the rows are
+            # cut to the room left under each class's cap BEFORE they are
+            # banked or shown, so the EXP Gain screen's adds and the store
+            # agree; a capped pilot sees no Pilot row at all
+            _cpc = self.playing_char()
+            if _cpc is not None:
+                rows, _cut = classes.cap_exp_rows(classes.class_exp_of(_cpc), rows)
+                if _cut:
+                    log(f"{self.peer}   level cap: "
+                        + ", ".join(f"{classes.CLASS_NAMES.get(k, k)} -{a}" for k, a in _cut)
+                        + f" not paid (Pilot cap Lv{classes.PILOT_LEVEL_CAP}, "
+                        f"jobs Lv{len(classes.CLASS_CURVE)}; FMO_PILOT_LEVEL_CAP)")
         if rows:
             # Banked BEFORE the push, like the money: the 0x014C rows are
             # deltas the client adds to its lobby+0xF08 copy, and the next
@@ -160,7 +229,7 @@ class SessionSettlement:
             "contrib_old": old, "contrib_new": new,
             "money_old": old_money, "money_new": new_money,
             "banked": banked, "why": why, "won": _won, "kills": kills,
-            "kill_bonus_hs": pay["kill_bonus_hs"],
+            "kill_bonus_hs": pay["kill_bonus_hs"], "battle_fee": battle_fee,
         }
         log(f"{self.peer}   BATTLE SETTLEMENT ({why}): "
             f"{'WON' if _won else 'LOST'}, {len(kills)} enemy kill(s)"
@@ -172,6 +241,56 @@ class SessionSettlement:
             f"{'BANKED on the pilot' if banked else 'NOT banked (no pilot in the store): the pushes move the display only'}"
             f"; both 0x014C and 0x015A are built from these numbers.")
         return self.battle_settlement
+
+    def battle_fee_settle(self, why):
+        """(charged, (money, contribution) after it or None): the Battle Fee
+        of the setup this pilot sortied with (economy.setup_battle_fee, the
+        client's own 0x61175CB0 sum at the 0x019F rates), banked ONCE per
+        sortie from settle_battle, and a 0x01A1 queued for the next keepalive:
+        +0x00 the new balance, +0x04 the fee, +0x08 = 1 when the battle ran
+        with the ranks disabled (Arena 8:85 / sector below the B.G. bar 8:75),
+        in which case nothing is charged.
+        KEY: WHEN. SE charged at the SORTIE (2:106 refuses a sortie the wallet
+        cannot cover; paybook 11:16 "Sortie cost refund"). The debit is taken
+        at the battle end here (OURS) because the sortie grant belongs to
+        sortie.py; the client's own 2:106 check still runs at the sortie with
+        the same rates, so a pilot who cannot pay never gets this far."""
+        char = self.playing_char() if charstore.CHAR_STORE else None
+        if char is None or not any(squadron.BATTLE_FEE_RATES):
+            return 0, None
+        block = self.setups_block()
+        no, src = inventory.active_setup_no(char, block)
+        fee, lines = economy.setup_battle_fee(block, no, squadron.BATTLE_FEE_RATES, char)
+        if not fee:
+            return 0, None
+        sec_min = 0
+        try:
+            tile = int(self.sector[0]) if getattr(self, "sector", None) else None
+            ws = warstate.war_state() if tile is not None else None
+            if ws is not None:
+                sec_min = int(((ws.data.get("sectors") or {}).get(str(tile)) or {})
+                              .get("bg_min") or 0)
+        except Exception:
+            sec_min = 0
+        charge, disabled, verdict = economy.battle_fee_verdict(fee, self.in_arena(), sec_min)
+        log(f"{self.peer}   BATTLE FEE ({why}): setup {no} ({src}), fee {fee} at rates "
+            f"{list(squadron.BATTLE_FEE_RATES)}: {verdict}. " + "; ".join(lines))
+        now = None
+        if charge:
+            charge = min(charge, economy.wallet_money(char)[0])
+            now = self.credit_money(f"Battle Fee ({why})", money=-charge)
+        mc = now or self.stored_money()
+        if mc is not None:
+            try:
+                self.queue_push(pushes.MSG_FEE_PUSH,
+                                pushes.fee_push_body(money=mc[0],
+                                                     sortie_cost=fee if disabled else charge,
+                                                     modified_refused=disabled),
+                                f"Battle Fee {charge} ({verdict}); money := {mc[0]}")
+            except Exception as e:
+                log(f"{self.peer}   WARNING: the 0x01A1 for the Battle Fee was not "
+                    f"queued ({e!r}); the wallet is banked and the next 0x014A shows it")
+        return charge, now
 
     def in_arena(self):
         """Is this connection's battle a Coliseum (Arena) one that pays no
@@ -660,6 +779,118 @@ class SessionSettlement:
             f"once FMO_WAR_MAP binds the fields.")
         return s
 
+    def event_battle_settle(self, won):
+        """A WIN on a sector with a running event battle (events.event_for)
+        pays the event's bonus H$ / contribution once per battle. Never raises."""
+        try:
+            tile = int(self.sector[0]) if getattr(self, "sector", None) else None
+            ev = events.event_for(tile)
+            if ev is None or not won or self.in_arena():
+                return None
+            if not (ev["bonus_hs"] or ev["bonus_contrib"]):
+                return ev
+            self.credit_money(f"event battle {ev['name']!r} won on sector {tile}",
+                              money=ev["bonus_hs"], contribution=ev["bonus_contrib"])
+            log(f"{self.peer}   EVENT BATTLE: {ev['name']!r} won on sector {tile}: "
+                f"H$ {ev['bonus_hs']:+d}, contribution {ev['bonus_contrib']:+d} "
+                f"(fmo-event-battles.tsv; shown from the next 0x014A)")
+            return ev
+        except Exception as e:
+            log(f"{getattr(self, 'peer', '?')}   WARNING: event battle bonus not paid ({e!r})")
+            return None
+
+    def story_battle_settle(self, won):
+        """THE STORY STEP FROM THE BATTLE VERDICT (2026-10-08). Once per
+        sortie, from the battle end: the accepted story mission whose sortie
+        tiles hold the tile this sortie was TAKEN on (sortie.py's snapshot,
+        `sortie_story`) moves to 3 (cleared: the NPC's clear scene and its
+        105 come next) or 99 on a WIN; a LOSS moves nothing, so the pilot can
+        sortie again. Retail advanced the mission on the battle result; until
+        10-08 this hung off the post-battle 0x0150 word, which is always
+        0xFFFD after a 0x014C, so no deployment had ever advanced a mission.
+        A withdraw (0x013D) clears the snapshot and never gets here; an arena
+        battle is fought for no sector. Each battle-group member runs this on
+        its own session with its own snapshot, so every member who had the
+        mission accepted and sortied on its tile advances (OURS: no SE text
+        says whether a member's mission cleared on the leader's win).
+        The flags reach the client in a 0x015A at the next lobby keepalive
+        (flags_push_due), never inside the scene change the 0x014C starts.
+        -> the mission dict when one moved, else None."""
+        ss = getattr(self, "sortie_story", None)
+        if not progress.PROGRESS_ADVANCE:
+            log(f"{self.peer}   progression: FMO_PROGRESS_ADVANCE=0 -- the battle "
+                f"verdict moves no story mission")
+            return None
+        if ss is None:
+            log(f"{self.peer}   progression: battle end with no sortie snapshot on "
+                f"this session (a resume, or a sortie granted before the snapshot "
+                f"existed) -- nothing advanced")
+            return None
+        if ss.get("settled"):
+            return None
+        ss["settled"] = True
+        # KEY: ONLY THE LEADER'S MISSION. SE's BOOT CAMP
+        # Lesson 5: in a battle group the player who accepted the special
+        # mission must be the leader; the group's success carries out the
+        # LEADER's mission, and a member with the same mission accepted does
+        # not complete it (change leader and sortie again). Battle exp and
+        # pay are every member's all the same (settle_battle).
+        if storybattle.STORY_LEADER_ONLY and ss.get("leader") is False:
+            log(f"{self.peer}   progression: battle {'WON' if won else 'LOST'} as a "
+                f"battle group MEMBER -- only the leader's special mission is carried "
+                f"out (SE BOOT CAMP Lesson 5; FMO_STORY_LEADER_ONLY); this pilot's "
+                f"accepted mission stays as it was")
+            return None
+        # an arena battle (a Coliseum match, or a sortie from a 6xx zone) is
+        # fought for no sector, whatever FMO_ARENA_NO_PAY says about its pay
+        try:
+            _bst = referee.BATTLE_STATE.get(self.battle_key()) or {}
+        except Exception:
+            _bst = {}
+        if _bst.get("arena_match") or arena_zone(rooms.WORLD_ZONES.get(getattr(self, "ip", None))):
+            log(f"{self.peer}   progression: a Coliseum battle completes no story "
+                f"mission (fought for no sector)")
+            return None
+        if _bst.get("training"):
+            # the registration / retraining battle steps byte 128 through its
+            # own end scene (training.END_SCENE: 0x8084 calls 104 [128]), never
+            # a story mission
+            log(f"{self.peer}   progression: a training battle completes no story "
+                f"mission (byte 128 moves through its end scene)")
+            return None
+        if not charstore.CHAR_STORE:
+            log(f"{self.peer}   progression: battle {'WON' if won else 'LOST'}, but no "
+                f"character store -- nothing to record into")
+            return None
+        _pc = self.playing_char()
+        if not _pc:
+            log(f"{self.peer}   progression: battle {'WON' if won else 'LOST'}, no "
+                f"played character on this session")
+            return None
+        _m, _what, _ra = progress.advance_progress(_pc, tile=ss.get("tile"), won=bool(won))
+        if not _m:
+            log(f"{self.peer}   progression: battle {'WON' if won else 'LOST'} on tile "
+                f"{ss.get('tile')} -- {_what}")
+            return None
+        # the byte may be 3 (cleared, awaiting the report's 105) or 99 (done):
+        # say which, and push the flags at the next lobby keepalive
+        self.flags_push_due = True
+        try:
+            self.commit(f"progression: {_pc.get('first', '')} {_pc.get('last', '')} "
+                        f"{'cleared' if ': cleared,' in _what else 'completed'} "
+                        f"'{_m['title']}' on the battle verdict (WON, tile "
+                        f"{ss.get('tile')}) -> {_what}"
+                        + (f", rank -> {_ra} (FMO_PROGRESS_RANK_FOLLOW)" if _ra else ""))
+        except Exception as _e:
+            log(f"{self.peer}   WARNING: progression NOT banked ({_e!r}); the byte "
+                f"moves in memory and goes back at the next login")
+        log(f"{self.peer}   KEY: progression: '{_m['title']}' -> {_what}. The next "
+            f"frontier is "
+            + (" | ".join(x["title"] for x in progress.progress_frontier(_pc)) or "(nothing)")
+            + ". The flags reach the client in a 0x015A at the next lobby "
+              "keepalive; rank and Pilot level at the next Start Game (0x014A).")
+        return _m
+
     def battle_end_push(self, conn_id, why="the FMO_BATTLE_END timer", won=None,
                         next_battle=False):
         """ONE 0x014C from the battle settlement (settle_battle), which is
@@ -669,6 +900,8 @@ class SessionSettlement:
         _won = st["won"]
         self.war_settle(_won)
         self.mission_battle_settle(_won)
+        self.story_battle_settle(_won)
+        self.event_battle_settle(_won)
         # HANGAR RANK (hangar.HANGAR_JOB_LEVEL): banked here, after the exp
         # above, and served in +0x0F5 -- the same value the next 0x014A serves.
         _hc = self.playing_char() if charstore.CHAR_STORE else None
@@ -819,3 +1052,7 @@ from . import penalty  # noqa: E402  (the friendly-fire report and vote)
 from . import loot, squad  # noqa: E402  (loot_battle_settle)
 from . import pvproom  # noqa: E402  (the PvP room's war settle)
 from . import training  # noqa: E402  (the training result ranking feed)
+from . import economy, squadron  # noqa: E402  (the Battle Fee)
+from . import cosmetics  # noqa: E402  (the career kill count the shop gates read)
+from . import events  # noqa: E402  (event battles: the win bonus)
+from . import storybattle  # noqa: E402  (story battles: leader-only rule, story exp)

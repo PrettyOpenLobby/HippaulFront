@@ -1,6 +1,8 @@
 """run(): the listeners, the startup log and the background threads."""
+import os
 import socket
 import threading
+import time
 from .deps import fmodb, fmoworld
 from .wirelog import log
 from . import wirelog
@@ -287,10 +289,60 @@ def run():
     except Exception as _e:
         log(f"live-session heartbeat not started: {_e!r}")
     while True:
-        conn, addr = s.accept()
-        threading.Thread(target=tcpserver.serve_client, args=(conn, addr),
+        # accept() can raise (EMFILE when descriptors run out, ECONNABORTED
+        # when the peer vanishes mid-handshake); either used to end this loop
+        # and leave the port bound and dead.
+        try:
+            conn, addr = s.accept()
+        except OSError as e:
+            log(f"accept failed ({e!r}); listener continues")
+            time.sleep(0.1)
+            continue
+        if not _peer_acquire(addr[0]):
+            log(f"{addr[0]}:{addr[1]} refused: that address already holds "
+                f"{_MAX_PER_IP} connections (POL_MAX_CONNS_PER_IP)")
+            conn.close()
+            continue
+        threading.Thread(target=_serve_capped, args=(conn, addr),
                          name="fmo-session-%s-%d" % addr,
                          daemon=True).start()
+
+
+#: One address's share of the handler threads. The listener has no global cap
+#: (the core's serving.py has one); this stops a single peer from holding
+#: every session thread. 0 disables it.
+_MAX_PER_IP = int(os.environ.get("POL_MAX_CONNS_PER_IP", "32"))
+_PER_IP = {}
+_PER_IP_LOCK = threading.Lock()
+
+
+def _peer_acquire(ip):
+    if _MAX_PER_IP <= 0:
+        return True
+    with _PER_IP_LOCK:
+        n = _PER_IP.get(ip, 0)
+        if n >= _MAX_PER_IP:
+            return False
+        _PER_IP[ip] = n + 1
+    return True
+
+
+def _peer_release(ip):
+    if _MAX_PER_IP <= 0:
+        return
+    with _PER_IP_LOCK:
+        n = _PER_IP.get(ip, 0) - 1
+        if n > 0:
+            _PER_IP[ip] = n
+        else:
+            _PER_IP.pop(ip, None)
+
+
+def _serve_capped(conn, addr):
+    try:
+        tcpserver.serve_client(conn, addr)
+    finally:
+        _peer_release(addr[0])
 
 
 # Called at run time only; imported last so that import cycles resolve.

@@ -60,6 +60,15 @@ try:
 except ImportError:                                  # pragma: no cover
     fmodb = None
 
+if contentauth is None and fmodb is not None:
+    # On a checkout it is fmodb that puts OpenLobby's services/ on the path,
+    # so the contentauth import above ran too early there (in the image the
+    # modules sit side by side and it succeeded). Try once more.
+    try:
+        import contentauth
+    except ImportError:                              # pragma: no cover
+        contentauth = None
+
 try:
     # KEY: THE WAR STATE (stage 17): per-sector control, the phase clock and the
     # binding onto the 216-byte sector record the war map and City Control

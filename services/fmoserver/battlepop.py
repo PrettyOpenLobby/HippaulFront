@@ -462,6 +462,32 @@ def _parse_battle_dummy(spec):
 
 BATTLE_DUMMY = _parse_battle_dummy(BATTLE_DUMMY_SPEC)
 
+
+def squad_blocked_for(bst, zone, zone_is_arena=None, in_match=False):
+    """Why the NPC enemy squad must NOT be popped on this battle channel, or
+    None when it may. Pure, so the selftest can drive it.
+
+    A Coliseum arena is pilots only (Playing Manual p.45; SE's 2005-10-31
+    update page: arenas are battles between battle groups). Live 2026-10-06
+    17:04:58Z the first 1 vs 1 arena match got the sector squad every sortie
+    gets, both fighters died to it and the judge called a draw. The kinds:
+      * `bst["arena_match"]` (set by coliseum.arena_sortie_go) or `in_match`
+        (coliseum.match_of knows the account): an arena match;
+      * `bst["arena_spectate"]`: a spectator's channel, nothing of its own;
+      * the pilot's zone is a Coliseum zone (600..607, settlement.ARENA_ZONES)
+        and the battle came through the arena bar rather than a match push.
+    A sector sortie, the Frontline (pvproom.squad_allowed gates the waiting
+    room separately) and training keep the squad."""
+    bst = bst or {}
+    if bst.get("arena_match") or in_match:
+        return f"a Coliseum arena match ({bst.get('arena_match') or 'match_of'}) is pilots only"
+    if bst.get("arena_spectate"):
+        return "a Coliseum spectator channel receives, it fights nothing"
+    if zone_is_arena is not None and zone_is_arena(zone):
+        return f"zone {zone} is a Coliseum zone (settlement.ARENA_ZONES)"
+    return None
+
+
 POP_BATTLE_SPEC = os.environ.get("FMO_UDP_POP_BATTLE", "").strip()
 try:
     POP_BATTLE = popsweep._parse_pop(POP_BATTLE_SPEC)

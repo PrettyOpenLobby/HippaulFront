@@ -60,9 +60,11 @@ from .wirelog import log
 #: (pushes.py), so a mission group that ends while its pilots are in the lobby
 #: stays attached until they relog. A live test settles all four.
 #:
-#: FMO_MISSION_GROUP: 0 (default) = no mission group is ever attached and
-#: nothing here runs; 1 = attach them as above.
-MISSION_GROUP = _env_int("FMO_MISSION_GROUP", "0") != 0
+#: FMO_MISSION_GROUP: 1 (default since 2026-10-08: retail had mission groups,
+#: Playing Manual p.61, and only a pilot who issues or takes a derived order
+#: is ever attached) = attach them as above; 0 = no mission group is ever
+#: attached and nothing here runs (the rollback if a type 2/3 attach misbehaves).
+MISSION_GROUP = _env_int("FMO_MISSION_GROUP", "1") != 0
 MG_TYPE_MEMBER, MG_TYPE_LEADER = 2, 3
 #: the manager id (datagram `kind`) each type registers, from 0x61177620
 MG_KIND = {MG_TYPE_MEMBER: 6, MG_TYPE_LEADER: 5}

@@ -148,9 +148,7 @@ class Session(
         acct = f"member:{member}"
         was = self._account
         self._account = acct
-        with identity._store_lock:
-            identity._proven_by_ip[self.ip] = (acct, time.monotonic())
-            identity._identity_by_ip[self.ip] = (acct, time.monotonic())
+        identity.remember_proven(self.ip, acct)
         rank = next(i for i, (v, _) in enumerate(cands) if v == prefix)
         log(f"{self.peer}   KEY: content auth: key prefix {prefix.hex()[:8]}.. "
             f"(candidate {rank + 1} of {len(cands)}) was minted for {acct} -- "
@@ -162,7 +160,7 @@ class Session(
     @property
     def account(self):
         if self._account is None:
-            self._account = identity.account_for(self.ip)
+            self._account = identity.account_for(self.ip, session=self)
         return self._account
 
     def wire_self_id(self):
@@ -368,6 +366,23 @@ class Session(
             c = named[0] if named else None
         return c
 
+    def warmap_player_rows(self, body):
+        """The 0x0161 rows for a 0x0160 request: the live pilots fighting on
+        the battle map its +0x00 names (warmap.player_rows_for_map). A body
+        too short to carry a map id lists nobody."""
+        if len(body) < 4:
+            log(f"{self.peer}   0x0160 body is {len(body)}B, no battle map id at +0x00: "
+                f"count 0")
+            return []
+        mapno = struct.unpack_from("<I", body, 0)[0]
+        rows = warmap.player_rows_for_map(
+            mapno, trade.live_pilots(), referee.BATTLE_STATE, time.time(),
+            warmap.S161_ROW_MAX, warmap.session_nation)
+        log(f"{self.peer}   0x0160 +0x00 = battle map {mapno}, +0x04 = "
+            f"{struct.unpack_from('<I', body, 4)[0] if len(body) >= 8 else 'short'}: "
+            f"{len(rows)} pilot(s) fighting there now (BATTLE_STATE census)")
+        return rows
+
     def remember_zone(self, mapkind, mapno, why):
         """Store the zone (and lobby map) a 0x0153 just put this pilot in, on
         the pilot's own record -- the `mapkind`/`mapno` columns fmostore has
@@ -385,8 +400,12 @@ class Session(
         was = pc.get("mapkind")
         pc["mapkind"] = int(mapkind)
         pc["mapno"] = mapno
+        _fz = progress.note_frontline_entry(pc, mapkind)    # bit 17: first Frontline entry
+        if _fz:
+            self.flags_push_due = True
         self.commit(f"zone {was} -> {int(mapkind)} (MapNo {mapno}, {why}); the "
-                    f"FMO content profile's Zone now reads {int(mapkind) // 100}")
+                    f"FMO content profile's Zone now reads {int(mapkind) // 100}"
+                    + ("; flag bit 17 set (first Frontline entry)" if _fz else ""))
         return True
 
     def setups_block(self):
@@ -987,48 +1006,20 @@ class Session(
             want = struct.unpack_from("<H", p["payload"], 0)[0] \
                 if len(p["payload"]) >= 2 else 0
             if getattr(self, "sortie_pending", False):
+                # PROGRESSION (2026-10-08): the story step runs at the BATTLE
+                # VERDICT (settlement.story_battle_settle), where won/lost
+                # is known; this return is only noted. Until 10-08 the step
+                # hung off this word, and after a 0x014C it is always 0xFFFD,
+                # so it had never fired on a deployment.
                 self.sortie_pending = False
-                if want == 0xFFFD:
-                    log(f"{self.peer}   progression: 0x0150 word 0xFFFD is the "
-                        f"withdraw's -- or, live 2026-09-10, the 0x014C battle end's -- "
-                        f"follow-up, not a completed sortie")
-                elif not progress.PROGRESS_ADVANCE:
-                    log(f"{self.peer}   progression: back from a sortie, "
-                        f"FMO_PROGRESS_ADVANCE=0 -- nothing recorded")
-                elif not charstore.CHAR_STORE:
-                    log(f"{self.peer}   progression: back from a sortie, but "
-                        f"no character store -- nothing to record into")
-                else:
-                    _pc = self.playing_char()
-                    if not _pc:
-                        log(f"{self.peer}   progression: back from a sortie, "
-                            f"no played character on this session")
-                    else:
-                        _m, _what, _ra = progress.advance_progress(
-                            _pc, tile=self.sector[0] if self.sector else None)
-                        if _m:
-                            # the byte may be 3 (cleared, awaiting the report's
-                            # 105) or 99 (done): say which, and push the flags
-                            # at the next lobby keepalive rather than into the
-                            # scene change this 0x0150 starts
-                            self.flags_push_due = True
-                            self.commit(f"progression: {_pc.get('first','')} "
-                                        f"{_pc.get('last','')} "
-                                        f"{'cleared' if ': cleared,' in _what else 'completed'} "
-                                        f"'{_m['title']}' -> {_what}"
-                                        + (f", rank -> {_ra} (FMO_PROGRESS_RANK_"
-                                           f"FOLLOW: the successor's level)"
-                                           if _ra else ""))
-                            log(f"{self.peer}   KEY: progression: the next "
-                                f"frontier is "
-                                + (" | ".join(x["title"] for x in
-                                              progress.progress_frontier(_pc)) or "(nothing)")
-                                + ". The flags reach the client in a 0x015A at the "
-                                  f"next lobby keepalive; rank and Pilot level at "
-                                  f"the next Start Game (0x014A).")
-                        else:
-                            log(f"{self.peer}   progression: back from a "
-                                f"sortie -- {_what}")
+                _ss = getattr(self, "sortie_story", None)
+                log(f"{self.peer}   progression: back from a sortie (0x0150 word "
+                    f"0x{want:04X}); the story step ran at the battle verdict"
+                    + (f" (sortie tile {_ss.get('tile')}, "
+                       + ("settled" if _ss.get("settled") else
+                          "NOT settled: no battle end reached this session, so "
+                          "nothing advanced") + ")"
+                       if _ss else " (no sortie snapshot: a withdraw, or a resume)"))
             log(f"{self.peer}   0x0150 JOIN: client asks MapKind 0x{want:04X}"
                 + ("  (0xFFFF/0xFFFD are the client's sentinels, not a real "
                    "selector)" if want in (0xFFFF, 0xFFFD) else ""))
@@ -1122,6 +1113,7 @@ class Session(
                         f"MapNo={mn} MapKind={mk}; relaunch for the next")
                 log(f"{self.peer}   check with the crash instrument: an 'alloc' "
                     f"of 0 on a slot names the id that does not exist")
+            zoneentry.note_grant(self, mk, _f18)   # the zone a following 101 is from
             outs = [packet.build(zoneentry.MSG_0150_REPLY,
                            zoneentry.reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
                                                 csn=csn, field18=_f18,
@@ -1564,6 +1556,7 @@ class Session(
                     f"request. Answering message 1 instead is the client's own "
                     f"'no' (0x61174400, back to the lobby) -- that is what to "
                     f"send the day this needs to fail cleanly.")
+            zoneentry.note_grant(self, mk, kind)   # the zone a following 101 is from
             outs = [packet.build(zoneentry.MSG_0150_REPLY,
                                  zoneentry.reply_0153(mapkind=mk, mapno=mn, pilotpos=pp,
                                                       csn=csn, field18=kind,
@@ -1700,13 +1693,6 @@ class Session(
                 log(f"{self.peer}   credentials: region {c['region']} "
                     f"({c['region_name']}), identity {c['identity'].hex()}, "
                     f"{len(c['auth'])}B polcore auth blob")
-            log(f"{self.peer}   WARNING: the auth blob is NOT verified -- nobody is "
-                f"authenticated; we answer anyway to see where the client goes")
-            # Logged VERBATIM for the member-binding hunt: the 52-byte blob
-            # varies per session and is minted by polcore from its login
-            # state. If it turns out to carry the session token our own
-            # authserv issued, it names the member with no address heuristic
-            # at all -- compare these lines across machines and accounts.
             log(f"{self.peer}   polcore auth blob (verbatim): "
                 f"{c['auth'].hex()}")
             # The character store account. Resolved HERE, on the login
@@ -1714,9 +1700,31 @@ class Session(
             # live on this side; every character message rides the game
             # connection that follows -- so stash the RESOLVED key against
             # the address (and in the field-A token) for that one to adopt.
-            found = identity.member_for_ip(self.ip)
+            #
+            # The 52-byte blob decides first (2026-10-08): it decodes to a
+            # hash the core filed when it answered this login's 4:5
+            # (contentauth.member_for_blob), so a hit names the member with
+            # no address involved. Only a miss asks member_for_ip, the
+            # freshest-POL-login guess that two devices behind one router
+            # share.
+            found = None
+            if contentauth is not None and hasattr(contentauth, "member_for_blob"):
+                _mid, _row, _how = contentauth.member_for_blob(
+                    c["auth"], log=lambda m: log(f"{self.peer}   {m}"),
+                    tag="credential blob")
+                if _mid is not None:
+                    found = (f"member:{_mid}",
+                             f"the CREDENTIAL BLOB decided ({_how}); the "
+                             f"address was not consulted")
+            if found is None:
+                log(f"{self.peer}   the credential blob did not decide - "
+                    f"resolving by the address (member_for_ip)")
+                found = identity.member_for_ip(self.ip)
             if found:
                 acct, how = found
+                # this connection adopts it, the way resolve_key adopts the
+                # key-proven member; account_for() answers from here first
+                self._account = acct
                 log(f"{self.peer}   character store account = {acct} -- {how}")
                 if not charstore.load_roster(acct):
                     legacy = [k for k in identity.store_accounts()
@@ -1808,7 +1816,8 @@ class Session(
         if p["msg"] == move.MSG_HANGAR_PW:
             _new, _cur = move.parse_hangar_pw(p["payload"])
             log(f"{self.peer}   VERIFIED: 0x0170 = SET HANGAR PASSWORD, {len(p['payload'])}B: "
-                f"new={_new!r} (+0x00), current={_cur!r} (+0x10, our 0x014A +0x738). "
+                f"new={len(_new)} chars (+0x00), current={len(_cur)} chars "
+                f"(+0x10, our 0x014A +0x738; the values themselves are not logged). "
                 f"The move machine's state 101 polls seq 0x{p['seq']:08X} for message 1.")
             if not move.HANGAR:
                 log(f"{self.peer}   FMO_HANGAR=0 -- staying silent (reproduces the "
@@ -1888,6 +1897,7 @@ class Session(
                 f"is MapNo {_mn}, a type-2 lobby map -- the warzone's own "
                 f"terrain is one of the 281 TYPE-1 files and is reached "
                 f"through the sortie, not through this grant.")
+            zoneentry.note_grant(self, zone)   # the zone a following 101 is from
             outs = [packet.build(zoneentry.MSG_0150_REPLY,
                                  zoneentry.reply_0153(mapkind=zone, mapno=_mn,
                                                       host=addressing.host_for(addressing.BATTLE_HOST, self.ip),
@@ -2049,48 +2059,27 @@ class Session(
                 f"has any text in it is a separate question.")
             return [packet.build(battlegroups.MSG_GROUP_COMMENT_REPLY, b"", p["seq"], p["conn"])]
 
-        if p["msg"] in (shop.MSG_ITEM_SELL, shop.MSG_ITEM_BUY):
-            # THE ITEM COUNTER. See MSG_ITEM_SELL for why these two siblings are
-            # answered oppositely: the sell price is on the wire and the buy
-            # price is not.
+        if p["msg"] == shop.MSG_ITEM_REMODEL:
+            # THE REMODEL ("Upgrade"): 0x017E is not a purchase (shop.py)
+            return shop.on_remodel(self, p)
+
+        if p["msg"] == shop.MSG_ITEM_SELL:
+            # THE ITEM COUNTER: SELL or DISCARD (see MSG_ITEM_SELL). The sell
+            # price is on the wire; the client never credits itself.
             _b = p["payload"]
             _mode, _price, _serial, _iid, _kind = shop.parse_item_request(_b)
-            _buy = p["msg"] == shop.MSG_ITEM_BUY
-            _what = ("BUY" if _buy else
-                     ("DISCARD" if _mode == 1 else "SELL"))
+            _what = "DISCARD" if _mode == 1 else "SELL"
             log(f"{self.peer}   0x{p['msg']:04X} = ITEM {_what} ({len(_b)}B): "
                 f"serial 0x{_serial:016X}, id {_iid}, kind {_kind}, "
                 f"mode byte {_mode} at record+0x{shop.S169_REC_MODE:02X} "
                 f"(1 = discard), price field {_price} at "
                 f"payload+0x{shop.S169_PRICE:02X}.")
-            _mode_knob = shop.ANSWER_017E if _buy else shop.ANSWER_0169
+            _mode_knob = shop.ANSWER_0169
             if _mode_knob == "0":
-                log(f"{self.peer}   WARNING: FMO_ANSWER_{'017E' if _buy else '0169'}"
-                    f"=0: staying silent -- the counter polls forever and the "
-                    f"client hangs. That is what it did before today; kept for "
+                log(f"{self.peer}   WARNING: FMO_ANSWER_0169=0: staying silent -- "
+                    f"the counter polls forever and the client hangs. Kept for "
                     f"the A/B.")
                 return []
-            if _buy and _mode_knob != "1":
-                log(f"{self.peer}   -> message 2 (a WRONG id, deliberately): "
-                    f"0x61179383's jne takes 0x611793CA, which puts our "
-                    f"word[+8] in lobby+0x7D5F as a numbered [FM...] code and "
-                    f"leaves state 3. KEY: The debit at 0x61179373 lives INSIDE "
-                    f"the 0x{shop.MSG_ITEM_BUY_REPLY:04X}-matched path, so no money "
-                    f"moves. We refuse because the BUY price is never sent "
-                    f"(it is [record+0x18], one dword past the 24 the client "
-                    f"copies), so we cannot charge for this -- and a 0x017F "
-                    f"here would debit the client's own display for an item we "
-                    f"hold no stock of, then be undone by the next 0x014A. "
-                    f"FMO_ANSWER_017E=1 to let it through anyway.")
-                return [packet.build(2, b"", p["seq"], p["conn"])]
-            if _buy:
-                log(f"{self.peer}   WARNING: FMO_ANSWER_017E=1 -> "
-                    f"0x{shop.MSG_ITEM_BUY_REPLY:04X}: the client will subtract "
-                    f"[record+0x18] from its OWN wallet, a figure we were never "
-                    f"sent and do not store. Expect the wallet to snap back on "
-                    f"the next 0x014A.")
-                return [packet.build(shop.MSG_ITEM_BUY_REPLY, bytes(0x14),
-                                     p["seq"], p["conn"])]
             if _mode_knob != "1":
                 log(f"{self.peer}   -> message 2 (FMO_ANSWER_0169=fail): "
                     f"0x6117A90F, a numbered refusal; the item is NOT removed.")
@@ -2118,6 +2107,10 @@ class Session(
                     log(f"{self.peer}   the serial is not among the pilot's "
                         f"acquired items (a setups-block record, or minted "
                         f"before items were kept) -- nothing to remove here")
+            if _mode != 1 and _price:
+                # SE's own sell price (shop row +0x04); a higher figure is cut
+                _price, _pnote = shop.sale_price(_price, _kind, _iid)
+                log(f"{self.peer}   sale price {_price}: {_pnote}")
             if _mode != 1 and _price:
                 # KEY: THE CLIENT NEVER CREDITS ITSELF on a sale -- no `add
                 # [lobby+0x88C]` exists in that arm -- so the money is ours to
@@ -2413,7 +2406,7 @@ class Session(
             # list, an empty sector answers count=0, and either way the reason
             # is logged -- "the same place every time" was invisible precisely
             # because this request was never read.
-            _rows = warmap.warmap_rows() if _is5e else []
+            _rows = warmap.warmap_rows() if _is5e else self.warmap_player_rows(_b)
             _srcnote = None
             if _is5e:
                 _tile, _srow, _smap, _ondisk, _srcnote = warmap.warmap_sector_for(
@@ -2439,7 +2432,15 @@ class Session(
                     self.sector = None
                 log(f"{self.peer}   sector lookup: {_srcnote}")
             _body = warmap.reply_warmap_list(0, _rows)
-            if _rows:
+            if _rows and not _is5e:
+                log(f"{self.peer}   -> {_rep:#06x}, {len(_body)}B, count={len(_rows)}: "
+                    f"0x40-B Player List rows from +0x14 (names at +0x00 / +0x11, "
+                    f"nation at +0x22 = the consumer 0x6118D360's filter against "
+                    f"lobby+0x8B4): "
+                    + ", ".join(r[:0x11].split(b'\0')[0].decode('cp932', 'replace')
+                                + "." + r[0x11:0x22].split(b'\0')[0].decode('cp932', 'replace')
+                                + f" (nation {r[0x22]})" for r in _rows))
+            elif _rows:
                 log(f"{self.peer}   -> {_rep:#06x}, {len(_body)}B, count={len(_rows)}: "
                     f"battle map id(s) "
                     f"{', '.join(str(struct.unpack_from('<I', r)[0]) for r in _rows)} at "
@@ -2636,7 +2637,7 @@ class Session(
                 f"lobby+0x6E4A is in state 2 polling seq 0x{p['seq']:08X}. "
                 f"0x61177AB5 compares the reply's message id against 1 and "
                 f"nothing reads its body.")
-            # KEY: 2026-09-05 (settled-lobby round 2, LIVE): the counter NPC event
+            # KEY: the counter NPC event
             # scripts (nina_event / gunsou1_event, SCP 0x8071/0x8074) send ONE
             # 0x0159 per dialogue step -- three in three seconds, first dwords
             # 0x68, 0xC9, 0x66 -- so this block is the client committing its
@@ -2694,6 +2695,7 @@ class Session(
                     f"record -- the driven sweep sends one): acked, not persisted")
             else:
                 log(f"{self.peer}   {scriptcall.describe_0159(_ev, _ps)}")
+                scriptcall.note_call(self, _ev, _ps)   # 102: the battle's end scene
                 if _pc is not None:
                     _se = dict(_pc.get("srv_events") or {})
                     _prev = _se.get(str(_ev)) or {}
@@ -2720,8 +2722,9 @@ class Session(
                     _fl = fmostore.flags_bytes(_pc.get("flags")) if (fmostore and _pc) else b""
                     if not _fl:
                         _fl = status.reply_014a(char=_pc or {})[status.S14A_FLAGS11:status.S14A_FLAGS11 + status.S14A_FLAGS11_LEN]
-                    _ans, _nfl, _what = scriptcall.apply_event_rule(_rule, _ps, _fl)
-                    _reward_money, _reward_pushes = 0, []
+                    _ans, _nfl, _what = scriptcall.apply_event_rule(
+                        _rule, _ps, _fl, ctx=scriptcall.call_context(self))
+                    _reward_money, _reward_contrib, _reward_pushes = 0, 0, []
                     if not _what:
                         log(f"{self.peer}   fmo-events.tsv row for event {_ev} "
                             f"(p1 {_rule['p1'] if _rule['p1'] is not None else '*'}) "
@@ -2742,20 +2745,51 @@ class Session(
                                 # the report's reward (scriptcall.MISSION_REWARD):
                                 # the script prints it because p2 = 1; pay it here
                                 if scriptcall.MISSION_REWARD:
+                                    # contribution per report (progress.REPORT_CONTRIB_RAW,
+                                    # OURS): the delta that makes the script's
+                                    # "Contribution points earned." line play
+                                    _rc = progress.report_contribution()
                                     for _rb, _rm, _ri in progress.rewards_due(_pc, _fl, _nfl):
                                         _why = f"mission byte {_rb} reported"
-                                        if _rm:
+                                        if _rm or _rc:
                                             _reward_money += _rm
-                                            self.credit_money(f"{_why}: reward {_rm} H$", money=_rm)
+                                            _reward_contrib += _rc
+                                            self.credit_money(f"{_why}: reward {_rm} H$, "
+                                                              f"contribution +{_rc}",
+                                                              money=_rm, contribution=_rc)
                                         _pid = progress.REWARD_PASS.get((_ri or {}).get("name"))
+                                        _paint = progress.reward_paint(_ri)
                                         if _pid:
                                             _mint = self.grant_reward_pass(p["conn"], _pid, _why)
                                             if _mint:
                                                 _reward_pushes.append(_mint)
-                                        elif _ri:
+                                        elif _paint:
+                                            # a reward-only paint (nation flag 255, not in
+                                            # the shop): banked as the owned bit the
+                                            # pickers list (progress.REWARD_PAINT)
+                                            _pnew = inventory.add_owned_paint(_pc, _paint[0], _paint[1])
                                             log(f"{self.peer}   {_why}: {_ri.get('kind')} "
-                                                f"{_ri.get('name')!r} needs no grant (the cosmetic "
-                                                f"catalogue already offers it)")
+                                                f"{_ri.get('name')!r} = {_paint[0]} id {_paint[1]} "
+                                                f"{'GRANTED (owned bit, rides this push)' if _pnew else 'already owned'}")
+                                        elif _ri:
+                                            log(f"{self.peer}   WARNING: {_why}: {_ri.get('kind')} "
+                                                f"{_ri.get('name')!r} is not in progress.REWARD_PAINT "
+                                                f"-- NOT granted; the script still prints it")
+                                    # the sergeant's 105 [128] ("cleared to sortie"):
+                                    # the base squadron insignia the scene names by
+                                    # the zone of the talk, and the contribution line
+                                    if progress.registration_reported(_fl, _nfl):
+                                        _bi = progress.base_insignia_for_zone(_pc.get("mapkind"))
+                                        _bnew = inventory.add_owned_paint(_pc, "insignia", _bi)
+                                        if _rc:
+                                            _reward_contrib += _rc
+                                            self.credit_money("registration reported (105 [128]): "
+                                                              f"contribution +{_rc}",
+                                                              contribution=_rc)
+                                        log(f"{self.peer}   registration reported: base squadron "
+                                            f"insignia id {_bi} (zone {_pc.get('mapkind')}) "
+                                            f"{'GRANTED' if _bnew else 'already owned'}, "
+                                            f"contribution +{_rc}")
                                 try:
                                     self.commit(f"script event {_ev}: flags "
                                                 + ", ".join(w for w in _what if w.startswith("flag")))
@@ -2770,7 +2804,8 @@ class Session(
                         # +0x418..+0x41A = the pilot's penalty bytes (pilot=),
                         # not the record's own: the arm stores them either way
                         outs.append(resultpush.result_push_packet(
-                            p["conn"], record=_rec, money=_reward_money, contribution=0,
+                            p["conn"], record=_rec, money=_reward_money,
+                            contribution=_reward_contrib,
                             owned=bytes(_owned), pilot=_pc or {}))
                         log(f"{self.peer}   -> 0x{resultpush.MSG_RESULT_PUSH:04X} ANSWER push "
                             f"({resultpush.S15A_BODY_LEN}B, queue seq 0x{pushes.QUEUE_SEQ:08X}) BEFORE "
@@ -2779,6 +2814,9 @@ class Session(
                             f"(+0xAD8 = 0), the owned table + flags refreshed, "
                             + (f"money delta +{_reward_money} H$ (mission reward). "
                                if _reward_money else "no money. ")
+                            + (f"contribution delta +{_reward_contrib} (the script's "
+                               f"'Contribution points earned.' line). "
+                               if _reward_contrib else "")
                             + "The ack below then copies it to "
                             f"the script, whose 0xE222 reads the answer.")
                         outs += _reward_pushes
@@ -2802,12 +2840,20 @@ class Session(
                     f"re-granting (one-shot), so this cannot loop.")
             return outs
 
+        if p["msg"] == community.MSG_ANON_SET:
+            # /anon on|off (0x0187, builder 3, no poll): community.on_anon_set
+            return community.on_anon_set(self, p)
+
         if p["msg"] in lobapi.CLIENT_NOTICES:
-            # 0x0131 / 0x0189: fire-and-forget notices on the queue sequence
-            # (see lobapi.CLIENT_NOTICES); nothing polls, nothing is owed.
+            # 0x0131 / 0x0189 / 0x017A / 0x0180 / 0x0193 / 0x01C8: fire-and-forget
+            # notices on the queue sequence (see lobapi.CLIENT_NOTICES); nothing
+            # polls, nothing is owed. The body is decoded as far as it was read.
             log(f"{self.peer}   0x{p['msg']:04X} = {lobapi.CLIENT_NOTICES[p['msg']]} "
-                f"({len(p['payload'])}B {p['payload'][:8].hex(' ')}): a client "
-                f"notice, no reply")
+                f"({len(p['payload'])}B: {lobapi.notice_detail(p['msg'], p['payload'])}): "
+                f"a client notice, no reply")
+            if p["msg"] == 0x0180:
+                from . import resupply      # the item-used mark (resupply.on_item_used)
+                resupply.on_item_used(self, p)
             return []
 
         if p["msg"] == charselect.MSG_KEEPALIVE:
@@ -2837,7 +2883,10 @@ class Session(
             # the Coliseum: a waiting window the leader opened, a withdrawn
             # entry, an arena that ended (coliseum.py; FMO_COLISEUM)
             outs += self.coliseum_pushes_due(p["conn"])
-            if timesync.TIME_SYNC:
+            # 0x0199 only while this pilot has a battle on (its arm acts in
+            # scene 4 only and drops it in the lobby, so a lobby one is noise)
+            _ts_bst = referee.BATTLE_STATE.get(self.battle_key())
+            if timesync.TIME_SYNC and _ts_bst is not None and not _ts_bst.get("ended"):
                 outs.append(timesync.time_sync_packet(p["conn"], when, when_us))
             if pushes.PUSH_PROBE and not getattr(self, "push_probe_done", False):
                 self.push_probe_done = True
@@ -2933,6 +2982,20 @@ class Session(
                         f"its body.")
                 except ValueError as e:
                     log(f"{self.peer}   WARNING: FMO_ANNOUNCE not sent: {e}")
+            # EVENT BATTLES (events.EVENT_BATTLES): name the running ones once
+            # per session, after the announce
+            if not getattr(self, "events_announced", False):
+                self.events_announced = True
+                _evs = events.running_events()
+                if _evs:
+                    _evt = "Event battle under way: " + ", ".join(_evs) + "."
+                    try:
+                        outs.append(lobbymessage.lobby_message_packet(
+                            p["conn"], _evt, kind=lobbymessage.ANNOUNCE_KIND))
+                        log(f"{self.peer}   -> 0x{lobbymessage.MSG_LOBBY_MESSAGE:04X} "
+                            f"EVENT ANNOUNCE: {_evt!r}")
+                    except ValueError as e:
+                        log(f"{self.peer}   WARNING: event announce not sent: {e}")
             # WARNING: THE SAME FOR THE ZONE TABLE (live 2026-09-12): with only the
             # grant-side copy, Change Area drew EVERY area grey -- because grey
             # is what the filler stores when 0x611A3AA0 cannot find the zone in
@@ -3423,6 +3486,13 @@ class Session(
             if not _gid or not _iid:
                 log(f"{self.peer}      WARNING: group or insignia is 0 -- storing "
                     f"nothing. Body was {p['payload'][:12].hex(' ')}")
+            elif events.is_medal(events.MEDAL_KIND, _iid):
+                # SE (topics/060428): the commemorative service medal "cannot
+                # be set as the squadron insignia". The picker never lists it
+                # (squadron.insignia_for), so only a forged request gets here.
+                log(f"{self.peer}      REFUSED: insignia {_iid} is the commemorative "
+                    f"service medal ({events.MEDAL_NAME}), which SE did not allow as a "
+                    f"squadron insignia -- storing nothing")
             elif fmostore is None:
                 log(f"{self.peer}      WARNING: the character store is unavailable, so "
                     f"this registration CANNOT be persisted; the client will "
@@ -3512,6 +3582,14 @@ class Session(
                                        f"already -- it is on their record")
                 else:
                     _code, _why = missionbook.mission_accept_verdict(_req, _char)
+                if _code is None and charstore.TRAINING_GATE and not self.pilot_trained():
+                    # UNREGISTERED (byte 128 != 99): the counter script refuses
+                    # first (SCP 0x8000 tag_mission 0x10bb8, message 55); this is
+                    # the server's copy. No accept code says "unregistered", so
+                    # 0 = 27:4 "The operation failed." (OURS)
+                    _code, _why = 0, ("pilot not registered (flag byte 128 != 99): "
+                                      "the First Sergeant's training comes first "
+                                      "(FMO_TRAINING_GATE)")
                 if (missionboard.MISSION_PLACE and _code is None and _req is not None
                         and not community.MSN_MARK):
                     # FMO_MISSION_PLACE (Playing Manual p.59/60): Area missions
@@ -3854,11 +3932,19 @@ class Session(
             return self.on_coliseum(p)
 
         if p["msg"] == cosmetics.MSG_COSMETIC_BUY and charselect.ANSWER_LOBAPI:
-            # THE PAINT SHOP's buy (cosmetics.on_buy): camo / colour / insignia
-            # get a verdict, a debit and a grant; other kinds fall through.
+            # THE SHOP's buy (cosmetics.on_buy): accessories, pilot suits,
+            # camo, colours and insignia get a verdict (SE's gates included),
+            # a debit and a grant; any other kind falls through.
             _cb = cosmetics.on_buy(self, p)
             if _cb is not None:
                 return _cb
+
+        if p["msg"] == 0x01A6 and charselect.ANSWER_LOBAPI:
+            # THE RESUPPLY ITEMS counter (resupply.on_request): 0x01A7 + message 1
+            from . import resupply
+            _rs = resupply.on_request(self, p)
+            if _rs is not None:
+                return _rs
 
         if p["msg"] in lobapi.LOBAPI:
             reply, need = lobapi.LOBAPI[p["msg"]]
@@ -3993,7 +4079,9 @@ class Session(
                         f"picker fall back to a default body.")
             _lp = lobapi.lobapi_payload(p["msg"], need, p["payload"],
                                         self.pol_groups if p["msg"] == 0x01AC else (),
-                                        _cnat)
+                                        _cnat,
+                                        char=(self.playing_char() if p["msg"] == 0x01A2
+                                              and charstore.CHAR_STORE else None))
             if (p["msg"] == areatargets.MSG_AREA_TARGETS_REQ
                     and p["msg"] not in lobapi.MARK_LOBAPI):
                 _lp = self.area_targets_reply(p["payload"], need, _cnat) or _lp
@@ -4015,7 +4103,7 @@ class Session(
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
     addressing, areachange, areatargets, battleend, battlegroups, battlemaps, charlist,
-    charselect, charstore, citytable, community, cosmetics, economy, gatetool, groupchannel,
+    charselect, charstore, citytable, community, cosmetics, economy, events, gatetool, groupchannel,
     grouplogin, handshake, hangar, identity, inventory, lobapi, loot, lobbymessage, missionblock, missionboard,
     missionbook, missionlist, move, packet, partsstock, penalty, permits, popnames, popnation, popself,
     progress, pushes, ranks, referee, resultpush, room, rooms, scriptcall, servicerecord, shop,

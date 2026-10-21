@@ -47,9 +47,9 @@ from .wirelog import log
 # a different id is a failure and its conn field (+0x08) becomes the code the
 # client prints as [FMxxxxx]. So a refusal is message 2 with our code there.
 #
-# WARNING: NOT LIVE-TESTED. Every layout below is read off the client; none of
-# it has reached a screen. FMO_COLISEUM=0 (the default) keeps the zero stubs.
-COLISEUM = (os.environ.get("FMO_COLISEUM", "").strip() or "0") != "0"
+# Every layout below is read off the client. FMO_COLISEUM=1 (the default)
+# serves the desks; 0 keeps the zero stubs.
+COLISEUM = (os.environ.get("FMO_COLISEUM", "").strip() or "1") != "0"
 
 MSG_LIST_REQ, MSG_LIST_REPLY = 0x01B2, 0x01B3
 MSG_REGISTER_REQ, MSG_REGISTER_REPLY = 0x01B5, 0x01B6
@@ -575,6 +575,9 @@ class Coliseum:
         self.returning = {}             # account -> (winning entry, deadline)
         self.spectators = {}            # account -> the match it watches
         self.spectate_end = {}          # account -> a watched match that ended
+        #: Clash of Iron (fmoarena.COI_*): season name -> {"nights": {date:
+        #: {account: {name, wins, reached}}}, "final": {account: wins}}
+        self.coi = {}
         self.next_match = 1
         self.present = False
         if load:
@@ -584,7 +587,8 @@ class Coliseum:
     def document(self):
         return {"hosted": {str(k): v for k, v in self.hosted.items()},
                 "next_id": self.next_id, "day": self.day,
-                "hosted_today": self.hosted_today, "records": self.records}
+                "hosted_today": self.hosted_today, "records": self.records,
+                "coi": self.coi}
 
     def adopt(self, d):
         d = d or {}
@@ -595,6 +599,7 @@ class Coliseum:
         self.hosted_today = int(d.get("hosted_today") or 0)
         self.records = {str(k): [list(r) for r in v]
                         for k, v in (d.get("records") or {}).items()}
+        self.coi = d.get("coi") if isinstance(d.get("coi"), dict) else {}
 
     def load(self):
         data = read_state()
@@ -639,8 +644,42 @@ class Coliseum:
 
     def arenas(self, now=None):
         now = time.time() if now is None else now
-        return ([scheduled(a, now) for a in OFFICIAL]
-                + [self.hosted[k] for k in sorted(self.hosted)])
+        out = [scheduled(a, now) for a in OFFICIAL]
+        fin = fmoarena.coi_final_window(now)
+        if fin is not None:
+            out.append(fmoarena.coi_final_arena(fin))
+        return out + [self.hosted[k] for k in sorted(self.hosted)]
+
+    # -- Clash of Iron ------------------------------------------------------ #
+    def coi_season(self, name):
+        return self.coi.setdefault(str(name), {"nights": {}, "final": {}})
+
+    def coi_qualified(self, season_name):
+        """[(account, name, night)] this season's finalists so far."""
+        return fmoarena.coi_qualifiers(self.coi.get(str(season_name)))
+
+    def coi_note_win(self, account, name, now):
+        """A 1 vs 1 win during a preliminary night: one more for `account` on
+        that night's standings, unless an earlier night already qualified it
+        (SE: its results are not recorded). Returns a log line or None."""
+        night = fmoarena.coi_night(now)
+        if night is None:
+            return None
+        season, date = night
+        doc = self.coi_season(season["name"])
+        earlier = [a for a, _n, d in fmoarena.coi_qualifiers(doc) if d < date]
+        if account in earlier:
+            return (f"Clash of Iron {season['name']} {date}: {name!r} already "
+                    f"qualified on an earlier night -- this win is not recorded")
+        row = doc["nights"].setdefault(date, {}).setdefault(
+            account, {"name": name, "wins": 0, "reached": 0})
+        row["wins"] = int(row.get("wins") or 0) + 1
+        row["reached"] = float(now)
+        row["name"] = name
+        self.save()
+        top = fmoarena.coi_standings(doc["nights"][date])[:3]
+        return (f"Clash of Iron {season['name']} preliminary {date}: {name!r} now "
+                f"{row['wins']} win(s); top " + ", ".join(f"{n} {w}" for _a, n, w, _t in top))
 
     def find(self, aid, now=None):
         for a in self.arenas(now):
@@ -735,6 +774,13 @@ class Coliseum:
             return CODE_GONE, "no arena with that id"
         if a.get("end") and now >= a["end"]:
             return CODE_ENDED, "its time is up"
+        if a.get("kind") == "coi":
+            # SE mailed the entry password to the qualifiers only
+            # (guide/clashofiron:17-19), so anyone else met 'wrong password'
+            finalists = {x[0] for x in self.coi_qualified(a.get("coi"))}
+            if account not in finalists:
+                return CODE_PASSWORD, (f"the Clash of Iron {a.get('coi')} final is for "
+                                       f"its qualifiers only ({len(finalists)} so far)")
         if self.view(a, now).get("closed"):
             return CODE_CLOSED, "its tournament has started"
         taken = [m for m in members if m in self.entry_of]
@@ -995,7 +1041,7 @@ class Coliseum:
     def finish(self, m, winner, why, now):
         """Settle match `m`: every member's verdict for its keepalive, the
         prize to the winning leader, the streak, the bracket."""
-        a = self.find(m["arena"])
+        a = self.find(m["arena"], now)
         m["verdict"] = (winner, why, now)
         aid = m["arena"]
         for sp in m.get("spectators", ()):
@@ -1008,6 +1054,17 @@ class Coliseum:
             nxt = bool(won and m["format"] != FORMAT_TOURNAMENT and a is not None
                        and not (a.get("end") and now >= a["end"]))
             prize = prize_per_win(a) if (won and a is not None) else 0
+            if won and a is not None and a.get("kind") == "coi":
+                # SE: H$400,000 per final win; a bye is no match, so no prize
+                prize = fmoarena.COI_PRIZE_PER_WIN
+                fin = self.coi_season(a.get("coi"))["final"]
+                fin[e["leader"]] = int(fin.get(e["leader"]) or 0) + 1
+                self.save()
+            elif (won and a is not None and a.get("kind") == "official"
+                  and int(a.get("headcount") or 1) == 1):
+                _cl = self.coi_note_win(e["leader"], e["name"], now)
+                if _cl:
+                    log(f"coliseum: {_cl}")
             for acct in e["members"]:
                 self.verdicts[acct] = {"match": m["id"], "arena": aid, "won": won,
                                        "why": why, "next": nxt, "team": t,
@@ -1158,6 +1215,14 @@ def match_of_chan(c):
     if _COLISEUM is None or not (_COLISEUM.match_of or _COLISEUM.spectators):
         return None
     return match_key(_chan_key(c))
+
+
+def account_in_match(account):
+    """True while `account` fights in an arena match that has no verdict yet
+    (the squad gate, battlepop.squad_blocked_for). False with no Coliseum."""
+    if not account or _COLISEUM is None or not _COLISEUM.match_of:
+        return False
+    return account in _COLISEUM.match_of
 
 
 def spectator_of_chan(c):

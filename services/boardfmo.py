@@ -302,6 +302,69 @@ def cached_snapshot(args=None, ttl=2.0):
     return snap
 
 
+# ---------------------------------------------------------------------------
+# the phase clock for the Viewer's news: OpenLobby's services/fmonews.py reads
+# CALENDAR_KEY from the live-state store and posts the phase's end, its result
+# and the next phase's start. Written from the same pure reads as the board.
+#   FMO_CALENDAR_PERIOD  seconds between writes; 0 = off (60)
+# ---------------------------------------------------------------------------
+CALENDAR_KEY = "fmo:calendar"
+CALENDAR_PERIOD = float(os.environ.get("FMO_CALENDAR_PERIOD", "60") or 0)
+#: Kept this long, so a board that stops leaves no stale clock for long.
+CALENDAR_TTL = 6 * 3600
+
+
+def _result(rec):
+    """A judged phase as the news needs it, or None."""
+    if not rec:
+        return None
+    return {"winner": int(rec.get("winner") or 0), "ocu": int(rec.get("ocu") or 0),
+            "usn": int(rec.get("usn") or 0), "judged_at": int(rec.get("judged_at") or 0),
+            "reward": {str(n): str(r.get("name") or "") for n, r in (rec.get("reward") or {}).items()},
+            "penalty": int((rec.get("penalty") or {}).get("nation") or 0)}
+
+
+def calendar(snap):
+    """The news's view of a snapshot. Pure."""
+    p = snap["phase"]
+    return {"at": int(snap["updated"]), "phase": int(p["n"]), "start": p["start"], "judge": p["judge"],
+            "next": p["next"], "ceasefire": bool(p["ceasefire"]), "judged": _result(p["judged"]),
+            "last": _result(p["last"]), "score": {"ocu": snap["score"]["ocu"], "usn": snap["score"]["usn"]},
+            "present": bool(snap["war"]["present"]), "frontline_reset": bool(fmowar.PHASE_RESET)}
+
+
+def publish_calendar(args=None, kv=None, now=None):
+    snap = snapshot(args, now)
+    if kv is None:
+        from polcore import kv as _kv
+        kv = _kv.default()
+    kv.set_json(CALENDAR_KEY, calendar(snap), ttl=CALENDAR_TTL)
+    return snap
+
+
+def start(args):
+    """polboards' hook: keep CALENDAR_KEY current while the board runs."""
+    if CALENDAR_PERIOD <= 0:
+        print("[boardfmo] phase clock for the news OFF (FMO_CALENDAR_PERIOD=0)", flush=True)
+        return
+
+    def run():
+        said = None
+        while True:
+            try:
+                publish_calendar(args)
+                said = None
+            except Exception as exc:                 # noqa: BLE001 -- never die
+                if repr(exc) != said:
+                    print("[boardfmo] phase clock for the news not written (%r)" % exc, flush=True)
+                    said = repr(exc)
+            time.sleep(CALENDAR_PERIOD)
+
+    threading.Thread(target=run, name="fmo-calendar", daemon=True).start()
+    print("[boardfmo] phase clock for the news -> kv %s every %ds" % (CALENDAR_KEY, CALENDAR_PERIOD),
+          flush=True)
+
+
 def art_files():
     """What the page may load: the backdrop and the web fonts. The .ttf
     copies (render.png's) and the licences are not served."""
@@ -459,7 +522,11 @@ def render_cached(args=None):
 
 
 def route(path, query, args):
-    """polboards' hook: /render.png, the Discord image."""
+    """polboards' hook: /render.png, the Discord image, and /report, the
+    Huffman Conflict Report (fmoreport.py)."""
+    if path in ("/report", "/report.html"):
+        import fmoreport
+        return 200, fmoreport.page(), "text/html; charset=utf-8", "no-cache"
     if path != "/render.png":
         return None
     png = render_cached(args)

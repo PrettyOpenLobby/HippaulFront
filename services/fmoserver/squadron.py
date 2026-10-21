@@ -460,7 +460,8 @@ INSIGNIA_LIST_LEN = INSIGNIA_BLOCK               # the payload IS the block
 INSIGNIA_COUNT_OFF = 0x40              # -> lobby+0x7E35 (0x7E35 - 0x7DF5), u32
 INSIGNIA_ROW_OFF = 0x44                # -> lobby+0x7E39, the rows
 INSIGNIA_ROW_LEN = 8                             # 0x611BE3EC `add ebp, 8`
-INSIGNIA_MAX = (INSIGNIA_BLOCK - INSIGNIA_ROW_OFF) // INSIGNIA_ROW_LEN
+#: the rows stop short of +0x710, the foreign parts list (partsstock)
+INSIGNIA_MAX = (0x710 - INSIGNIA_ROW_OFF) // INSIGNIA_ROW_LEN
 INSIGNIA_TSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "fmodata", "fmo-insignia.tsv")
 
@@ -503,6 +504,10 @@ def insignia_for(nation):
         rows = [(i, en) for i, _f, en in INSIGNIA if i in want]
     else:
         rows = [(i, en) for i, f, en in INSIGNIA if f == 255 or f == nation]
+    # SE (topics/060428): the commemorative service medal "cannot be set as
+    # the squadron insignia", so its two ids (events.MEDAL_IDS) never reach
+    # the picker, whatever the list knob says
+    rows = [(i, en) for i, en in rows if not events.is_medal(events.MEDAL_KIND, i)]
     return rows[:INSIGNIA_MAX]
 
 
@@ -522,17 +527,18 @@ def insignia_for(nation):
 #: served them as zeros, so every fee read 0, exactly as the manual's own
 #: screenshot does. Callers: the setup screen (0x6103F6B5, "%6d"), the sortie
 #: check (0x611B73E5, against lobby+0x88C) and 0x611B8287.
-#: WARNING: The fee is computed and shown by the client. No decoded request
-#: field carries it (0x0139 in sortie.py; its +0x10..+0x3F is 48 bytes from
-#: [[globals+0x198]+0x2C]+0x388, not decoded), recomputing it here would need
-#: the client's per-kind type tables and the item `base`, and this server
-#: never authors a modified part (its item records carry zeros there), so
-#: the debit SE made (0x01A1, 8:74 "Paid H$%d as the sortie cost for a
-#: modified unit") is not built.
+#: KEY: 2026-10-08: base is PROVEN to be the shop row's buy price (the same
+#: 0x611A4760 row the shop list and the remodel cost read), the type tables
+#: are transcribed (economy.FEE_TYPES), parts are now remodelled (0x017E,
+#: shop.on_remodel), and the server recomputes the client's sum and debits it
+#: at the battle end with SE's 0x01A1 8:74 line (settlement.battle_fee_settle).
 #: FMO_BATTLE_FEE_RATES: eight comma-separated integers, rate[0]..rate[7];
-#: empty (default) = all zero, the block byte for byte as before. SE's values
-#: were never found in any captured page, so there is no default to ship.
+#: empty = all zero (no fee). SE's values were never found in any captured
+#: page; the release default (defaults.py) is OURS.
 BATTLE_FEE_RATES_OFF = 0x18
+#: lobby+0x7E09 = block +0x14: the ORDERS FLOOR (ranks.RANK_ORDER_FLOOR), the
+#: first rank contribution cannot reach; 0x61175510 / 0x61192953 read it.
+ORDERS_FLOOR_OFF = 0x14
 BATTLE_FEE_RATES_N = 8
 BATTLE_FEE_DIVISOR = 100000           # 0x186A0 at 0x611E1F7D
 
@@ -569,11 +575,18 @@ def insignia_payload(nation, rates=None):
     b = bytearray(INSIGNIA_LIST_LEN)
     for i, r in enumerate(BATTLE_FEE_RATES if rates is None else rates):
         struct.pack_into("<I", b, BATTLE_FEE_RATES_OFF + 4 * i, int(r) & 0xFFFFFFFF)
+    b[ORDERS_FLOOR_OFF] = ranks.RANK_ORDER_FLOOR & 0xFF
     struct.pack_into("<I", b, INSIGNIA_COUNT_OFF, len(rows))
     for i, (rid, _en) in enumerate(rows):
         off = INSIGNIA_ROW_OFF + i * INSIGNIA_ROW_LEN
         b[off] = nation & 0xFF
         struct.pack_into("<H", b, off + 2, rid & 0xFFFF)
+    # +0x710 = lobby+0x8505: the other nation's parts this pilot may buy (the
+    # victory reward), read by the shop's row filter (partsstock)
+    try:
+        partsstock.put_foreign_sale_list(b, partsstock.foreign_sale_list(nation))
+    except Exception as e:           # the insignia list must never fail on it
+        log(f"WARNING: 0x019F foreign sale list not built ({e!r})")
     return bytes(b)
 
 
@@ -585,6 +598,8 @@ def insignia_push(conn_id, nation):
     in-scene for, and it must REPEAT per scene -- 0x6117A2E4 zeroes the block
     on every lobby reset."""
     rows = insignia_for(nation)
+    # an EMPTY list crashed the client (2026-09-09): the orders floor rides
+    # only on a push that has rows, never on its own
     if not rows and not any(BATTLE_FEE_RATES):
         return None
     return packet.build(MSG_INSIGNIA_LIST, insignia_payload(nation), pushes.QUEUE_SEQ, conn_id)
@@ -612,11 +627,12 @@ MSG_SQUADRON_INSIGNIA = 0x01C5
 S1C5_LEN = 0x10
 S1C5_INSIGNIA = 0x08
 S1C5_MONEY = 0x0C
-#: FMO_INSIGNIA_PUSH: '0' (default) = a 0x01C4 registration is acked with
-#: message 1 and stored, as before. '1' = the ack is followed by a 0x01C5
+#: FMO_INSIGNIA_PUSH: '1' (default since 2026-10-08: the client has the arm,
+#: 0x6117F4A4, so SE's server sent it) = the 0x01C4 ack is followed by a 0x01C5
 #: carrying the stored insignia and the pilot's stored money -- skipped, with
 #: a log line, when the money is unknown (a store of 0 would empty the wallet).
-INSIGNIA_PUSH = (os.environ.get("FMO_INSIGNIA_PUSH", "").strip() or "0") != "0"
+#: '0' = acked with message 1 and stored only; row 7 greys at the next poll.
+INSIGNIA_PUSH = (os.environ.get("FMO_INSIGNIA_PUSH", "").strip() or "1") != "0"
 
 
 def _group_id_pair(group_id):
@@ -643,4 +659,6 @@ def squadron_insignia_push_body(group_id, insignia, money):
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import charstore, packet, pushes, zoneentry  # noqa: E402
+from . import charstore, events, packet, pushes, ranks, zoneentry  # noqa: E402
+from . import partsstock  # noqa: E402  (the 0x019F +0x710 foreign sale list)
+from .wirelog import log  # noqa: E402

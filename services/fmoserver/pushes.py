@@ -82,7 +82,20 @@ CLIENT_REQUESTS = {
     0x01AA: 56, 0x01AB: 20, 0x01AC: 80, 0x01AE: 24, 0x01B0: 24, 0x01B2: 20,
     0x01B5: 36, 0x01B7: 32, 0x01BB: 32, 0x01BD: 160, 0x01C0: 36, 0x01C2: 36,
     0x01C4: 48, 0x01C6: 36, 0x01F4: 0, 0x01F6: 0x88, 0x0321: 80,
+    # THE THIRD BUILDER, 0x6119A080 (queue sequence 0x7FFFFFFE, no poll):
+    # 18 call sites, 15 ids (BUILDER3_IDS). Listed so the sweep covers all
+    # three builders; before this a new
+    # builder-3 message could not fail the selftest. 0x0131 / 0x0189 are the
+    # client notices (lobapi.CLIENT_NOTICES), 0x0198 the keepalive, 0x01A5 the
+    # client log upload (its length is computed), 0x0187 /anon.
+    0x0131: 0, 0x0189: 1, 0x0198: 8, 0x01A5: None,
+    0x017A: 20, 0x0180: 40, 0x0187: 4, 0x0193: 12, 0x01C8: 20,
 }
+#: Every id the third builder sends (0x6119A080 call sites), so the selftest
+#: can pin that each is in CLIENT_REQUESTS and named in msgnames.
+BUILDER3_IDS = frozenset({0x0131, 0x0146, 0x0167, 0x0173, 0x017A, 0x017C, 0x0180,
+                          0x0181, 0x0187, 0x0189, 0x0193, 0x0198, 0x01A5, 0x01AC,
+                          0x01C8})
 #: The requests that fall to "no handler" ON PURPOSE. 0x000A and 0x0140 are
 #: fire-and-forget senders (0x61173E50 / 0x61173D70 send and `ret`, no poll);
 #: 0x0142/0x0143/0x0145 were here until 2026-09-26: they are the trade

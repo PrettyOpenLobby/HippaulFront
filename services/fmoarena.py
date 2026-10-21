@@ -99,11 +99,195 @@ def next_change(now):
 
 def scheduled(a, now):
     """Arena `a` as it stands at `now`: a copy with the schedule applied when
-    it follows it, else `a` itself."""
+    it follows it, else `a` itself. During a Clash of Iron preliminary night
+    the official 1 vs 1 arena runs the season's regulation instead."""
     if not a.get("schedule"):
         return a
     v = dict(a)
     v.update(official_rules(now, a.get("headcount") or 1))
+    night = coi_night(now)
+    if night is not None and int(a.get("headcount") or 1) == 1:
+        v.update(regulation_rules(night[0].get("regulation")))
+        v["coi"] = night[0]["name"]
+        v["name"] = ("Clash of Iron " + night[0]["name"])[:31]
+    return v
+
+
+# --------------------------------------------------------------------------- #
+# CLASH OF IRON (SE's official 1 vs 1 tournament, 2006-09 .. 2008-05)
+# --------------------------------------------------------------------------- #
+#: SE (guide/clashofiron.html.txt, topics20060709:27-69, polnews news8685):
+#: seasons of preliminary nights then an 8-pilot final. A preliminary is a
+#: night in the 1 vs 1 arena under the season's regulation; entry is just
+#: fighting there (no sign-up, no fee), wins need not be consecutive, and
+#: the night's most wins qualifies, a tie going to whoever reached that count
+#: first (news8685); an already-qualified pilot may fight but is not counted.
+#: Season 01 ran Thu/Fri/Sat 21:00-23:00 JST (the guide's "Fri/Sat 21-24" is
+#: not what ran). The final is single elimination in the arena's tournament
+#: format, qualifiers only (SE mailed them the password), a no-show forfeits
+#: and a bye is not a win; the prize is H$400,000 per final win (champion
+#: 1,200,000), plus equipment SE's staff handed over in game.
+#: Ours: the calendar (FMO_COI_SEASONS below; SE's dates are 2006's), the
+#: reserves (the night's runner-up is not called up), and the equipment
+#: prizes (not given: Solidwall / Hi Skua are not in our part tables by id).
+#: FMO_COI_SEASONS: '|'-separated seasons, each
+#:   name;prelims=YYYY-MM-DD,...;final=YYYY-MM-DD;reg=<regulation>
+#: '0' = no Clash of Iron. Nights and the final start 21:00 JST.
+COI_HOUR_JST = 21
+COI_NIGHT_HOURS = 2
+COI_FINAL_HOURS = 3
+COI_PRIZE_PER_WIN = 400000
+COI_FINAL_SIZE = 8
+COI_FINAL_ID = 9001                      # the final's arena id (ours)
+COI_TILE = 30001                         # the official 1 vs 1's map (ours)
+#: SE's six regulations (guide/clashofiron.html.txt:21-32). S01's table
+#: (topics20060709:36-69): 1 pilot, B.G.Cost 4, Search & Destroy, MG and SG
+#: required, every other weapon banned, turbo required.
+_W, _B = WEAPON_SLOTS, BP_SLOTS
+REGULATIONS = {
+    "twoguns": {"title": "Two-Guns Shootout", "main_rule": MAIN_SEARCH_DESTROY,
+                "sub_rule": SUB_NONE, "require": ("mg", "sg", "turbo"),
+                "only_weapons": ("mg", "sg")},
+    "bazooka": {"title": "Bazooka Brawl", "main_rule": MAIN_SCORE, "sub_rule": SUB_NONE,
+                "require": ("bz",), "only_weapons": ("bz",)},
+    "jagerhatz": {"title": "Jagerhatz", "main_rule": MAIN_SEARCH_DESTROY,
+                  "sub_rule": SUB_SUDDEN, "require": ("arf", "shield"),
+                  "only_weapons": ("arf", "shield")},
+    "lark": {"title": "Lark Style Melee", "main_rule": MAIN_SEARCH_DESTROY,
+             "sub_rule": SUB_NONE, "require": (), "only_weapons": ("kn", "rd", "pb"),
+             "only_bps": ("jet", "turbo")},
+    "fistfight": {"title": "Iron Fistfight", "main_rule": MAIN_SEARCH_DESTROY,
+                  "sub_rule": SUB_SUDDEN2, "require": ("kn", "jet"),
+                  "only_weapons": ("kn",)},
+    "gladiator": {"title": "Gladiator Battle", "main_rule": MAIN_SEARCH_DESTROY,
+                  "sub_rule": SUB_SUDDEN, "require": ("shield",), "only_weapons": None},
+}
+#: The default calendar: SE's six regulations in SE's season order (S01
+#: Two-Guns, S02 Lark Style Melee, then the rest), one season every two
+#: months from 2026-11; the dates are OURS (Thu/Fri/Sat nights of two weeks,
+#: the final the next Saturday).
+COI_DEFAULT = ("S01;prelims=2026-11-12,2026-11-13,2026-11-14,2026-11-19,2026-11-20,"
+               "2026-11-21;final=2026-11-28;reg=twoguns|"
+               "S02;prelims=2027-01-14,2027-01-15,2027-01-16,2027-01-21,2027-01-22,"
+               "2027-01-23;final=2027-01-30;reg=lark")
+
+
+def regulation_rules(key):
+    """The arena fields of regulation `key` (REGULATIONS), B.G.Cost 4."""
+    r = REGULATIONS.get(key) or REGULATIONS["twoguns"]
+    rule = {s: RULE_ALLOWED for s in _W + _B}
+    if r.get("only_weapons"):
+        rule.update({s: RULE_BANNED for s in _W if s not in r["only_weapons"]})
+    if r.get("only_bps"):
+        rule.update({s: RULE_BANNED for s in _B if s not in r["only_bps"]})
+    rule.update({s: RULE_REQUIRED for s in r.get("require") or ()})
+    return {"bg_cost": 4, "total_cost": 4, "main_rule": r["main_rule"],
+            "sub_rule": r["sub_rule"], "arms": 1, "mods": 0,
+            "weapons": [rule[s] for s in _W], "bps": [rule[s] for s in _B]}
+
+
+def _jst(date_s, hour):
+    import calendar
+    y, m, d = (int(x) for x in date_s.split("-"))
+    return calendar.timegm((y, m, d, hour, 0, 0)) - SCHEDULE_UTC_OFFSET
+
+
+def parse_coi(spec):
+    """FMO_COI_SEASONS -> [season dict]. Raises ValueError on a bad entry."""
+    spec = (spec or "").strip()
+    if spec == "0":
+        return []
+    out = []
+    for part in (x.strip() for x in (spec or COI_DEFAULT).split("|")):
+        if not part:
+            continue
+        f = part.split(";")
+        s = {"name": f[0].strip(), "prelims": [], "final": None, "regulation": "twoguns"}
+        for kv in f[1:]:
+            k, _, v = kv.partition("=")
+            k, v = k.strip(), v.strip()
+            if k == "prelims":
+                s["prelims"] = [d.strip() for d in v.split(",") if d.strip()]
+            elif k == "final":
+                s["final"] = v
+            elif k == "reg":
+                if v not in REGULATIONS:
+                    raise ValueError(f"FMO_COI_SEASONS {part!r}: regulation {v!r} is not "
+                                     f"one of {sorted(REGULATIONS)}")
+                s["regulation"] = v
+            else:
+                raise ValueError(f"FMO_COI_SEASONS {part!r}: unknown field {k!r}")
+        try:
+            s["nights"] = [(d, _jst(d, COI_HOUR_JST),
+                            _jst(d, COI_HOUR_JST) + COI_NIGHT_HOURS * 3600)
+                           for d in s["prelims"]]
+            s["final_at"] = _jst(s["final"], COI_HOUR_JST) if s["final"] else None
+        except ValueError:
+            raise ValueError(f"FMO_COI_SEASONS {part!r}: dates are YYYY-MM-DD")
+        out.append(s)
+    return out
+
+
+try:
+    COI_SEASONS = parse_coi(os.environ.get("FMO_COI_SEASONS", ""))
+    COI_ERR = ""
+except ValueError as _e:
+    COI_SEASONS, COI_ERR = [], str(_e)
+
+
+def coi_night(now, seasons=None):
+    """(season, night date) when a preliminary night is on at `now`, else None."""
+    for s in (COI_SEASONS if seasons is None else seasons):
+        for d, lo, hi in s.get("nights") or ():
+            if lo <= float(now) < hi:
+                return s, d
+    return None
+
+
+def coi_final_window(now, seasons=None):
+    """The season whose final is listed at `now` (from its last night's end
+    until the final's end), else None."""
+    for s in (COI_SEASONS if seasons is None else seasons):
+        if not s.get("final_at"):
+            continue
+        last = max((hi for _d, _lo, hi in s.get("nights") or ()), default=s["final_at"])
+        if last <= float(now) < s["final_at"] + COI_FINAL_HOURS * 3600:
+            return s
+    return None
+
+
+def coi_standings(night_rows):
+    """[(account, name, wins, reached)] best first: most wins, then whoever
+    reached that count first (news8685). `night_rows` = {account: {name,
+    wins, reached}}. Pure."""
+    rows = [(a, r.get("name", ""), int(r.get("wins") or 0), float(r.get("reached") or 0))
+            for a, r in (night_rows or {}).items()]
+    rows.sort(key=lambda r: (-r[2], r[3]))
+    return rows
+
+
+def coi_qualifiers(season_doc):
+    """[(account, name, night)] the pilots a season's nights have qualified,
+    one per night, in night order. `season_doc` = {"nights": {date: rows}}."""
+    out, seen = [], set()
+    for d in sorted((season_doc or {}).get("nights") or {}):
+        for a, name, wins, _t in coi_standings(season_doc["nights"][d]):
+            if wins > 0 and a not in seen:
+                out.append((a, name, d))
+                seen.add(a)
+                break
+    return out[:COI_FINAL_SIZE]
+
+
+def coi_final_arena(season):
+    """The season's final as an arena row: a 1-pilot tournament of 8."""
+    v = {"id": COI_FINAL_ID, "kind": "coi", "format": FORMAT_TOURNAMENT,
+         "name": ("Clash of Iron %s Final" % season["name"])[:31],
+         "promoter": "Coliseum", "headcount": 1, "req_bgs": COI_FINAL_SIZE,
+         "tile": COI_TILE, "fee": 0, "dup_bp": 1, "coi": season["name"],
+         "start": int(season["final_at"]),
+         "end": int(season["final_at"]) + COI_FINAL_HOURS * 3600}
+    v.update(regulation_rules(season.get("regulation")))
     return v
 
 

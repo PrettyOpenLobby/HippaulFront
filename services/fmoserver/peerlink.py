@@ -3,6 +3,7 @@ import socket
 import struct
 import time
 from .deps import fmoworld
+from .knobs import _env_int
 from .wirelog import log
 
 
@@ -38,6 +39,65 @@ def peer_stream_for(chan, got):
 PEER_HELLO = (3, 16)        # the peer's hello / retry -> answer cmd 4
 PEER_ACKED = 4              # the peer answering OUR hello
 PEER_PING, PEER_PONG = 300, 301
+#: KEY: UNIT IDS INSIDE A RELAYED BODY (static 2026-10-08), by cmd: the body
+#: offsets of u32 unit ids the relay renames for the receiving client.
+#:   50  the support / Emergency Escape handshake (sender 0x610504D0, receive
+#:       arm 0x611EDD70): {u32 requester, u32 responder, u16 mode, u16 phase}.
+#:       The arm looks BOTH ids up in its own unit table and on a miss returns
+#:       without the phase-1 / phase-2 answer, so the requester's 5 s deadline
+#:       (0x61050640) cancels the escape with 32:0 whenever another pilot is in
+#:       the battle. Verbatim bodies did exactly that.
+#:   129 the support record broadcast at execute (0x610605ED): +4 requester,
+#:       +8 target.
+BODY_UNIT_IDS = {50: (0, 4), 129: (4, 8)}
+#: KEY: /sos (alias /mayday) IS PEER CMD 48 (static; it was once taken for the
+#: cmd-128 field sync). The command 0x611DEAD0 (battle map
+#: only) calls 0x611FA7C0(self, on), which sends cmd 48 to every peer with the
+#: sender's own unit in the header and a 16-B body whose +8 u32 is 1 (on) / 0
+#: (off). The SENDER NEVER SETS ITS OWN FLAG: only the receive arm (BM_RECV
+#: 48, 0x611EE370 -> 0x611F7770) sets the unit's SOS bit and its cooldown
+#: (3600, 900 when turned off), and shows the HUD notice only for a same-side
+#: unit that is not the viewer's own. So SE's battle manager handed the
+#: record back to the sender too, or "/sos off" could never pass its own gate
+#: (bit 2 of unit+0xB1B) and "/sos on" would never be rate-limited. We echo
+#: it on the sender's self stream under its own unit id, once per send (the
+#: client sends one per peer). INFERRED from the arms; FMO_SOS_ECHO=0 stops it.
+SOS_CMD = 48
+SOS_ECHO = _env_int("FMO_SOS_ECHO", "1") != 0
+def rename_body_units(cmd, body, sender, viewer):
+    """`body` of a cmd in BODY_UNIT_IDS with each unit id renamed to the id
+    `viewer`'s client knows that unit by (squad.id_for_viewer); any other
+    cmd's body unchanged."""
+    b = bytearray(body)
+    for at in BODY_UNIT_IDS.get(cmd, ()):
+        if at + 4 <= len(b):
+            u = struct.unpack_from("<I", b, at)[0]
+            struct.pack_into("<I", b, at, squad.id_for_viewer(u, sender, viewer) & 0xFFFFFFFF)
+    return bytes(b)
+
+
+#: one echo per /sos: the copies to each peer arrive within this many seconds
+SOS_ECHO_DEDUP_S = 1.0
+
+
+def sos_echo(chan, body, got, off, addr):
+    """Hand one /sos record back to its sender (see SOS_CMD). Never raises."""
+    try:
+        now = time.time()
+        key = bytes(body[8:12]) if len(body) >= 12 else b""
+        last = getattr(chan, "sos_echoed", None)
+        if last and last[0] == key and now - last[1] < SOS_ECHO_DEDUP_S:
+            return
+        chan.sos_echoed = (key, now)
+        flt = struct.unpack_from("<I", got["plain"], off + 12)[0]
+        chan.pending.append(fmoworld.record(SOS_CMD, bytes(body), arg8=chan.self_unit(),
+                                            flt=flt & 0xFFFF0000))
+        on = struct.unpack_from("<I", body, 8)[0] if len(body) >= 12 else None
+        log(f"[udp {addr[0]}:{addr[1]}]   /sos {'ON' if on else 'OFF' if on == 0 else '?'}: "
+            f"cmd {SOS_CMD} echoed on the sender's self stream as unit "
+            f"{chan.self_unit():#x} (only the receive arm 0x611EE370 sets the SOS bit)")
+    except Exception as e:
+        log(f"[udp {addr[0]}:{addr[1]}]   WARNING: /sos echo failed ({e!r})")
 
 
 def peer_link_serve(chan, rs, got, addr):
@@ -77,6 +137,8 @@ def peer_link_serve(chan, rs, got, addr):
             # a linked pilot's own movement rides this stream, not the self one
             referee.track_battle_motion(
                 chan, cmd, body, struct.unpack_from("<I", got["plain"], off + 8)[0])
+        if cmd == SOS_CMD and SOS_ECHO:
+            sos_echo(chan, body, got, off, addr)
         if other is None or not other.tables:
             continue
         if coliseum.spectator_of_chan(chan) is not None:
@@ -145,6 +207,11 @@ def peer_link_serve(chan, rs, got, addr):
                 continue
             nb = bytearray(_own)
             struct.pack_into("<I", nb, 2, b_alias)
+        elif cmd in BODY_UNIT_IDS:
+            # unit ids INSIDE the body (Emergency Escape's support handshake
+            # and record): the receiver looks both up in its own unit table
+            # and drops the record on a miss
+            nb = bytearray(rename_body_units(cmd, bytes(nb), chan, other))
         try:
             rec = fmoworld.record(cmd, bytes(nb), arg8=new_src,
                                   flt=flt & 0xFFFF0000)

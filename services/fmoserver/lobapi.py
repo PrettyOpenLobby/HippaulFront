@@ -43,7 +43,7 @@ def mark_body(need, base):
     return bytes(b[:need])
 
 
-def lobapi_payload(msg, need, req=b"", groups=(), nation=1):
+def lobapi_payload(msg, need, req=b"", groups=(), nation=1, char=None):
     """The reply body for a lobby-API message: markers if this message is armed,
     the built 0x01AD / 0x01A3 block, or zeros.
 
@@ -60,7 +60,7 @@ def lobapi_payload(msg, need, req=b"", groups=(), nation=1):
         if len(body) == need:
             return body
     if msg == 0x01A2:
-        body = cosmetics.reply_01a3(need, req, nation)
+        body = cosmetics.reply_01a3(need, req, nation, char=char)
         if body is not None and len(body) == need:
             return body
     if msg == missionlist.MSG_MISSION_LIST_REQ and missionlist.SERVE_MISSION_LIST:
@@ -209,7 +209,41 @@ def parse_lobapi_mark(spec):
 CLIENT_NOTICES = {
     0x0131: "a client notice after a scene exit (0x6117A56B)",
     0x0189: "a client status notice (0x61174740, one status byte)",
+    # The third packet builder's (0x6119A080, queue seq 0x7FFFFFFE) four
+    # unanswered ids, read at their senders 2026-10-08. None polls a reply.
+    0x017A: "own-unit status notice (0x61174430, scene 4 only: +0x00 u32 = the "
+            "value a kind-4 cmd-128 field sync of the own unit just carried, "
+            "0x6105A6C0 / 0x61053010)",
+    0x0180: "owned-item notice (0x61177D10: +0x10.. the 24-B owned-item record, "
+            "then 0x61177BE0(dword0, dword1, 1) = find the item by serial; "
+            "reached only through a vtable)",
+    0x0193: "own-unit removed notice (0x611744D0, scene 4 only, empty body: sent "
+            "from the unit removal path 0x6105A590 when the removed unit is the "
+            "pilot's own [0x613B6B24] and the camera target 0x613B6A7C was "
+            "re-picked through 0x61054670)",
+    0x01C8: "login notice (0x6117B3E0, right after the 0x014A block is read: +0x00 "
+            "u8 = the byte at 0x613955E4, written by the Viewer side (POL1), sent "
+            "only when [[0x613CAC98]+8]+4 == 1)",
 }
+
+
+def notice_detail(msg, payload):
+    """What a client notice's body says, decoded as far as its sender was
+    read (CLIENT_NOTICES). Pure."""
+    b = bytes(payload or b"")
+    if msg == 0x017A and len(b) >= 4:
+        return f"value {struct.unpack_from('<I', b, 0)[0]:#x}"
+    if msg == 0x0180 and len(b) >= 0x28:
+        d0, d1 = struct.unpack_from("<II", b, 0x10)
+        return (f"item record {b[0x10:0x28].hex(' ')} (dword0 {d0:#x}, dword1 "
+                f"{d1:#x} = the serial 0x61177BE0 looks up)")
+    if msg == 0x0193:
+        return "empty body" if not any(b) else f"body {b[:12].hex(' ')}"
+    if msg == 0x01C8 and len(b) >= 1:
+        return f"byte {b[0]} (0x613955E4)"
+    if msg == 0x0189 and len(b) >= 1:
+        return f"status byte {b[0]}"
+    return f"body {b[:8].hex(' ')}" if b else "empty body"
 
 
 try:

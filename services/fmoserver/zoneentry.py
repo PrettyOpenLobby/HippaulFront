@@ -323,8 +323,8 @@ FIELD_18 = _env_int("FMO_0153_F18", "1")
 #: keys D87 attaches to map objects) land at the room origin. So a pilot gets
 #: kind 1 on their FIRST world entry only: no zone stored yet (`mapkind`, which
 #: remember_zone writes on every entry) and never shown it (`opening_seen`).
-#: Not flag byte 128: FMO_STATUS_FLAGS seeds every new pilot as registered
-#: (128=99), so that byte cannot tell a new pilot apart. Every other entry keeps
+#: Not flag byte 128: the test shortcut FMO_STATUS_FLAGS=...,128=99 seeds a new
+#: pilot as registered, so that byte cannot tell a new pilot apart. Every other entry keeps
 #: FIELD_18. FMO_OPENING: first (default) | off.
 OPENING = (os.environ.get("FMO_OPENING", "").strip() or "first").lower()
 
@@ -664,6 +664,85 @@ def reply_0153(fill=None, mapkind=None, mapno=None, pilotpos=None, csn=None,
     # The 88 bytes at +0x124 stay zero -- the structure is unidentified and it is
     # the same one a 0x0155 entry carries, so a guess here would be a guess twice.
     return bytes(b)
+
+
+# --------------------------------------------------------------------------- #
+# THE ZONE VISITED BITS 8..13 (2026-10-08, static)
+# --------------------------------------------------------------------------- #
+#: KEY: WHAT A VISITED BIT DOES. The LEV walk 0x610ED040 (the kind-2 arm of the
+#: scene selector 0x610F6ED0, called from the lobby scene machine at
+#: 0x61006413) picks the first LEV row (AI/F08/D15) whose MapKind band holds
+#: the zone and returns 0 when that row's +0x10 flag bit is SET
+#: (0x610ED0E9..0x610ED119): no entry script, the client lands in the settled
+#: lobby (scene 6). Bits: 100..109 -> 8, 200..209 -> 9, 300..309 -> 10,
+#: 400..409 -> 11, 500..519 -> 12, 600..607 -> 13 (fmo-gates.json lev).
+#: A room entry (0x0153 +0x18 == 1, outside 600..607) makes 0x61005100 run the
+#: nation's script 98/99 instead, whose LEV row (kinds 0..99, SCP 0x800d) has
+#: no bit.
+#:
+#: KEY: WHO SETS IT. No script writes bits 8..13 (fmo-gates.json: no
+#: flag_writes for 0x8070 / 0x8048 / 0x802a / 0x800d, no 200/205 with them).
+#: Every LEV entry script (0x8070 LobbyEntry_t / _s, 0x8048 LobbyEntry_geki,
+#: 0x802a LobbyEntry_tougi, 0x800d LobbyEntry) makes exactly one server call,
+#: srv_101 (D87 helper 0x52a: event 101, no params, returns answered p1 != 0).
+#: LobbyEntry_t (function 0x42b0..0x8260) makes it at the END of Son's welcome
+#: (0x81ca), right before the closing map-attach phases (0xE200 at 0x822a /
+#: 0x825c) that drop the client into the settled lobby, and no 0xE066 follows
+#: it; LobbyEntry_s makes it before its 0xE200 (0xc142 / 0xc156). Both 0x8070
+#: call sites throw the answer away (0x81ca: R0 overwritten by the 0xE223
+#: poll at 0x81d4; 0xc142: R0 loaded with 1 at 0xc148). So 101 is the script
+#: telling the server "this zone's entry scene has played", and the only
+#: client-visible state that can follow from it is the visited bit.
+#: INFERRED (retail's server code is not in the client): SE's server set the
+#: zone's bit on 101, pushed back with the answered record (0x015A), which is
+#: what scriptcall's `@visited` does (fmo-events.tsv row 101). The scene, and
+#: its map attach, still play in full on that first entry; every later entry
+#: lands in the settled lobby, the state the old FMO_STATUS_FLAGS seed forced
+#: from birth (tutorial skip live 2026-09-05).
+#: FMO_VISITED_ON_ENTRY=0: 101 stays a plain ack and nothing writes the bits.
+VISITED_ON_ENTRY = _env_int("FMO_VISITED_ON_ENTRY", "1") != 0
+LEV_VISITED_BANDS = ((100, 109, 8), (200, 209, 9), (300, 309, 10),
+                     (400, 409, 11), (500, 519, 12), (600, 607, 13))
+#: the +0x18 value that swaps in the nation's room script (0x61005100)
+ROOM_SCRIPT_KIND = 1
+ARENA_KINDS = (0x258, 0x25F)
+
+
+def lev_visited_bit(mapkind, field18=None):
+    """The LEV visited bit the client tests for a 0x0153 with this MapKind and
+    +0x18, or None when that entry runs a script with no bit (a room entry's
+    script 98/99) or the zone is in no LEV band. Pure."""
+    try:
+        mk = int(mapkind)
+    except (TypeError, ValueError):
+        return None
+    f18 = FIELD_18 if field18 is None else int(field18)
+    if f18 == ROOM_SCRIPT_KIND and not ARENA_KINDS[0] <= mk <= ARENA_KINDS[1]:
+        return None
+    for lo, hi, bit in LEV_VISITED_BANDS:
+        if lo <= mk <= hi:
+            return bit
+    return None
+
+
+def entry_script_runs(flags, mapkind, field18=None):
+    """The client's LEV decision (0x610ED040) for one 0x0153: True when the
+    zone's entry script runs (its bit is clear, or it has none). Pure."""
+    bit = lev_visited_bit(mapkind, field18)
+    if bit is None:
+        return True
+    fl = bytes(flags or b"")
+    return not (len(fl) > bit >> 3 and fl[bit >> 3] & (1 << (bit & 7)))
+
+
+def note_grant(sess, mapkind, field18=None):
+    """Remember on `sess` the MapKind and +0x18 of the 0x0153 it was just
+    sent: the zone whose entry script a following 101 comes from. Never
+    raises."""
+    try:
+        sess.entry_grant = (int(mapkind), FIELD_18 if field18 is None else int(field18))
+    except (TypeError, ValueError, AttributeError):
+        pass
 
 
 # Called at run time only; imported last so that import cycles resolve.

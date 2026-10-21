@@ -225,10 +225,12 @@ def ceasefire_owed(char, phases):
 #: prescribed count or more", and with none is DEMOTED to First Lieutenant
 #: with the contribution bar at about 90%; Major and above the same on AREA
 #: missions. Every rank has a headcount limit and a promotion needs a free
-#: slot. FMO_REVIEW: 0 (default) off; 'promote' = keep/promote only (no
-#: demotion); 'full' = SE's rule with demotion. WARNING: 'full' DEMOTES seeded
-#: pilots who never ran a mission -- arm it deliberately.
-REVIEW = (os.environ.get("FMO_REVIEW", "").strip() or "0").lower()
+#: slot. FMO_REVIEW: 'full' (default since 2026-10-08) = SE's rule with
+#: demotion; 'promote' = keep/promote only (no demotion); 0 = off. A pilot's
+#: first visit in the band only OPENS a period (personnel_visit), so nobody is
+#: demoted before a whole FMO_REVIEW_DAYS period with no mission success, and
+#: the outlook line warns mid-period (S:36 "demotion soon").
+REVIEW = (os.environ.get("FMO_REVIEW", "").strip() or "full").lower()
 REVIEW_DAYS = _env_int("FMO_REVIEW_DAYS", "7")           #: OURS: SE says only "a set period"
 REVIEW_PROMOTE = _env_int("FMO_REVIEW_PROMOTE", "3")     #: OURS: SE's count is not published
 #: OURS: "rank:cap,..." pilots allowed per rank and nation. SE: 「各階級にはそれぞれ
@@ -309,8 +311,8 @@ def review_demoted_contribution(new_rank, ladder=None):
 # THE PERSONNEL OFFICER'S ORDERS (2026-10-07). Promotion / demotion ORDERS
 # (辞令) and the promotion OUTLOOK line, SE's flow on the client's own gate.
 # --------------------------------------------------------------------------- #
-#: KEY: HOW AN ORDER MOVES (static, fmodis 2026-10-07; nothing here is
-#: seen live yet). The client holds two rank bytes: A = the rank (lobby+0x8BB,
+#: KEY: HOW AN ORDER MOVES (static; nothing here has
+#: been seen on a client). The client holds two rank bytes: A = the rank (lobby+0x8BB,
 #: 0x014A +0x2F and 0x0176 +0x0D) and C = the ORDERED rank (lobby+0xE1A,
 #: 0x014A +0x58E only: no other writer in the image). 0x61175510 calls an
 #: order pending when they differ (see ranks.orders_pending for the floor

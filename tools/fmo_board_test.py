@@ -191,6 +191,31 @@ def _main(db):
     check("the stored war and every file in the data dir are identical after the snapshots",
           tree_hash(data) == before and fmowar.read_state() == war_before)
 
+    print("the phase clock for the Viewer's news (fmo:calendar)")
+
+    class _KV:
+        def __init__(self):
+            self.v = {}
+
+        def set_json(self, key, value, ttl=None):
+            self.v[key] = (json.loads(json.dumps(value)), ttl)
+
+    kv = _KV()
+    boardfmo.publish_calendar(kv=kv, now=late)
+    cal, ttl = kv.v.get(boardfmo.CALENDAR_KEY, (None, None))
+    check("it writes the phase, its judgement, the next start and the score",
+          cal and cal["phase"] == 1 and cal["judge"] == fmowar._ts(2026, 11, 1, 12)
+          and cal["next"] == fmowar._ts(2026, 11, 5) and cal["ceasefire"] and cal["judged"] is None
+          and cal["score"] == {"ocu": s_late["score"]["ocu"], "usn": s_late["score"]["usn"]} and ttl == 6 * 3600,
+          cal)
+    check("...and writing it changes no game data either",
+          tree_hash(data) == before and fmowar.read_state() == war_before)
+    rec = {"winner": 1, "ocu": 12, "usn": 9, "judged_at": 5, "penalty": {"nation": 2, "tile": 103100},
+           "reward": {"1": {"series": "arpeggio-orgel", "name": "Arpeggio/Orgel", "parts": [], "kinds": []}}}
+    check("a judged phase is handed over as winner, points, reward names and the penalised side",
+          boardfmo._result(rec) == {"winner": 1, "ocu": 12, "usn": 9, "judged_at": 5,
+                                    "reward": {"1": "Arpeggio/Orgel"}, "penalty": 2})
+
     print("the phase clock")
     p = s["phase"]
     check("phase 1, judged 2026-11-01 12:00 UTC (fmowar.phase_at)",

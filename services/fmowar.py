@@ -155,8 +155,13 @@ SERIES_KINDS = (0x11, 0x21, 0x31)          #: body, arms, legs: one series
 #: O.C.U. Vyzov / U.S.N. Stork/Varsa). The vote is not built: a phase with no
 #: row here (and none in FMO_WAR_REWARDS) keeps the 01-02 rule, taking the
 #: first series of REWARD_ORDER the winner does not hold yet.
+#: Phases 03 and 04 are SE's vote results as published (2026-10-08: they were
+#: named above but missing from the table, so a phase-3 winner fell to the
+#: queue instead); phase 05 on has no published reward and uses the queue.
 REWARD_TABLE = {1: {OCU: "arpeggio-orgel", USN: "tiran"},
-                2: {OCU: "arpeggio-orgel", USN: "pabotte"}}
+                2: {OCU: "arpeggio-orgel", USN: "pabotte"},
+                3: {OCU: "vyzov", USN: "vyzov"},
+                4: {OCU: "vyzov", USN: "stork-varsa"}}
 #: The 01-02 rule's queue per winner, SE's own later picks first, then
 #: the phase-00 provisional series (topics060306). Ours, as an order.
 REWARD_ORDER = {OCU: ("arpeggio-orgel", "vyzov", "igel-grille"),
@@ -793,7 +798,13 @@ class War:
         rec = {"ocu": pts[OCU], "usn": pts[USN],
                "winner": winners[0] if len(winners) == 1 else 0,
                "judged_at": int(now), "war": self.phase1(), "penalty": None,
-               "reward": {}, "reward_from": int(start_next)}
+               "reward": {}, "reward_from": int(start_next),
+               # who held each economic city at the judgement (0 = Deadlock),
+               # the table SE's Huffman Conflict Report printed (topics 060612)
+               "cities": {str(t): (int((self.data["sectors"].get(str(t)) or {}).get("nation") or 0)
+                                   if not (self.data["sectors"].get(str(t)) or {}).get("deadlock")
+                                   else 0)
+                          for t in CITIES}}
         if loser in FORTRESS:
             rec["penalty"] = {"nation": loser, "tile": FORTRESS[loser]}
         for nat in winners:

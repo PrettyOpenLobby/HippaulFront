@@ -145,6 +145,8 @@
                       vote, the three script bytes (+0x418..+0x41A) and the retraining wins.
     solo.py           The solo area (SE's Festa 2006 rules): one NPC ally at a time, two
                       enemies at a time, ten kills win, three allies lost lose.
+    storybattle.py    Story missions' own battles (fmo-story-battles.tsv): the mission's enemies,
+                      allies, objective and verdict; no PvP wait; only the leader's mission.
     defection.py      Defection (Change Nations): who may change nations, the refusal the
                       client shows, and what a defection costs the pilot.
     main.py           run(): the listeners, the startup log and the background threads.

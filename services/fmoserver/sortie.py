@@ -277,6 +277,45 @@ def join_verdict(entries, my_side, my_gid, now, cap=None, window=None,
                             f"the join-in window is {window} s"), None
 
 
+def story_sortie_snapshot(sess, q, now=None):
+    """What the battle verdict needs to advance a story mission, taken at the
+    0x013A GRANT: the sector tile this sortie was taken on (sess.sector, the
+    0x015E that opened the war map), the zone, and `settled` = False. A 9:10
+    follower (its 0x0139 +0x00 is the group's map and it never opened the
+    war map) takes the group's tile (groupchannel.GROUP_SORTIE). The pilot
+    may open another sector before the battle ends, which is why the tile
+    is kept here and not read back at the return."""
+    sec = getattr(sess, "sector", None)
+    tile = int(sec[0]) if sec else None
+    acct = getattr(sess, "account", None)
+    gs = groupchannel.GROUP_SORTIE.get(groupchannel.GROUP_OF.get(acct)) if acct else None
+    if (gs and q.get("id") and q["id"] == gs.get("map") and gs.get("by") != acct
+            and gs.get("sector")):
+        tile = int(gs["sector"]) % 1_000_000 or tile
+    # LEADER: in a battle group only the leader's special mission is carried
+    # out (BOOT CAMP Lesson 5; storybattle.STORY_LEADER_ONLY)
+    role, _info = storybattle.sortie_role(acct, q.get("id"))
+    return {"tile": tile, "zone": getattr(sess, "sector_zone", None),
+            "at": time.time() if now is None else now, "settled": False,
+            "leader": role in ("solo", "leader")}
+
+
+def story_battle_for_sortie(sess, q):
+    """(story battle row or None, why) for a sortie about to be granted: the
+    mission the leader (or a solo pilot) accepted on the sector tile, or the
+    one the group's sortie carries for a 9:10 follower (storybattle.py)."""
+    acct = getattr(sess, "account", None)
+    role, info = storybattle.sortie_role(acct, q.get("id"))
+    try:
+        char = sess.playing_char() if charstore.CHAR_STORE else None
+    except Exception:                    # no pilot loaded: no story battle
+        char = None
+    sec = getattr(sess, "sector", None)
+    tile = int(sec[0]) if sec else None
+    return storybattle.sortie_story_battle(char, tile, role,
+                                           info if role == "follower" else None)
+
+
 class SessionSortie:
     """Session's sortie requests: 0x0139, the group sortie GO and the battle withdraw."""
 
@@ -339,6 +378,25 @@ class SessionSortie:
             return code, why
         self.join_pct = pct
         return None
+
+    def story_size_verdict(self, q, row):
+        """(code, why) when the pilots this story sortie takes are outside the
+        mission's min/max (storybattle.size_verdict), else None."""
+        acct = getattr(self, "account", None)
+        role, _info = storybattle.sortie_role(acct, q.get("id"))
+        if role == "follower":
+            return None
+        gid = groupchannel.GROUP_OF.get(acct)
+        n = 1
+        if role == "leader" and gid:
+            n += sum(1 for a in groupchannel.GROUP_MEMBERS.get(gid, [])
+                     if a != acct and groupchannel.GROUP_READY.get(a, (0, 0))[0] == 1
+                     and groupchannel.group_member_live(a))
+        no = storybattle.size_verdict(row, n)
+        log(f"{self.peer}   STORY SIZE: '{row.get('title')}' min/max "
+            f"{'/'.join(str(x) for x in row.get('size') or storybattle.SIZE_DEFAULT)}, "
+            f"{n} pilot(s) Ready ({role}): " + (no[1] if no else "within the limits"))
+        return no
 
     def bg_cost_sortie_verdict(self, q, gid, st):
         """(code, why) when a B.G.Cost rule refuses this sortie, else None
@@ -450,6 +508,7 @@ class SessionSortie:
                 f"sortie poller 0x61184710 waits in state 1 forever")
             return []
         why = None
+        _story_row = None
         #: None means "use FMO_SORTIE_MAPNO" all the way down to
         #: sortie_mapno(), so the not-served arm below cannot leave it unbound.
         _mn = None
@@ -464,12 +523,35 @@ class SessionSortie:
                    "(progress byte 128 != 99). SE's flow: greet the sergeant, "
                    "do the training sortie, THEN sortie to the battlefields "
                    "(intro/flow.html); 105 [128] after the training sets the byte")
+        elif (charstore.TRAINING_GATE and not self.pilot_trained()
+              and training.registration_refusal(self.pilot_flags(), q["create"])):
+            # the registration training itself: only once the sergeant has
+            # sent the pilot (byte 128 == 1), so a modified client cannot
+            # fire it from byte 0 or run it again on 2
+            why = ("FMO_TRAINING_GATE=1: registration training refused, "
+                   + training.registration_refusal(self.pilot_flags(), q["create"]))
         else:
             # KEY: THE SECTOR THE WAR MAP ASKED ABOUT WINS. self.sector is set
             # by the 0x015E that opened this screen; without one (a kycli
             # RESUME, or the war map never opened) this is FMO_SORTIE_MAPNO,
             # exactly as every sortie before 2026-09-08.
             _mn = str(self.sector[2]) if self.sector else None
+            # THE TRAINING SORTIE (training.TRAINING_MAPNO): fought on the
+            # training ground, for no war-map sector. The sector the war map
+            # last opened is dropped, so the map, the PvP room, the enemy
+            # level, the war state and the story step do not inherit it.
+            _tmn = training.training_mapno(q)
+            if _tmn:
+                if self.sector:
+                    log(f"{self.peer}   TRAINING SORTIE: the war map's last sector "
+                        f"{self.sector[1]} (tile {self.sector[0]}) is dropped; this "
+                        f"battle is for no sector")
+                self.sector = None
+                _mn = _tmn
+                log(f"{self.peer}   TRAINING SORTIE: create {q['create']}, infoid "
+                    f"{q['infoid']} (a Tutorial Sector tile) -> training ground map "
+                    f"{_tmn} (FMO_TRAINING_MAPNO), enemies at NPC level "
+                    f"{training.ENEMY_LEVEL} (FMO_TRAINING_ENEMY_LEVEL)")
             # KEY: A GROUP FOLLOWER (the 9:10 YES) never opened the war map: its
             # 0x0139 +0x00 is the map our 0x0163 offered. Live 2026-09-27 a follower
             # asked for 267 and was sent FMO_SORTIE_MAPNO's 418 -- two maps.
@@ -491,7 +573,31 @@ class SessionSortie:
                 _pv_map = None
             _pv_role, _pv_room = (pvproom.peek(getattr(self, "sector_zone", None), _pv_map)
                                   if self.sector else (None, None))
-            _pv_knobs = pvproom.block_knobs(_pv_role, _pv_room)
+            # STORY MISSION (storybattle.py): the leader's accepted mission on
+            # this tile is fought with its own units, and a sortie that would
+            # CREATE a matching room starts at once instead (topics/060804:
+            # with a special mission for the sector the map does not wait)
+            _story_row, _story_why = story_battle_for_sortie(self, q)
+            if _story_row and _pv_role == "create" and storybattle.STORY_NO_WAIT:
+                log(f"{self.peer}   STORY SORTIE: {_story_why} -- no WAITING FOR "
+                    f"OPPONENTS room (SE topics/060804: a special mission's battle "
+                    f"starts at once); the mission's own battle is served")
+                _pv_role, _pv_room = None, None
+            elif _story_row and _pv_role:
+                log(f"{self.peer}   STORY SORTIE: {_story_why}, but this sortie joins "
+                    f"a matching room that is already open ({_pv_role}) -- the "
+                    f"room's battle is fought, not the mission's own")
+                _story_row = None
+            elif not _story_row and self.sector:
+                log(f"{self.peer}   story battle: none ({_story_why})")
+            _pv_knobs = pvproom.block_knobs(
+                _pv_role, _pv_room, side=_side,
+                tile=(int(self.sector[0]) if self.sector else None))
+            if _story_row:
+                if storybattle.STORY_BLOCK_KIND and _story_row["block_kind"]:
+                    _pv_knobs = dict(_pv_knobs, objective_kind=_story_row["block_kind"])
+                if _story_row["time_limit"]:
+                    _pv_knobs = dict(_pv_knobs, seconds=_story_row["time_limit"])
             # ONE stamp: block+0x48 AND cmd 138 (a late joiner: the room's start)
             _t0 = pvproom.start_stamp(_pv_role, _pv_room) or int(time.time())
             body = reply_013a(mapno=_mn, host=addressing.host_for(
@@ -512,6 +618,11 @@ class SessionSortie:
             except (TypeError, ValueError):
                 _pmap = None
             _pno = self.platoon_sortie_verdict(q, _pmap)
+            # STORY MISSION SIZE (storybattle.size_verdict): the catalogue's
+            # min/max pilots, refused with 3:0 / 3:1. A 9:10 follower rides
+            # the leader's sortie, which was judged already.
+            if _pno is None and _story_row:
+                _pno = self.story_size_verdict(q, _story_row)
             # PENALTY: revoked clearance leaves only the (re)training sortie;
             # also notes whether this is the retraining battle (create 2)
             _pno = penalty.sortie_verdict(self, q) or _pno
@@ -578,9 +689,15 @@ class SessionSortie:
             f"manager (id 0, key %xbattle) has an address for the first time. "
             f"Bar: a type-1 row with THAT id and its file's size in "
             f"fmocrash.py --live, not a screenshot.")
-        # PROGRESSION: this sortie was GRANTED; the next world-entry join on
-        # this session is the return, and the frontier mission advances then.
+        # PROGRESSION: this sortie was GRANTED; the battle verdict (0x014C,
+        # settlement.story_battle_settle) advances the story mission whose
+        # tiles hold the tile the sortie was TAKEN on, snapshotted HERE: the
+        # pilot may open another sector before the battle ends. A 9:10
+        # follower never opened the war map, so its tile is the group's.
         self.sortie_pending = True
+        self.sortie_story = story_sortie_snapshot(self, q)
+        log(f"{self.peer}   progression: sortie tile {self.sortie_story['tile']} "
+            f"(zone {self.sortie_story['zone']}) kept for the battle verdict")
         self.sortie_granted_at = time.time()
         self.battle_end_done = False
         self.battle_settlement = None          # one settlement per sortie
@@ -593,6 +710,19 @@ class SessionSortie:
         _bsr0["start_unix"] = next(
             (struct.unpack_from("<I", r)[0] for l, _o, r, _s in fields
              if l == "StartGameTime" and r), None)
+        # STORY MISSION: the battle the squad pops with (storybattle.py); a
+        # group leader's carries to its followers through the group sortie
+        _bsr0["story"] = _story_row
+        if _story_row:
+            _sgid = groupchannel.GROUP_OF.get(self.account)
+            _sgs = groupchannel.GROUP_SORTIE.get(_sgid) if _sgid else None
+            if _sgs is not None and _sgs.get("by") == self.account:
+                _sgs["story"] = _story_row
+            log(f"{self.peer}   STORY BATTLE armed: '{_story_row['title']}' (byte "
+                f"{_story_row['byte']}), objective {_story_row['objective'][0]}, "
+                f"block kind {(locals().get('_pv_knobs') or {}).get('objective_kind', 0)}, time limit "
+                f"{_story_row['time_limit'] or missionblock.MISSION_TIME} s; win: "
+                f"{_story_row['win']}; lose: {_story_row['lose']}")
         # SOLO AREA (solo.py, SE's Festa 2006 rules): a sortie to the solo
         # sector (FMO_SOLO_AREA, default O.C.U. 統制区10 セクター14 =
         # selector 109 tile 74149) runs the solo squad in this battle
@@ -730,6 +860,12 @@ class SessionSortie:
             return outs
         # a matching room counts this pilot out (pvproom.py)
         pvproom.withdrew(self.battle_key())
+        # PROGRESSION: a withdraw never completes a story mission; the
+        # snapshot goes, so a late battle end cannot advance it either
+        if getattr(self, "sortie_story", None) is not None:
+            log(f"{self.peer}   progression: WITHDRAW -- the sortie on tile "
+                f"{self.sortie_story.get('tile')} completes no story mission")
+            self.sortie_story = None
         # a withdraw is never a win: sortie pay only, whatever was destroyed
         push = self.battle_result_push(p["conn"], "the battle withdraw", won=False)
         if push is not None:
@@ -748,3 +884,4 @@ from . import solo  # noqa: E402  (the solo area)
 from . import coliseum  # noqa: E402  (Coliseum spectators)
 from . import pvproom  # noqa: E402  (Frontline matching rooms)
 from . import training  # noqa: E402  (the training sortie and its ranking)
+from . import storybattle  # noqa: E402  (story mission battles)

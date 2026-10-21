@@ -15,6 +15,12 @@ from .wirelog import log
 #: address-keyed roster.
 IDENTITY_TTL = _env_float("FMO_IDENTITY_TTL", "120")
 
+#: Both per-address tables below are the last fallback. Two
+#: devices behind one router share the address and overwrite each other here,
+#: so a connection that has learned its own account (the credential blob in
+#: 0x0321, the 0x015B token echo, the key trial in resolve_key) keeps it on the
+#: Session and account_for() answers from there first. Only a connection that
+#: proved nothing, and the world helpers asking by host, read these.
 _identity_by_ip = {}
 #: {ip: (account key, monotonic)} -- set only when a game connection's key trial
 #: (Session.resolve_key) names the member. Lives MEMBER_WINDOW, not
@@ -23,10 +29,35 @@ _proven_by_ip = {}
 _store_lock = threading.Lock()
 
 
+def _note_by_ip(table, ip, acct, ttl, what):
+    """Write a per-address entry, saying so when it replaces a DIFFERENT live
+    account: that is two logins behind one address, and from here on only a
+    connection that proved nothing of its own reads the entry."""
+    now = time.monotonic()
+    prev = table.get(ip)
+    table[ip] = (acct, now)
+    if prev and prev[0] != acct and now - prev[1] <= ttl:
+        log(f"WARNING: {ip} {what} {acct} (was {prev[0]}, still live) - two "
+            f"logins behind one address; a connection that adopted its own "
+            f"account (blob, token or key) is not affected, one that proved "
+            f"nothing now reads {acct}")
+
+
 def remember_identity(ip, identity_hex):
-    """Called on the LOGIN connection so the GAME connection can find it."""
+    """Called on the LOGIN connection so the GAME connection can find it,
+    when the token echo does not."""
     with _store_lock:
-        _identity_by_ip[ip] = (identity_hex, time.monotonic())
+        _note_by_ip(_identity_by_ip, ip, identity_hex, IDENTITY_TTL,
+                    "now carries the login-connection account")
+
+
+def remember_proven(ip, acct):
+    """A game connection's key trial named the member (Session.resolve_key)."""
+    with _store_lock:
+        _note_by_ip(_proven_by_ip, ip, acct, MEMBER_WINDOW,
+                    "now carries the key-proven account")
+        _note_by_ip(_identity_by_ip, ip, acct, IDENTITY_TTL,
+                    "now carries the key-proven account")
 
 
 #: KEY: FMO_ACCOUNT_PIN -- `<ip>=<account>[,<ip>=<account>]`, an EXPLICIT binding
@@ -74,19 +105,23 @@ except ValueError as _e:
     raise SystemExit(str(_e))
 
 
-def account_for(ip):
+def account_for(ip, session=None):
     """The account key for a game connection from `ip`.
 
-    Tries, in order: an operator PIN for this address, the key the login
-    connection resolved (TTL-bound carry), a fresh POL-member lookup (so a
-    late consumer -- the UDP world channel's POP names, minutes after login --
-    does not degrade when the TTL lapses), and the address itself. Never a
-    shared bucket: a roster that silently merges two players is worse than one
-    that is merely inconvenient to find.
+    Tries, in order: an operator PIN for this address, the account the
+    connection itself already adopted (`session`, see Session.account), the
+    key the login connection resolved (TTL-bound carry by address), a fresh
+    POL-member lookup (so a late consumer -- the UDP world channel's POP
+    names, minutes after login -- does not degrade when the TTL lapses), and
+    the address itself. Never a shared bucket: a roster that silently merges
+    two players is worse than one that is merely inconvenient to find.
     """
     pinned = ACCOUNT_PIN.get(ip)
     if pinned:
         return pinned
+    own = getattr(session, "_account", None) if session is not None else None
+    if own:
+        return own
     # Serving a world datagram: THAT channel's player, not the address's newest.
     _a = getattr(worldchannel._udp_ctx, "addr", None)
     if _a is not None and _a[0] == ip:

@@ -19,4 +19,5 @@ Modules:
   fmomap         map-container header and world-space bounding boxes
   fmoscriptcast  syscall parameter recovery from compiled SCP scripts
   fmotim2        TIM2 texture decoder (the City Control board backdrop)
+  fmostorybattles the story missions' own battles -> fmo-story-battles.tsv
 """

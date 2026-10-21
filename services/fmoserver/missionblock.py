@@ -166,6 +166,81 @@ MB_RECTDATA = 0x418                    # rect array -> lobby+0x6096
 MB_RECT_STRIDE = 0x1C                  # 28 B (0x610F1C5D `imul eax,eax,0x1c`)
 MB_RECT_MINX, MB_RECT_MINZ = 0x04, 0x0C
 MB_RECT_SIZEX, MB_RECT_SIZEZ = 0x10, 0x18
+#: KEY: THE RECT RECORD, re-read 2026-10-07 (capture & hold). +0x10/+0x14/+0x18
+#: are the MAX corner, not a size: the containment test 0x61054A22 checks
+#: min <= pos <= max on x, y and z (+0x04..+0x0C against unit+0x251.., then
+#: +0x10..+0x18), the 3D draw 0x61215640 takes the width as +0x10 - +0x04,
+#: and the script centre 0x610F1CE2 is (min + max) * 0.5. FMO_MISSION_AREA
+#: still writes its sizeX/sizeZ there, which is the right box only when the
+#: origin is 0 (its 'map' default). The rest of the 28 bytes:
+#:   +0x00 u8 the rect ID. 0x61049300 labels the drawn rects by it: ids 10..14
+#:         and 20..49 take letters A, B, C.. in id order, 15..19 none, 40 a
+#:         space; ids >= 50 are not drawn
+#:   +0x01 u8 the OWNER: 1/2 = a nation (drawn blue when it is the local
+#:         unit's nation, red otherwise), anything else grey (0x61215811);
+#:         cmd 133 writes it
+#:   +0x02 bit 1 = DRAWN in the 3D view (0x6104936E); bits 0..1 are what
+#:         cmd 148 resyncs
+#:   +0x03 u8 a type; 6 makes cmd 133 read a UnitID (+0x10) for the local
+#:         unit; 0 here
+#:   +0x04/+0x08/+0x0C f32 min x/y/z, +0x10/+0x14/+0x18 f32 max x/y/z
+MB_RECT_ID, MB_RECT_OWNER, MB_RECT_FLAGS, MB_RECT_TYPE = 0x00, 0x01, 0x02, 0x03
+MB_RECT_MAXX, MB_RECT_MAXY, MB_RECT_MINY = 0x10, 0x14, 0x08
+RECT_FLAG_DRAWN = 0x02
+#: 32 rects fit before block+0x798 (the 12 bytes cmd 148 writes at +0x88)
+MB_RECT_MAX = (0x798 - MB_RECTDATA) // MB_RECT_STRIDE
+#: KEY: THE RECT GROUPS (static 2026-10-07, cmd 133's arm 0x611EF98B): up to
+#: RectGroupCnt (+0x2C) records of 0x58 bytes at block+0xA8 (10 fit before
+#: +0x418). +0x00 u8 the group id cmd 133 names; +0x01 u8 its type, and only
+#: type 5 lets cmd 133 write a rect's owner. Nothing else in the image reads
+#: the table that we found (the debug print aside).
+MB_RECTGROUP = 0x0A8
+MB_RECTGROUP_STRIDE = 0x58
+MB_RECTGROUP_MAX = (MB_RECTDATA - MB_RECTGROUP) // MB_RECTGROUP_STRIDE
+RECTGROUP_OWNED = 5
+
+
+def rect_record(rid, lo, hi, owner=0, flags=RECT_FLAG_DRAWN, rtype=0):
+    """One 28-byte rect: id, owner, flags, type, f32 min (x, y, z), f32 max
+    (x, y, z). Pure."""
+    b = bytearray(MB_RECT_STRIDE)
+    b[MB_RECT_ID], b[MB_RECT_OWNER] = rid & 0xFF, owner & 0xFF
+    b[MB_RECT_FLAGS], b[MB_RECT_TYPE] = flags & 0xFF, rtype & 0xFF
+    struct.pack_into("<3f", b, MB_RECT_MINX, *[float(v) for v in lo])
+    struct.pack_into("<3f", b, MB_RECT_MAXX, *[float(v) for v in hi])
+    return bytes(b)
+
+
+def rect_group_record(gid, gtype=RECTGROUP_OWNED):
+    """One 0x58-byte rect group: id and type; the rest is unread, zero."""
+    b = bytearray(MB_RECTGROUP_STRIDE)
+    b[0], b[1] = gid & 0xFF, gtype & 0xFF
+    return bytes(b)
+
+
+def rect_fields(rects, groups=()):
+    """(label, block offset, raw, source) for a whole rect list and its
+    groups (capture zones). Refuses (a note, no bytes) past the room the
+    block has."""
+    if len(rects) > MB_RECT_MAX or len(groups) > MB_RECTGROUP_MAX:
+        return [("RectData", MB_RECTDATA, b"",
+                 f"REFUSED: {len(rects)} rects / {len(groups)} groups, the block "
+                 f"holds {MB_RECT_MAX} / {MB_RECTGROUP_MAX}")]
+    out = [("RectGroupCnt", MB_RECTGROUPCNT, struct.pack("<I", len(groups)),
+            f"{len(groups)} rect group(s), type {RECTGROUP_OWNED} = cmd 133 may "
+            f"write the owner"),
+           ("RectDataCnt", MB_RECTDATACNT, struct.pack("<I", len(rects)),
+            f"{len(rects)} capture zone(s)")]
+    for i, g in enumerate(groups):
+        out.append((f"RectGroup[{i}]", MB_RECTGROUP + i * MB_RECTGROUP_STRIDE, bytes(g),
+                    f"group id {g[0]} type {g[1]}"))
+    for i, r in enumerate(rects):
+        lo = struct.unpack_from("<3f", r, MB_RECT_MINX)
+        hi = struct.unpack_from("<3f", r, MB_RECT_MAXX)
+        out.append((f"Rect[{i}]", MB_RECTDATA + i * MB_RECT_STRIDE, bytes(r),
+                    f"id {r[0]} owner {r[1]} flags {r[2]:#x}: x {lo[0]:g}..{hi[0]:g} "
+                    f"y {lo[1]:g}..{hi[1]:g} z {lo[2]:g}..{hi[2]:g} (min/max)"))
+    return out
 MB_LEADERID = 0x070                    # u32 -> lobby+0x5CEE (0x610DC6B8)
 MB_BGCOSTMAX = 0x074                   # 2 x u8 -> lobby+0x5CF2/0x5CF3 (0x610CB1BB)
 MB_TOTALBGCOST = 0x078                 # 2 x u8
@@ -391,7 +466,7 @@ MB_OBJECTIVE_KIND = 0x050
 
 def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
                    battleticket=None, side=None, start_time=None, match_flags=None,
-                   objective_kind=None):
+                   objective_kind=None, rects=None, rect_groups=None, seconds=None):
     """(label, block offset, raw bytes, source) for every field that is ON.
 
     Returns nothing with every knob at its default -- that is what makes the
@@ -412,7 +487,15 @@ def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
             out.append(("MapNo", MB_MAPNO, b"",
                         f"REFUSED: type-1 id {mn} is NOT on disk (would crash "
                         f"the client at 0x611250A2) -- left zero"))
-    out.extend(mission_area_fields())
+    # `seconds`: a story mission's own time limit (storybattle.py), else
+    # FMO_MISSION_TIME
+    _area = mission_area_fields(seconds=seconds or None)
+    if rects:
+        # capture zones (pvproom.py, P4) replace FMO_MISSION_AREA's one rect;
+        # the play boundary it also writes stays
+        _area = [f for f in _area if f[0] not in ("RectDataCnt", "AreaRect[0]")]
+        _area += rect_fields(rects, rect_groups or ())
+    out.extend(_area)
     for label, off, spec in (("BGCostMax", MB_BGCOSTMAX,
                               MISSION_BGCOSTMAX if bgcostmax is None else bgcostmax),
                              ("TotalBgCostTbl", MB_TOTALBGCOST,
@@ -435,7 +518,7 @@ def mission_fields(leader=None, mapno=None, bgcostmax=None, totalbgcost=None,
         out.append(("ObjectiveKind", MB_OBJECTIVE_KIND,
                     struct.pack("<I", int(objective_kind)),
                     f"{int(objective_kind)} -> lobby+0x5CCE (5 = Team Deathmatch, "
-                    f"79:25; pvproom.py)"))
+                    f"79:25; 3 = target area, 79:14; pvproom.py)"))
     if side in (1, 2):
         out.append(("BattleSide", MB_BATTLE_SIDE, bytes([side]),
                     f"the pilot's nation {side} -> lobby+0x68D3 (0x61175A90): "

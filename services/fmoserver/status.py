@@ -93,6 +93,12 @@ S14A_HANGAR_RANK = S14A_BLOCK + 0x31
 #: writes 0 into setup 1's IN-USE byte (`[idx*0x220 + lobby+0x3DF4]`), i.e. it
 #: un-marks the very setup we just filled. 1 selects Setup1 and marks it in use.
 S14A_ACTIVE_SETUP = S14A_BLOCK + 0x2B  # u8, = lobby+0x8B7
+#: KEY: /anon (static 2026-10-08). The login arm tests `byte [lobby+0x8B8]` at
+#: 0x6117B37A and prints 8:49 "Anon is set to on." when it is set, right
+#: before the MapKind is taken from the block's +0x70C. lobby+0x8B8 is
+#: block+0x2C, one past the active-setup byte. Served from the character
+#: record's `anon`, which the 0x0187 handler (community.on_anon_set) writes.
+S14A_ANON = S14A_BLOCK + 0x2C          # u8, = lobby+0x8B8, 1 = /anon on
 
 #: Two neighbours of rank in the same block, read all over the UI and NOT decoded:
 #: lobby+0x8B4 (also mirrored to the global 0x613C0BF0 at 0x6117B331), lobby+0x8B5,
@@ -257,7 +263,7 @@ STATUS_WFD4 = int(os.environ.get("FMO_STATUS_WFD4", "").strip() or "0", 0)
 #: Empty (default) = today's zeros. Live-unproven; the expected result is the
 #: script's returning-player arm (file 0x12E70: E200 phase 0, then E285 places
 #: of the wire NPCs) instead of the cutscene.
-#: KEY: 2026-09-05 (settled-lobby round 2): THE SAME 256-BYTE BLOCK IS ALSO READ AS
+#: KEY: THE SAME 256-BYTE BLOCK IS ALSO READ AS
 #: BYTE VALUES. 0xE066 (0x610FD7D0) and the LEV row gate (0x610ED040) test ONE
 #: BIT (byte id>>3, bit id&7); 0xE067 (0x610FD860) returns the WHOLE BYTE at
 #: index id (`0x611750F0(lobby, id) & 0xFF`) and the counter scripts compare it
@@ -398,6 +404,11 @@ def status_fields(rank=None, char=None, money=None, mp=None, contrib=None,
                     "passes it to the ONLY writer of lobby+0x3DF2)",
                     S14A_ACTIVE_SETUP,
                     bytes([_act_setup & 0xFF]), "FMO_ACTIVE_SETUP"))
+    # /anon (community.on_anon_set stores it): +0x2C -> lobby+0x8B8, the
+    # byte 0x6117B37A tests for 8:49 "Anon is set to on."
+    if int(char.get("anon") or 0):
+        out.append(("anon (+0x2C -> lobby+0x8B8; 8:49 'Anon is set to on.' at 0x6117B37A)",
+                    S14A_ANON, b"\x01", "character store: /anon on"))
     _money, _money_src = economy.wallet_money(char, money)
     if _money < 0:
         # WARNING: A pilot already carrying a negative balance from before the floor

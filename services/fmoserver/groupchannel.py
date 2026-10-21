@@ -111,6 +111,28 @@ GROUP_SORTIE = {}
 #: {account: (ready, cont)} from 0x0173 CHANGE SORTIE SETTING (+0x04 1 = Ready,
 #: 2 = Standing By; +0x07 1 = Continue, 2 = Do not continue; 0 = unchanged).
 GROUP_READY = {}
+#: KEY: VOICE ON / OFF (static 2026-10-08, live bodies 2026-09-27 and 10-02).
+#: Two 4-byte battle-manager commands, both built on the self id ([mgr+0x2C])
+#: through 0x611E2750 and never answered by any client arm (BM_RECV has no
+#: 121/122, so they are reports TO the server, not something to echo):
+#:   cmd 122 (0x7A, sender 0x611E52F0) = THE VOICE SYSTEM STATE. 1 from the
+#:     voice init's success tail (0x6122EF1E, after status 0x1D), 0 from its
+#:     shutdown (0x6122EB74) and from the scene-4 setup reset (0x61006F8E).
+#:   cmd 121 (0x79, sender 0x611E52D0) = TRANSMITTING. 1 when the voice
+#:     module's set-state goes above 1 (0x6122E6F6, push-to-talk down), 0 on
+#:     set-state 0 (0x6122E725) and on the pump's silence timeout
+#:     (0x6122F3DB / 0x6122F40E); the setup reset sends 0 too (0x61006F82).
+#: What the OTHER members read is the member blob's +0x58 (G190_VOICE): bit 0
+#: is the send gate per destination (0x611E5150 skips a member without it), so
+#: a member whose voice system is off is served +0x58 = 0 in its cmd 190 /
+#: 191 and nobody's client sends it cmd 123. The talk state has no reader in
+#: the blob (the HUD lights on cmd 123 itself), so 121 is kept and logged.
+#: Per account, not persisted: {"on": bool, "talk": bool}; unknown = on, which
+#: is what every blob carried before this (groupchannel.py:224 hard-coded 1).
+GROUP_VOICE = {}
+GROUP_VOICE_TALK_CMD = 121
+GROUP_VOICE_STATE_CMD = 122
+VOICE_CMDS = (GROUP_VOICE_TALK_CMD, GROUP_VOICE_STATE_CMD)
 G191_BLOB_FROM = 0x4C       # cmd 191 copies body+0x08.. to blob+0x4C..
 G_FLAG_LISTED, G_FLAG_READY, G_FLAG_CONT = 0x01, 0x02, 0x100
 #: 0x0163 (the board's GROUP INFO reply, requested by 0x0162 on a row click):
@@ -226,6 +248,44 @@ def group_blob_update(uid, leader, flags, voice=True, listed=True):
     return fmoworld.record(roomrelay.GROUP_BLOB_UPDATE_CMD, body)
 
 
+def group_member_voice(account):
+    """+0x58 bit 0 for `account`'s member blob: 1 unless its client reported
+    its voice system OFF (cmd 122 body 0). See GROUP_VOICE."""
+    st = GROUP_VOICE.get(account)
+    return 1 if st is None or st.get("on", True) else 0
+
+
+def on_voice_cmd(chan, addr, cmd, body):
+    """A cmd 121 / 122 from a client: store its voice state and, for the
+    system state (122), rewrite that member's blob on every group channel of
+    its battle group (cmd 191 with +0x58 = the new value). Returns the number
+    of channels told."""
+    acct = getattr(chan, "account", None) or identity.account_for(addr[0])
+    val = struct.unpack_from("<I", body, 0)[0] if len(body) >= 4 else 0
+    if not acct:
+        log(f"[udp {addr[0]}:{addr[1]}]   cmd {cmd} = VOICE "
+            f"{'TRANSMIT' if cmd == GROUP_VOICE_TALK_CMD else 'SYSTEM'} {val}: no "
+            f"account on this channel, not stored")
+        return 0
+    st = GROUP_VOICE.setdefault(acct, {"on": True, "talk": False})
+    if cmd == GROUP_VOICE_TALK_CMD:
+        st["talk"] = bool(val)
+        log(f"[udp {addr[0]}:{addr[1]}]   cmd 121 = VOICE TRANSMIT {val} "
+            f"({'talking' if val else 'silent'}; 0x611E52D0, the voice module's "
+            f"set-state / silence timeout): noted for {acct}, nothing to relay "
+            f"(no client arm; the HUD lights on cmd 123 itself)")
+        return 0
+    was = st["on"]
+    st["on"] = bool(val)
+    n = group_push_flags(acct) if was != st["on"] else 0
+    log(f"[udp {addr[0]}:{addr[1]}]   cmd 122 = VOICE SYSTEM {val} "
+        f"({'up' if val else 'off'}; 0x611E52F0 from the voice init / shutdown): "
+        f"{acct}'s member blob +0x58 = {group_member_voice(acct)} -> cmd 191 "
+        f"on {n} group channel(s)"
+        + ("" if was != st["on"] else " (unchanged, nothing re-sent)"))
+    return n
+
+
 def _group_chans():
     return [(k, c) for k, c in list(WORLD_PEERS.items())
             if isinstance(k, tuple) and len(k) == 3 and k[2] == "group"]
@@ -295,7 +355,8 @@ def group_push_flags(account):
             uid = None
         if not uid:
             continue
-        c.pending.append(group_blob_update(uid, leader, flags))
+        c.pending.append(group_blob_update(uid, leader, flags,
+                                           voice=bool(group_member_voice(account))))
         n += 1
     return n
 
@@ -596,7 +657,7 @@ def group_queue(chan):
         leader = battlegroups.group_leader(gid) == acct
         chan.pending.append(group_remote_member_record(
             alias, first, last, leader, GROUP_KEY, rs.tag, host, addressing.GROUP_PORT,
-            flags=group_member_flags(acct, gid)))
+            voice=bool(group_member_voice(acct)), flags=group_member_flags(acct, gid)))
         rs.popped = True
         n += 1
         log(f"[udp {chan.addr[0]}:{chan.addr[1]}] VERIFIED: GROUP: member {acct} "

@@ -735,14 +735,20 @@ def active_setup_no(char, block=None, default=1):
 #: shop buy goes out as lobby-API 0x01A4 (cosmetics.MSG_COSMETIC_BUY) and the
 #: client sets no owned bit itself, so a bought id is banked on the pilot as
 #: char["paint_owned"] (add_owned_paint) and served here like the rest.
+#: The PILOT.LOCKER's two (2026-10-08, same jump table): 7 pilot suits
+#: +0x250, 0x10 bytes, id - 101 (0x61175050); 13 accessories +0x440, 0x10
+#: bytes, id - 10 (0x61175070). An id below the bias reads as owned (the
+#: lookup returns -1), which is why the starting suits and hats never show in
+#: the shop lists. Both are banked the same way (cosmetics.on_buy).
 OWNED_PAINT_CATS = {"camo": (0x110, 0x80, 101), "colour": (0x190, 0x80, 0),
-                    "insignia": (0x3C0, 0x80, 101)}
+                    "insignia": (0x3C0, 0x80, 101),
+                    "suit": (0x250, 0x10, 101), "accessory": (0x440, 0x10, 10)}
 
 
 def owned_paint_ids(char, nation):
     """{category name: sorted ids} the pilot owns for the colouring pickers:
     the starting paint and every non-zero paint field of a setup in use."""
-    out = {"camo": set(), "colour": set(), "insignia": set()}
+    out = {k: set() for k in OWNED_PAINT_CATS}
     st = starter_paint(nation)
     if st:
         out["camo"].add(st["camo"])

@@ -87,11 +87,21 @@ ACQ_REFUSE_MSG = 2
 #: non-zero in a known master table -- and zeros at +0x0C..+0x17, which the
 #: thunk walks as per-stat bytes (0x611A55B0, zero = skip).
 #: FMO_ACQUIRE_KINDS: the item kinds an 0x0168 may buy, comma-separated, or
-#: 'all'. Default 0x13 (consumables and passes) until a part buy has been seen
-#: live on the corrected reply; 'all' or '0x13,0x11,0x21,0x31,0x41,0x12' opts
-#: parts in. A refused kind gets message 2: the poll's other-id arm returns
-#: negative, 0x61034450 skips the fit, nothing is debited or appended.
-ACQUIRE_KINDS_RAW = os.environ.get("FMO_ACQUIRE_KINDS", "0x13").strip() or "0x13"
+#: 'all'. KEY: DEFAULT 'all' since 2026-10-08 -- retail sold every kind the
+#: setup screen lists (SE's shop guide: parts, weapons and items). The buy is
+#: a FIT, and the fit is kind-generic: 0x61034450 hands scene+0xB700 to
+#: 0x6103E220 -> 0x6103D330(slot, rec), which writes the record into the
+#: setup (0x61177E10), packs (id << 16) | kind for the slot's node
+#: (0x611AC4E0) and walks rec+0x0C (the remodel ranks, zero on a new part)
+#: through 0x611A58D0. The slot is the category the list was opened on
+#: ([scene+0xBF84]), so the kind always matches it. The append 0x61177B30
+#: copies all 24 bytes for any kind. What a record must carry is therefore
+#: the same for every kind: a unique serial, the client's own (id, kind)
+#: inside a master table, zeros at +0x0C..+0x17 -- acquire_check below.
+#: A list of kinds (e.g. '0x13') narrows it again. A refused kind gets
+#: message 2: the poll's other-id arm returns negative, 0x61034450 skips the
+#: fit, nothing is debited or appended.
+ACQUIRE_KINDS_RAW = os.environ.get("FMO_ACQUIRE_KINDS", "all").strip() or "all"
 
 
 def parse_acquire_kinds(spec):
@@ -228,22 +238,15 @@ def mint_serial():
 # --------------------------------------------------------------------------- #
 # THE ITEM COUNTER -- 0x0169 (SELL / DISCARD) and 0x017E (BUY)
 # --------------------------------------------------------------------------- #
-#: VERIFIED:KEY: STATIC 2026-09-09. Two sibling requests off the item counter, both
-#: unserved until now, so both HUNG the client. They are near-identical on the
-#: wire -- 40 bytes, a 24-byte item record at payload+0x10 copied from a pointer
-#: in the lobby -- and they must be treated OPPOSITELY, for one measurable
-#: reason:
+#: VERIFIED:KEY: STATIC 2026-09-09, CORRECTED 2026-10-08. Two sibling requests
+#: off the hangar's setup screen, 40 bytes each, a 24-byte item record at
+#: payload+0x10 and a price at payload+0x0C:
 #:
-#:   0x0169 (record at lobby+0x7406) puts the PRICE ON THE WIRE at payload+0x0C.
-#:   0x017E (record at lobby+0x743E) does NOT: its price lives at record+0x18,
-#:          one dword PAST the 24 bytes the sender copies.
-#:
-#: So we can pay for a sale correctly and we cannot charge for a purchase at
-#: all. That is not a preference, it is what the two senders do.
-#:
-#: 0x0169 -- SELL or DISCARD, decided by a byte the client sends us:
+#: 0x0169 -- SELL or DISCARD (dialog types 2/3, record at lobby+0x7406),
+#:   decided by a byte the client sends us:
 #:   0x6117A9AE `cmp byte [rec+0x12], 1` -- 1 = DISCARD (and payload+0x0C is
-#:   forced to 0), anything else = SELL (payload+0x0C = the price). The reply
+#:   forced to 0), anything else = SELL (payload+0x0C = the price, SE's own
+#:   sell price: the shop row's +0x04, 75% of the buy price). The reply
 #:   handler 0x6117A893 wants **message 1**; on it the client calls 0x6117A640
 #:   (find by 64-bit serial, remove from the owned list) and prints SE's own
 #:   8:73 "Discarded %s." or 8:33 "Sold %s." on the same byte.
@@ -253,19 +256,54 @@ def mint_serial():
 #:   Any other reply id takes 0x6117A90F: word[frame+8] -> lobby+0x7D5F, a
 #:   numbered [FM...] box, state 3. Graceful, and the item is NOT removed.
 #:
-#: 0x017E -- BUY. Reply 0x017F, and on it 0x61179373 does
-#:   `sub dword ptr [lobby+0x88C], eax` with eax = [rec+0x18]: **the client
-#:   debits ITSELF, from a price we were never told.** The debit sits inside the
-#:   0x017F-matched path, so any other id skips it entirely and takes the
-#:   graceful numbered failure at 0x611793CA.
-#:   WARNING: SO WE REFUSE IT BY DEFAULT. Answering 0x017F would take the player's
-#:   money on screen for an item no server-side stock exists for, and our very
-#:   next 0x014A would snap the wallet back to the stored value -- a desync that
-#:   reads to a player as "the shop stole my money". A numbered refusal is
-#:   honest and, either way, beats the hang they get today.
+#: 0x017E -- REMODEL ("Upgrade", 99:251), NOT a purchase. RETRACTS the
+#:   2026-09-09 reading "0x017E = BUY, its price is never sent, refuse by
+#:   design": the sender 0x611793F8 copies the 24-byte pending record to
+#:   payload+0x10 AND `mov edx,[ecx+0x18]; mov [eax+0xC],edx` -- the cost IS
+#:   at payload+0x0C, exactly as in 0x0169. The pending record is built by
+#:   0x6102F200(stat, rank, cost) (dialog type 4, event 0x1007): a copy of the
+#:   chosen OWNED item with ONE remodel rank byte (record+0x0C+stat) set and
+#:   +0x18 = the cost, and its two callers 0x61037213 / 0x61037382 are the
+#:   normal and the special remodel, each right after the window has checked
+#:   that cost against the wallet (0x61036FFD / 0x61037301). The normal cost
+#:   is 0x6103FA70 = SE's formula in economy.remodel_cost.
+#:   The reply wants 0x017F (0x6117928F). On it the arm finds the owned item
+#:   by serial in the inventory list (0x61175170) and in the setups
+#:   (0x611751C0) and, with reply+0x00 == 0, copies the whole pending record
+#:   over both; with reply+0x00 != 0 it writes reply+0x0B..+0x10 into the
+#:   record's six rank bytes instead. Then it DEBITS [pending+0x18] itself
+#:   (0x61179373 `sub [lobby+0x88C], eax`), copies reply+0x03 / +0x07 into
+#:   lobby+0xB50 / +0xB54 (owned table +0x288, see remodel_reply_payload) and
+#:   returns -6 for reply+0x00 == 2, -7 for 3 (the special remodel's
+#:   "failed" / "failed and the part was damaged", 17:57 / 17:58). Any other
+#:   id is the graceful failure at 0x611793CA: no debit, nothing changed.
+MSG_ITEM_REMODEL = 0x017E
+MSG_ITEM_REMODEL_REPLY = 0x017F
+#: the old names, kept for callers and selftests written against them
+MSG_ITEM_BUY, MSG_ITEM_BUY_REPLY = MSG_ITEM_REMODEL, MSG_ITEM_REMODEL_REPLY
+R17F_MODE = 0x00                       # 0 = copy the pending record
+R17F_OWNED_B50 = 0x03                  # -> lobby+0xB50 (u32)
+R17F_OWNED_B54 = 0x07                  # -> lobby+0xB54 (u32)
+R17F_RANKS = 0x0B                      # six rank bytes, read when mode != 0
+REPLY_017F_LEN = 0x14
+#: lobby+0xB50 - lobby+0x8C8: where reply+0x03 lands inside the owned table
+#: the 0x014A serves at status.S14A_OWNED (8 bytes, two dwords)
+R17F_OWNED_AT = 0xB50 - 0x8C8
+
+
+def remodel_reply_payload(owned=b""):
+    """The 0x017F body: mode 0 (the client applies its own pending record,
+    which is the remodel it priced and showed), and the pilot's own owned-table
+    bytes +0x288..+0x28F at +0x03 / +0x07 so the two stores the arm makes
+    leave lobby+0xB50..+0xB57 as the 0x014A set them."""
+    b = bytearray(REPLY_017F_LEN)
+    b[R17F_MODE] = 0
+    o = bytes(owned)[R17F_OWNED_AT:R17F_OWNED_AT + 8]
+    b[R17F_OWNED_B50:R17F_OWNED_B50 + len(o)] = o
+    return bytes(b)
+
+
 MSG_ITEM_SELL = 0x0169
-MSG_ITEM_BUY = 0x017E
-MSG_ITEM_BUY_REPLY = 0x017F
 S169_PRICE = 0x0C                      # `mov [eax+0xc], [rec+0x18]`
 S169_RECORD = 0x10                     # the 24-byte record, both messages
 S169_REC_SERIAL, S169_REC_ID = 0x00, 0x08
@@ -278,10 +316,10 @@ ITEM_FAIL_SPECIAL = 0xC922
 #: FMO_ANSWER_0169: '1' (default) = accept a sell/discard and pay for a sell.
 #: 'fail' = the graceful numbered refusal, '0' = silence (the hang, for an A/B).
 ANSWER_0169 = os.environ.get("FMO_ANSWER_0169", "1").strip() or "1"
-#: FMO_ANSWER_017E: 'fail' (default) = refuse a purchase gracefully -- see above.
-#: '1' = answer 0x017F and let the client debit itself (a DESYNC: our next
-#: 0x014A overwrites the wallet). '0' = silence (the hang).
-ANSWER_017E = os.environ.get("FMO_ANSWER_017E", "fail").strip() or "fail"
+#: FMO_ANSWER_017E: '1' (default since 2026-10-08) = serve the remodel: the
+#: owned item is checked, the cost banked, 0x017F sent. 'fail' = refuse every
+#: remodel gracefully (message 2, no debit), '0' = silence (the hang).
+ANSWER_017E = os.environ.get("FMO_ANSWER_017E", "1").strip() or "1"
 
 
 def parse_item_request(payload):
@@ -297,3 +335,148 @@ def parse_item_request(payload):
     serial = struct.unpack_from("<Q", rec, S169_REC_SERIAL)[0]
     item_id = struct.unpack_from("<H", rec, S169_REC_ID)[0]
     return rec[S169_REC_MODE], price, serial, item_id, rec[S169_REC_KIND]
+
+
+# --------------------------------------------------------------------------- #
+# THE REMODEL (0x017E -> 0x017F) and the sale price check
+# --------------------------------------------------------------------------- #
+def owned_record(char, block, serial):
+    """The pilot's current 24-byte record for `serial`: a stored item's own
+    record (with its remodel ranks) first, else the setups block's copy, else
+    None. The same two places the 0x017F arm updates (0x61175170 / 0x611751C0)."""
+    serial = int(serial)
+    for it in inventory.stored_items(char):
+        if it["serial"] == serial:
+            for rec in inventory.stored_item_records({"items": [it]}):
+                return rec
+    for rec in inventory.inventory_from_setups(block or b""):
+        if struct.unpack_from("<Q", rec, 0)[0] == serial:
+            return rec
+    return None
+
+
+def remodel_verdict(char, block, rec, cost, table=None):
+    """(ok, why, old_record, expected_cost) for an 0x017E carrying `rec` (the
+    client's pending record) and `cost` (payload+0x0C). Pure.
+
+    Refused when: the serial is not an item the pilot owns, the (id, kind)
+    differs from the owned one, the new ranks break the shop row's caps
+    (economy.remodel_check), the cost is below SE's own formula for the raise
+    (a special remodel may cost more, never less), or the wallet cannot pay."""
+    rec = bytes(rec)
+    serial = struct.unpack_from("<Q", rec, 0)[0]
+    kind, iid = rec[inventory.ITEM_KIND], struct.unpack_from("<H", rec, inventory.ITEM_ID)[0]
+    old = owned_record(char, block, serial)
+    if old is None:
+        return False, f"serial 0x{serial:016X} is not an item this pilot owns", None, 0
+    if old[inventory.ITEM_ID:inventory.ITEM_KIND + 1] != rec[inventory.ITEM_ID:inventory.ITEM_KIND + 1]:
+        return False, (f"the record names id {iid} kind 0x{kind:02X}, the owned item is "
+                       f"id {struct.unpack_from('<H', old, inventory.ITEM_ID)[0]} kind "
+                       f"0x{old[inventory.ITEM_KIND]:02X}"), old, 0
+    new_r, old_r = economy.record_ranks(rec), economy.record_ranks(old)
+    ok, why = economy.remodel_check(economy.part_row(kind, iid, table), new_r)
+    if not ok:
+        return False, why, old, 0
+    price, src = economy.part_price(kind, iid, char, serial, table)
+    expected = economy.remodel_cost(price, old_r, new_r) if price else None
+    if expected is not None and int(cost) < expected:
+        return False, (f"cost {cost} is below SE's {expected} for ranks {list(old_r)} -> "
+                       f"{list(new_r)} at price {price} ({src})"), old, expected
+    have = economy.wallet_money(char)[0]
+    if int(cost) > have:
+        return False, f"the wallet holds {have}, the remodel costs {cost}", old, expected
+    return True, (f"ranks {list(old_r)} -> {list(new_r)}, cost {cost}"
+                  + (f" (SE's formula: {expected}, price {price} from the {src})"
+                     if expected is not None else " (price unknown: the client's figure)")), old, expected
+
+
+def apply_remodel(char, block, rec):
+    """Store a granted remodel the way the 0x017F arm applies it on the client:
+    the whole new record replaces the owned item's and every setup copy with
+    the same serial. MUTATES char (its stored item and its stored setups);
+    returns the new block."""
+    rec = bytes(rec)[:inventory.INV_ENTRY_LEN]
+    serial = struct.unpack_from("<Q", rec, 0)[0]
+    found = False
+    for it in (char.get("items") or ()):
+        if isinstance(it, dict) and int(it.get("serial", -1)) == serial:
+            it["rec"] = rec.hex()
+            found = True
+    if not found:
+        e = inventory.add_stored_item(char, serial, struct.unpack_from("<H", rec, inventory.ITEM_ID)[0],
+                                      rec[inventory.ITEM_KIND])
+        e["rec"], e["src"] = rec.hex(), "setup"
+    b = bytearray(block or b"")
+    changed = False
+    for si in range(inventory.SETUP_SLOTS):
+        for i in range(inventory.SETUP_ITEMS):
+            off = si * inventory.SETUP_ENTRY_LEN + inventory.SETUP_ITEM_OFF + i * inventory.INV_ENTRY_LEN
+            if off + inventory.INV_ENTRY_LEN <= len(b) and struct.unpack_from("<Q", b, off)[0] == serial:
+                b[off:off + inventory.INV_ENTRY_LEN] = rec
+                changed = True
+    if changed:
+        char["setups"] = bytes(b).hex()
+    return bytes(b)
+
+
+def on_remodel(sess, p):
+    """0x017E -- a REMODEL (see MSG_ITEM_REMODEL). Granted: the cost is banked,
+    the new record stored, and 0x017F goes back (the client then applies its
+    pending record and debits the same cost). Refused: message 2 (0x611793CA),
+    nothing moves."""
+    pl = p["payload"]
+    rec = bytes(pl[S169_RECORD:S169_RECORD + ITEM_RECORD_LEN])
+    cost = struct.unpack_from("<I", pl, S169_PRICE)[0] if len(pl) >= S169_PRICE + 4 else 0
+    log(f"{sess.peer}   0x{MSG_ITEM_REMODEL:04X} = REMODEL ({len(pl)}B): "
+        f"record {rec.hex(' ')}, cost {cost} at payload+0x{S169_PRICE:02X}")
+    if ANSWER_017E == "0":
+        log(f"{sess.peer}   WARNING: FMO_ANSWER_017E=0: silent, the remodel window hangs.")
+        return []
+    char = (sess.playing_char() or None) if charstore.CHAR_STORE else None
+    if ANSWER_017E != "1" or char is None or len(rec) < ITEM_RECORD_LEN:
+        why = ("FMO_ANSWER_017E=" + ANSWER_017E if ANSWER_017E != "1" else
+               "no pilot in the store" if char is None else "short record")
+        log(f"{sess.peer}   -> message 2: remodel refused ({why}); 0x611793CA, no "
+            f"debit, the part is unchanged.")
+        return [packet.build(2, b"", p["seq"], p["conn"])]
+    block = sess.setups_block()
+    ok, why, _old, _exp = remodel_verdict(char, block, rec, cost)
+    if not ok:
+        log(f"{sess.peer}   -> message 2: remodel REFUSED: {why}. 0x611793CA: no "
+            f"debit, the part is unchanged.")
+        return [packet.build(2, b"", p["seq"], p["conn"])]
+    apply_remodel(char, block, rec)
+    iid, kind = struct.unpack_from("<H", rec, inventory.ITEM_ID)[0], rec[inventory.ITEM_KIND]
+    now = None
+    if cost:
+        now = sess.credit_money(f"remodel of item {iid} (kind 0x{kind:02X}): {why}",
+                                money=-int(cost))
+    else:
+        try:
+            sess.commit(f"remodel of item {iid} (kind 0x{kind:02X}), free: {why}")
+        except Exception as e:
+            log(f"{sess.peer}   WARNING: remodel NOT persisted ({e!r})")
+    owned = status.reply_014a(char=char)[status.S14A_OWNED:status.S14A_OWNED + R17F_OWNED_AT + 8]
+    log(f"{sess.peer}   -> 0x{MSG_ITEM_REMODEL_REPLY:04X} REMODEL granted: {why}; wallet "
+        f"now {now[0] if now else '?'}. The client copies its pending record over "
+        f"the owned item and its setup copies (mode 0) and debits {cost} itself "
+        f"(0x61179373); the store already holds both.")
+    return [packet.build(MSG_ITEM_REMODEL_REPLY, remodel_reply_payload(owned),
+                         p["seq"], p["conn"])]
+
+
+def sale_price(price, kind, item_id, table=None):
+    """(price to pay, note) for a SELL of (kind, id) at the client's figure.
+    The client sends the shop row's +0x04, SE's own sell price; a figure above
+    it is cut to it. No row = the client's figure."""
+    row = economy.part_row(kind, item_id, table)
+    if row is None or not row["buy"]:
+        return int(price), "the client's figure (no shop row)"
+    if int(price) > row["sell"]:
+        return row["sell"], f"cut from {price} to the shop row's sell price {row['sell']}"
+    return int(price), f"SE's sell price (row +0x04 = {row['sell']}, 75% of {row['buy']})"
+
+
+# Called at run time only; imported last so that import cycles resolve.
+from . import charstore, economy, packet, status  # noqa: E402
+from .wirelog import log  # noqa: E402

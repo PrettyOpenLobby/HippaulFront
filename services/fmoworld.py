@@ -1914,6 +1914,53 @@ def record_battle_start(reason, start_gametime=0, arg=0):
                               int(arg) & 0xFFFFFFFF))
 
 
+#: KEY: cmd 133 = THE ZONE STATE, server -> client (static 2026-10-07, arm
+#: 0x611EF944 in the battle dispatcher 0x611EF2E0; the client has no sender
+#: for it, so the battle server authors every capture). Body:
+#:   +0x00 u32 rect GROUP id, matched against the group table at block+0xA8
+#:         (stride 0x58, RectGroupCnt at +0x2C) by its byte +0x00
+#:   +0x04 u32 rect INDEX (< RectDataCnt)
+#:   +0x08 u32 HUD message: hi16 + 0x1B335 = the message resource, lo16 = the
+#:         line (0x6110B2B0 queues it, 0x6110B4E5 shows it); 0 = none.
+#:         hi16 11 = BB/F14/D24.DAT (111424): 0..4 "戦域A..Eの制圧開始",
+#:         5 + 8*zone + k the countdown (k: 30,15,10,5,4,3,2,1 s), 45..49
+#:         "戦域A..Eを制圧しました"
+#:   +0x0C u8  a flag carried into the message entry (bit 2); meaning unread
+#:   +0x0D u8  the rect OWNER -> rect+0x01, written whenever the group matches
+#:         and its byte +0x01 is 5 -- so EVERY cmd 133 must carry the zone's
+#:         current owner, a countdown line included
+#:   +0x10 u32 a UnitID, read only for a rect whose +0x03 is 6 (unused here)
+CMD_BM_ZONE_STATE_LEN = 0x14
+ZONE_MSG_RES = 11                     # 0x1B335 + 11 = 111424, BB/F14/D24.DAT
+ZONE_MSG_COUNTDOWN = (30, 15, 10, 5, 4, 3, 2, 1)
+
+
+def zone_msg(kind, zone, left=None):
+    """The +0x08 word for a capture line: kind 'start', 'count' (with `left`
+    seconds, one of ZONE_MSG_COUNTDOWN) or 'done'; zone 0..4 = A..E."""
+    if not 0 <= zone <= 4:
+        raise ValueError("zone %d: the D24 lines name areas A..E only" % zone)
+    if kind == "start":
+        idx = zone
+    elif kind == "done":
+        idx = 45 + zone
+    elif kind == "count" and left in ZONE_MSG_COUNTDOWN:
+        idx = 5 + 8 * zone + ZONE_MSG_COUNTDOWN.index(left)
+    else:
+        raise ValueError("zone message %r/%r has no D24 line" % (kind, left))
+    return (ZONE_MSG_RES << 16) | idx
+
+
+def record_zone_state(group, index, owner, msg=0, flag=0, unit=0):
+    """cmd 133 -- one zone's owner (and optionally a HUD line) to a client."""
+    b = bytearray(CMD_BM_ZONE_STATE_LEN)
+    struct.pack_into("<III", b, 0, int(group) & 0xFFFFFFFF, int(index) & 0xFFFFFFFF,
+                     int(msg) & 0xFFFFFFFF)
+    b[0x0C], b[0x0D] = flag & 0xFF, owner & 0xFF
+    struct.pack_into("<I", b, 0x10, int(unit) & 0xFFFFFFFF)
+    return record(CMD_BM_ZONE_STATE, bytes(b))
+
+
 def record_side_names(name_a, name_b):
     """cmd 134 -- the two 80-byte cp932 strings the arm copies to block+0xC60
     and +0xCB0. What draws them is unread; a probe, not a service."""

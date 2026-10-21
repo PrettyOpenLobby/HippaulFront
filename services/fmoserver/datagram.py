@@ -66,7 +66,35 @@ def chat_route(chan, kind):
     return heard, CHAT_ROOM_CHANNEL, "room"
 
 
+#: When the peer table was last swept (epoch). Nothing ever removed a
+#: WORLD_PEERS entry: every reader skips a channel silent past ROOM_TTL (or
+#: GROUP_LIVE_S for a group channel) but the table kept it, so it grew with
+#: every address a client ever sent from. The sweep runs from the datagram
+#: thread, the only writer, once per ROOM_TTL at most.
+_PEER_SWEEP_AT = [0.0]
+
+
+def sweep_peers(peers, now=None):
+    """Drop channels idle longer than any reader still counts them."""
+    now = time.time() if now is None else now
+    if now - _PEER_SWEEP_AT[0] < room.ROOM_TTL:
+        return 0
+    _PEER_SWEEP_AT[0] = now
+    ttl = max(room.ROOM_TTL, groupchannel.GROUP_LIVE_S)
+    gone = 0
+    for k, c in list(peers.items()):
+        seen = getattr(c, "seen_at", None)
+        if seen and now - seen > ttl:
+            peers.pop(k, None)
+            gone += 1
+    if gone:
+        log(f"[udp] forgot {gone} channel(s) silent for more than {ttl:.0f}s; "
+            f"{len(peers)} left")
+    return gone
+
+
 def _serve_datagram(sock, peers, dg, addr):
+    sweep_peers(peers)
     # KEY: THE BATTLE-GROUP CHANNEL (LIVE 2026-09-05 23:13Z, brute-forced against
     # the client's own MD5 from a capture): CFmoGroup's datagrams come from the
     # SAME client socket as the lobby world's (source port 19155), hid 0, kind
@@ -316,6 +344,10 @@ def _serve_datagram(sock, peers, dg, addr):
                 if off + 12 <= len(got["plain"]) else None
             # WHERE THIS PILOT IS in a battle: its own cmd 23/24 motion state
             referee.track_battle_motion(chan, cmd, body, _a8)
+            if cmd in groupchannel.VOICE_CMDS:
+                # voice system / transmit state (cmds 122 / 121): the member
+                # blob's +0x58 for the rest of the battle group
+                groupchannel.on_voice_cmd(chan, addr, cmd, body)
             if rooms._is_battle_chan(chan):
                 _nr = squad.squad_relay(chan, addr, cmd, body, _a8)
                 if cmd == squad.CMD_BM_HITLIST:
@@ -332,6 +364,13 @@ def _serve_datagram(sock, peers, dg, addr):
                             f"pilot(s); the TARGET's owner applies it")
                 if cmd == squad.CMD_BM_FIRE:
                     _nr += squad.fire_relay(chan, addr, body, _a8)
+                # cmd 21 (unit event) relayed like a shot; cmd 112 (depop
+                # request) answered with cmd 8; 14 / 111 named (squad.py)
+                if cmd == squad.CMD_BM_UNIT_EVENT:
+                    _nr += squad.unit_event_relay(chan, addr, cmd, body, _a8)
+                if cmd == squad.CMD_BM_DEPOP_REQ:
+                    squad.depop_request(chan, addr, body)
+                squad.battle_cmd_note(chan, addr, cmd, body)
                 if _nr and chan.cmd_seen.get(cmd, 0) <= 3:
                     log(f"[udp {addr[0]}:{addr[1]}]   -> cmd {cmd} (source "
                         f"{_a8:#x}) relayed to {_nr} other battle pilot(s)")
@@ -947,16 +986,20 @@ def _serve_datagram(sock, peers, dg, addr):
     # battle_squad_for. Popped once per battle channel, after the self-POP.
     # A Coliseum battle is pilots only (Playing Manual p.45): live 2026-10-06
     # the first arena match got the NPC squad every sortie gets.
-    _arena_fight = False
     if (battlepop.BATTLE_DUMMY and battlepop.BATTLE_DUMMY_AI and chan.popped
             and not getattr(chan, "squad_popped", False)
             and rooms._is_battle_chan(chan)):
-        _arena_fight = bool((referee.BATTLE_STATE.get(referee.bkey(addr[0])) or {}).get(
-            "arena_match")) or settlement.arena_zone(rooms.WORLD_ZONES.get(addr[0]))
-        if _arena_fight:
+        # battlepop.squad_blocked_for: the battle's KIND decides (arena match,
+        # spectator, Coliseum zone); the Frontline's waiting room is
+        # pvproom.squad_allowed below.
+        _no_squad = battlepop.squad_blocked_for(
+            referee.BATTLE_STATE.get(referee.bkey(addr[0])),
+            rooms.WORLD_ZONES.get(addr[0]), settlement.arena_zone,
+            in_match=coliseum.account_in_match(getattr(chan, "account", None)))
+        if _no_squad:
             chan.squad_popped = True
-            log(f"[udp {addr[0]}:{addr[1]}] ARENA: no NPC squad (a Coliseum battle "
-                f"is pilots only)")
+            log(f"[udp {addr[0]}:{addr[1]}] ARENA: no NPC squad: {_no_squad}; the "
+                f"judge decides by pilots alone (coliseum.Coliseum.judge)")
     if (battlepop.BATTLE_DUMMY and battlepop.BATTLE_DUMMY_AI and chan.popped
             and not getattr(chan, "squad_popped", False)
             and rooms._is_battle_chan(chan)
@@ -984,9 +1027,14 @@ def _serve_datagram(sock, peers, dg, addr):
             _bk = referee.chan_bkey(chan)
             _sqpos = battlepop.squad_spawn_positions(
                 rooms.SORTIE_MAP.get(_bk) or (referee.BATTLE_STATE.get(_bk) or {}).get("mapno"),
-                _sqside, solo.solo_on_field(_solo) or squad.BATTLE_ENEMIES[0])
+                _sqside, solo.solo_on_field(_solo) or storybattle.first_on_field(_bst.get("story"))
+                or squad.BATTLE_ENEMIES[0])
+        # STORY MISSION (storybattle.py): the sortie grant named the mission's
+        # own battle; the squad opens with its first units
         _sq, _och = squad.battle_squad_for(chan, _base, _snat, _sparts,
-                                           n=solo.solo_on_field(_solo), positions=_sqpos)
+                                           n=(solo.solo_on_field(_solo)
+                                              or storybattle.first_on_field(_bst.get("story"))),
+                                           positions=_sqpos)
         # body+0x27 is the z float's high byte: a squad placed from the table
         # sends no side byte, or every enemy lands at z ~ 0 and they stack
         _esside = (None if _sq.get("pos_src") == "spawn table"
@@ -995,6 +1043,8 @@ def _serve_datagram(sock, peers, dg, addr):
         _owner = squad.squad_owner_uid(chan, _mine, _och)
         if _solo and _mine:
             solo.solo_squad_setup(_sq, _solo, _base)
+        if _bst.get("story") and _mine:
+            storybattle.setup_squad(_sq, _bst, _base)
         _bst["squad"] = _sq
         _bst.setdefault("enemies", set())
         for _i, (_eid, _epos) in enumerate(zip(_sq["ids"], _sq["pos"])):
@@ -1011,6 +1061,17 @@ def _serve_datagram(sock, peers, dg, addr):
                 continue
             _bst["enemies"].add(_eid)
         _allies = solo.pop_allies(chan, _sq, _owner) if _sq.get("solo") else []
+        _story_allies = storybattle.pop_allies(chan, _sq, _owner)
+        if _sq.get("story"):
+            _srow = _sq["story"]["row"]
+            log(f"[udp {addr[0]}:{addr[1]}] -> STORY BATTLE '{_srow['title']}' (byte "
+                f"{_srow['byte']}): objective {_srow['objective'][0]}, NPC level "
+                f"{_sq['story']['level']}, {len(_sq['ids'])} enemy unit(s) on the field of "
+                f"{len(_sq['story']['queue'])}, allies "
+                + (", ".join(f"{u:#x} {_sq['ally_info'][u]['role']}"
+                             + (" (protected)" if _sq['ally_info'][u].get('protected') else "")
+                             for u in _story_allies) or "none")
+                + f"; win: {_srow['win']}; lose: {_srow['lose']}")
         if _allies:
             log(f"[udp {addr[0]}:{addr[1]}] -> SOLO AREA: ally "
                 + ", ".join(f"{u:#x} ({_sq['ally_info'][u]['role']}, "
@@ -1462,3 +1523,5 @@ from . import (  # noqa: E402
     settlement, solo, squad, udpconfig, warmap, worldchannel,
 )
 from . import pvproom  # noqa: E402  (Frontline matching rooms)
+from . import coliseum  # noqa: E402  (the arena squad gate)
+from . import storybattle  # noqa: E402  (story mission battles)

@@ -18,7 +18,7 @@ services:
     build: !reset null
     volumes:
       - ../hippaulfront/services/fmodata:/app/fmodata:ro
-  board:
+  fmoboard:
     image: ghcr.io/prettyopenlobby/hippaulfront:${HIPPAULFRONT_TAG:-${CRYSTALFRONT_TAG:-latest}}
     pull_policy: missing
     volumes:

@@ -218,8 +218,12 @@ REGISTRATION_CLEARED = 2
 #: the answered p2 != 0 (the library's 0x824 switch; fmo-gates.json `rewards`,
 #: decoded by fmogates.mission_rewards). The lines only SHOW; the server pays
 #: the money (session: the 0x015A answer's money delta + the stored wallet) and
-#: mints the OC transit pass of bytes 139/140. Armor colours, camo and insignia
-#: need no grant: every cosmetic is already in the open catalogue (cosmetics.py).
+#: mints the OC transit pass of bytes 139/140. 2026-10-08: the armor colours,
+#: camo and insignia the lines name are reward-only rows (nation flag 255, not
+#: in the shop catalogue), so the session banks them as owned paint
+#: (progress.REWARD_PAINT), credits the report's contribution
+#: (progress.report_contribution) and, for the sergeant's 105 [128], the base
+#: squadron insignia (progress.base_insignia_for_zone).
 #: FMO_MISSION_REWARD=0 answers p2 = 0 and pays nothing, the pre-10-01 behaviour.
 MISSION_REWARD = _env_int("FMO_MISSION_REWARD", 1) != 0
 
@@ -253,18 +257,45 @@ def _mission_action(name, ps, flags, out, what):
             out[1] = pay
 
 
-def apply_event_rule(rule, ps, flags):
+def call_context(sess):
+    """What a rule may need from the session that sent the call, beyond the
+    record: {"visited_bit": the LEV visited bit of the zone whose entry script
+    is running (zoneentry.lev_visited_bit of the last 0x0153), or None}."""
+    g = getattr(sess, "entry_grant", None)
+    bit = (zoneentry.lev_visited_bit(*g)
+           if (g and zoneentry.VISITED_ON_ENTRY) else None)
+    return {"visited_bit": bit, "grant": g}
+
+
+def note_call(sess, ev, ps):
+    """Bookkeeping a call needs whether or not a rule matches it: the
+    sortie call 102 names the battle's end scene (training.note_script_call).
+    Never raises."""
+    try:
+        training.note_script_call(sess, ev, ps)
+    except Exception as e:              # bookkeeping must never cost the ack
+        log(f"{getattr(sess, 'peer', '?')}   WARNING: script call note failed ({e!r})")
+
+
+def apply_event_rule(rule, ps, flags, ctx=None):
     """(answer params, new flags bytes, [what changed]) for one rule. Pure.
 
     A `set` term `@step` / `@report` is a mission step (see
     MISSION_SCRIPT_STEPS); it runs FIRST, so an `answer` term in the same row
-    reads the flags after the step."""
+    reads the flags after the step. `@visited` sets the bit `ctx` names
+    (call_context: the zone whose entry script made the call, event 101)."""
     flags = bytearray(flags if flags else bytes(fmostore.FLAGS_LEN if fmostore else 256))
     out = list(ps)
     what = []
     sets = [s.strip() for s in (rule.get("set") or "").split(";") if s.strip()]
     for s in sets:
-        if s.startswith("@"):
+        if s == "@visited":
+            bit = (ctx or {}).get("visited_bit")
+            if bit is not None and not flags[bit >> 3] & (1 << (bit & 7)):
+                flags[bit >> 3] |= 1 << (bit & 7)
+                what.append(f"flag bit {bit} set (@visited: zone {(ctx or {}).get('grant')} "
+                            f"entry script ran; its next entry lands in the settled lobby)")
+        elif s.startswith("@"):
             _mission_action(s[1:], ps, flags, out, what)
     for a in filter(None, (rule.get("answer") or "").split(";")):
         lhs, _, rhs = a.partition("=")
@@ -338,4 +369,5 @@ REGRANT_0159 = os.environ.get("FMO_0159_REGRANT", "").strip() not in ("", "0")
 
 
 # Called at run time only; imported last so that import cycles resolve.
-from . import progress, resultpush, status  # noqa: E402
+from . import progress, resultpush, status, training, zoneentry  # noqa: E402
+from .wirelog import log  # noqa: E402

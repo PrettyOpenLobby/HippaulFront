@@ -12,6 +12,9 @@ from .wirelog import log
 #: way everything else here is keyed, by the client's IP: WORLD_MAPS, the
 #: session binding, the relay room. A TCP Session reads it on its keepalive.
 BATTLE_STATE = {}
+#: cmd 139's reason at the Emergency Escape's +12 s step (0x6104C0F4): the
+#: wanzer is back at its POP position. The request carries 0x49895963.
+ESCAPE_DONE_REASON = 0x24360679
 
 
 def referee_shot(chan, addr):
@@ -271,6 +274,11 @@ def battle_end_trigger(st, triggers, now, limit_secs):
     _solo = solo.solo_verdict(st)
     if _solo:
         return _solo
+    # a STORY MISSION battle's own verdict (storybattle.py: its win / loss
+    # conditions and its own time limit)
+    _story = storybattle.verdict(st, now)
+    if _story:
+        return _story
     if "objective" in triggers and st.get("objective_done"):
         return f"the objective ({st['objective_done'][0]})", True
     if "escape" in triggers and st.get("escaped"):
@@ -358,15 +366,30 @@ def _note_battle_record(chan, addr, cmd, body):
         # battle map -- the battle goes on. FMO_BATTLE_END's 'escape' trigger
         # ends the battle as a loss here instead (the 2026-09-10 live loop); it
         # left the release default and prod's profile on 2026-10-01 to match
-        # retail. Still unmeasured: whether the client completes the
-        # relocation without an answer from the BM is unmeasured (the live run
-        # logged cmd 139 three times, which may be resends waiting for one).
-        # The capture that decides it: one battle with FMO_BATTLE_END=limit,
-        # press Emergency Escape, and watch (a) the wanzer reappear at the
-        # entry point and keep playing -> drop 'escape' from the default, or
-        # (b) a stall / repeated cmd 139 -> the BM owes an answer; read
-        # 0x61050600 mode 2 and the 0x6104C0F4 follow-up (reason 0x24360679
-        # plus cmd 111) for it.
+        # retail.
+        # VERIFIED: STATIC 2026-10-08. THE ESCAPE NEEDS NO ANSWER AND THE
+        # CLIENT PICKS THE DESTINATION. cmd 139 is sent from three call sites
+        # (request 0x610548DA, execute 0x61060807, record tick 0x6105DB48),
+        # which is the "three in one second" of every live run, not resends;
+        # the BM receive table 0x611D4750 has no arm for 139, 111 or 112 and
+        # nothing polls for one. Execute (mode 2, 0x610605ED) broadcasts the
+        # support record as peer cmd 129 and starts a 30 s record; at +45 s
+        # the escape object (update 0x6104BFE0) copies unit+0x241..0x249 over
+        # unit+0x251..0x259 at +1 s -- the RELOCATION -- and at +12 s sends
+        # cmd 139 reason 0x24360679 (0x6104C0F4) and, for the pilot's own
+        # unit, cmd 111 {0, unit, requester} (0x6104C11A); at +17 s the object
+        # dies and escape can be used again. unit+0x241 has one writer, the
+        # unit creator 0x611ED760 (0x611ED949), which sets +0x241 and +0x251
+        # from the POP record: THE DESTINATION IS THE POP POSITION, i.e. our
+        # self-POP spawn point (missionblock / FMO_BATTLE_SPAWNS) -- the
+        # manual's "the place where you entered the battle map". With another
+        # pilot in the battle the request first waits up to 5 s for every
+        # other player unit's peer cmd 50 answer (0x610504D0 / 0x61050640),
+        # which the peer link now relays with the body's unit ids renamed
+        # (peerlink.BODY_UNIT_IDS); verbatim, the receiver's lookup missed and
+        # the escape was cancelled with 32:0. So the server must NOT end,
+        # withdraw or answer here, and must keep the self POP at the entry
+        # point.
         esc = fmoworld.parse_escape(body)
         st = battle_state(bkey(addr[0]))
         if esc and not st["escaped"]:
@@ -376,8 +399,11 @@ def _note_battle_record(chan, addr, cmd, body):
             + (f". FMO_BATTLE_END has 'escape': the next keepalive on this host's "
                f"TCP session ends the battle with a 0x{battleend.MSG_BATTLE_END:04X}."
                if "escape" in battleend.BATTLE_END else
-               ". Not a trigger (FMO_BATTLE_END lacks 'escape'); the client will "
-               "withdraw on its own 0x013D as before."))
+               (". The escape FINISHED: the wanzer is back at its POP position "
+                "(0x6104C0F4); nothing is owed" if esc and esc[0] == ESCAPE_DONE_REASON
+                else ". Not a trigger (FMO_BATTLE_END lacks 'escape'): the client "
+                "relocates the wanzer to its POP position by itself about 57 s "
+                "after the confirm (0x6104BFE0), no answer owed")))
     elif cmd == fmoworld.CLI_FIELD_SYNC and len(body) >= 4:
         kind, off, ln = body[0], body[1], struct.unpack_from("<H", body, 2)[0]
         if chan.cmd_seen.get(cmd, 0) <= 3:
@@ -417,12 +443,15 @@ def _note_battle_record(chan, addr, cmd, body):
                                 f"{len(_sq['dead'])}/{len(_sq['ids'])} down")
                         # SOLO AREA: the next enemy arrives, or the tenth wins
                         solo.unit_died(chan, addr, _sq, h["target"])
+                        # STORY MISSION: the next wave, or the verdict
+                        storybattle.unit_died(chan, addr, _sq, h["target"])
                     continue
                 if _sq and h["target"] in (_sq.get("allies") or ()):
                     # SOLO AREA: an ally fell; the next role arrives, or the
                     # third loss loses (solo.on_death). Never a pilot's kill.
                     if _sq["owner"] == bkey(addr[0]):
                         solo.unit_died(chan, addr, _sq, h["target"])
+                        storybattle.unit_died(chan, addr, _sq, h["target"])
                     continue
                 st["kills"].append((h["target"], time.time()))
                 if h["target"] == chan.self_unit():
@@ -492,3 +521,4 @@ def _relay_battle_record(chan, addr, cmd, body, alias_stream):
 from . import (  # noqa: E402
     battleend, battlepop, groupchannel, identity, pvproom, rooms, solo, squad, worldchannel,
 )
+from . import storybattle  # noqa: E402  (story mission battles)

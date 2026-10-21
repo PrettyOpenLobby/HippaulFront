@@ -58,6 +58,23 @@ def band_rosters():
            "FMO_UDP_POP_NPC_COL" if npccast.POP_NPC_COL_SPEC else
            "the Coliseum's own catalogue on the tougi script's tier marks (desk-to-mark is a labelled guess)")
     bands = {"hq": hq, "occ": occ, "fz": fz, "col": col}
+    refresh_layout_overrides()
+    for _b in bands:
+        _lr = layout_band(_b)
+        if _lr is not None:
+            bands[_b] = (bands[_b][0], _lr, npccast.usn_roster(*_lr),
+                         f"the layout file {npccast.NPC_LAYOUT.path} ({len(_lr[0])} rows, "
+                         f"the lobby NPC editor; U.S.N. by SE's E060 pairing)")
+    hq, occ, fz, col = bands["hq"], bands["occ"], bands["fz"], bands["col"]
+    return {1: hq, 3: hq, 2: occ, 4: occ, 5: fz, 6: col}
+
+
+def refresh_layout_overrides(extra_poses=None):
+    """Rebuild the per-key client_kind / height / pose overrides from every
+    layout band (lobby, place and room bands alike), then add `extra_poses`
+    (a shipped room cast's) for keys the layout does not set. Called on a
+    lobby roster AND on a place roster: 2026-10-07 a Room entry did not run
+    it, so a pose seated in the room band only took after a lobby entry."""
     if npccast.NPC_LAYOUT is not None:
         _ck, _ht, _po = {}, {}, {}
         for _b in fmolayout.BAND_IDS:
@@ -73,14 +90,8 @@ def band_rosters():
         npccast.NPC_CKIND_OVERRIDE.update(_ck)
         npccast.NPC_HEIGHT_OVERRIDE.clear()
         npccast.NPC_HEIGHT_OVERRIDE.update(_ht)
-    for _b in bands:
-        _lr = layout_band(_b)
-        if _lr is not None:
-            bands[_b] = (bands[_b][0], _lr, npccast.usn_roster(*_lr),
-                         f"the layout file {npccast.NPC_LAYOUT.path} ({len(_lr[0])} rows, "
-                         f"the lobby NPC editor; U.S.N. by SE's E060 pairing)")
-    hq, occ, fz, col = bands["hq"], bands["occ"], bands["fz"], bands["col"]
-    return {1: hq, 3: hq, 2: occ, 4: occ, 5: fz, 6: col}
+    for k, v in (extra_poses or {}).items():
+        npccast.NPC_POSE_OVERRIDE.setdefault(k, v)
 
 
 def place_band_roster(place_kind, zone):
@@ -93,10 +104,12 @@ def place_band_roster(place_kind, zone):
     for b in ids:
         r = layout_band(b)
         if r is not None:
+            refresh_layout_overrides()
             return b, r, f"the layout file's {b} band ({len(r[0])} rows)"
     for b in ids:
         rows = roomcast.ROOM_DEFAULT_ROWS.get(b)
         if rows:
+            refresh_layout_overrides(fmolayout.rows_poses(rows))
             return b, fmolayout.rows_to_roster(rows, npccast.FACE_SIGN), (
                 f"the shipped {b} cast (roomcast.py, {len(rows)} rows; a layout "
                 f"{b} band replaces it)")

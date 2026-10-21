@@ -16,3 +16,4 @@ COPY services/fmostore.py /app/fmostore.py
 COPY services/fmotitle.py /app/fmotitle.py
 
 ENV POL_TITLES=fmotitle
+

@@ -36,6 +36,23 @@ MSG_NAMES[trade.MSG_TRADE_OK] = "trade-ok"
 MSG_NAMES[trade.MSG_TRADE_POLL] = "trade-poll"
 MSG_NAMES[trade.MSG_TRADE_STATE] = "trade-state"
 MSG_NAMES[trade.MSG_TRADE_PUSH] = "trade-push"
+# The third packet builder's ids (pushes.BUILDER3_IDS, 0x6119A080), named
+# 2026-10-08; the ones another table already names keep that name.
+MSG_NAMES.setdefault(0x0131, "scene-exit-notice")
+MSG_NAMES.setdefault(0x0146, "trade-poll-q")
+MSG_NAMES.setdefault(0x0167, "setup-save-q")
+MSG_NAMES.setdefault(0x0173, "sortie-setting")
+MSG_NAMES.setdefault(0x017A, "own-unit-status-notice")
+MSG_NAMES.setdefault(0x017C, "penalty-give")
+MSG_NAMES.setdefault(0x0180, "owned-item-notice")
+MSG_NAMES.setdefault(0x0181, "battle-result-q")
+MSG_NAMES.setdefault(0x0187, "anon-set")
+MSG_NAMES.setdefault(0x0189, "status-notice")
+MSG_NAMES.setdefault(0x0193, "own-unit-removed-notice")
+MSG_NAMES.setdefault(0x0198, "keepalive-q")
+MSG_NAMES.setdefault(0x01A5, "client-log-upload")
+MSG_NAMES.setdefault(0x01AC, "city-table-req")
+MSG_NAMES.setdefault(0x01C8, "login-notice")
 MSG_NAMES.update({r: "lobapi-req" for r in lobapi.LOBAPI})
 MSG_NAMES.update({v[0]: "lobapi-reply" for v in lobapi.LOBAPI.values()
                   if v[0] not in MSG_NAMES})

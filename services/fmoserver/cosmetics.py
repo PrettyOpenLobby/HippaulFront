@@ -86,8 +86,72 @@ COSMETIC_PRICE = _env_int("FMO_COSMETIC_PRICE", "0")
 #:          so the picker can list the paint and the wallet drops this session.
 MSG_COSMETIC_BUY = 0x01A4
 BUY_ID, BUY_KIND, BUY_PRICE = 0x00, 0x02, 0x04
-#: catalogue kind -> inventory.OWNED_PAINT_CATS name (category 4 / 5 / 12).
-BUY_KIND_CAT = {2: "camo", 3: "colour", 4: "insignia"}
+#: catalogue kind -> inventory.OWNED_PAINT_CATS name (category 4 / 5 / 12,
+#: and since 2026-10-08 the PILOT.LOCKER's 13 accessories / 7 pilot suits).
+#: KEY: THE LOCKER BUYS THE SAME WAY (static 2026-10-08): its buy functions
+#: (0x61028E20 suits, 0x61029020 accessories) match the row by (kind, id),
+#: gate on money with 0x611785D0, copy the row to scene+0x3AC1 and confirm in
+#: mode 5, so the 0x01A4 body is the same {u16 id, u8 kind, u8, u32 price};
+#: and the client again sets no owned bit, so before 10-08 a hat or suit
+#: "bought" there was free and never owned.
+BUY_KIND_CAT = {2: "camo", 3: "colour", 4: "insignia", 0: "accessory", 1: "suit"}
+#: the kinds FMO_COSMETIC_STOCK filters (paint only; the locker is always stocked)
+PAINT_KINDS = (2, 3, 4)
+
+# --------------------------------------------------------------------------- #
+# THE ACCESSORY SHOP'S GATES (SE update 050628gp4sc1:53-54, topics 050826:24-26)
+# --------------------------------------------------------------------------- #
+#: SE: some items need a rank or a battle record (update 050628gp4sc1:53), the
+#: record being the kill count, credited to every member of the battle group
+#: (:54); and topics 050826:24-26 added dress caps for company-grade and
+#: field-grade officers. VERIFIED: STATIC 2026-10-08: the client enforces none
+#: of it. The 0x01A3 row's byte +3 is never read (every list builder and buy
+#: function reads +0, +2 and +4 only) and the D27/D28 records carry no gate
+#: field, so SE's server gated by what it listed and what it sold. We do the
+#: same: a row the pilot does not qualify for is left out of 0x01A3 and its
+#: 0x01A4 is refused. SE never published the per-item list (it pointed to the
+#: printed guidebook), so the table is OURS, from the item names:
+#:   Garrison Cap (20 O.C.U., 21 U.S.N.)        rank 18 Second Lieutenant
+#:   Officer's Dress Hat (26 O.C.U., 27 U.S.N.) rank 21 Major
+#:   the six helmets 93..98 (Armorbuster's ..   career kills 100 / 200 / 300 /
+#:   Chaos)                                     500 / 1000 / 2000 (any enemy
+#:                                              unit; the kind is not tallied)
+#: FMO_COSMETIC_GATES=0 lists and sells every row.
+COSMETIC_GATES = (os.environ.get("FMO_COSMETIC_GATES", "").strip() or "1") != "0"
+GATES = {(0, 20): ("rank", 18), (0, 21): ("rank", 18),
+         (0, 26): ("rank", 21), (0, 27): ("rank", 21),
+         (0, 93): ("kills", 100), (0, 94): ("kills", 200), (0, 95): ("kills", 300),
+         (0, 96): ("kills", 500), (0, 97): ("kills", 1000), (0, 98): ("kills", 2000)}
+
+
+def pilot_kills(char):
+    """Career enemy units destroyed (settlement.settle_battle banks it)."""
+    try:
+        return max(0, int((char or {}).get("kill_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def gate_refusal(kind, rid, char):
+    """Why `char` may not buy (kind, rid), or None. No pilot = no gate (the
+    catalogue without a character is the old behaviour)."""
+    if not COSMETIC_GATES or char is None:
+        return None
+    g = GATES.get((int(kind), int(rid)))
+    if g is None:
+        return None
+    what, need = g
+    if what == "rank":
+        from . import economy, ranks, status
+        have = int(economy._econ_value("rank", None, status.START_RANK, "FMO_RANK",
+                                       char)[0] or 0)
+        if have < need:
+            return f"needs rank {ranks.rank_name(need)} (the pilot is {ranks.rank_name(have)})"
+        return None
+    have = pilot_kills(char)
+    if have < need:
+        return f"needs {need} enemy units destroyed (the pilot has {have})"
+    return None
 #: FMO_COSMETIC_BUY: '1' (default) = the verdict below; '0' = the old blind
 #: acknowledgement (message 1, nothing charged, nothing granted).
 COSMETIC_BUY = (os.environ.get("FMO_COSMETIC_BUY", "").strip() or "1") != "0"
@@ -102,7 +166,7 @@ def parse_stock(spec):
     Raises ValueError with a sentence on a bad entry."""
     spec = (spec or "").strip().lower()
     if spec in ("", "all"):
-        return {k: None for k in BUY_KIND_CAT}
+        return {k: None for k in PAINT_KINDS}
     if spec in ("0", "none"):
         return {}
     out = {}
@@ -113,7 +177,7 @@ def parse_stock(spec):
         k, _, ids = ent.partition(":")
         try:
             k = int(k, 0)
-            if k not in BUY_KIND_CAT:
+            if k not in PAINT_KINDS:
                 raise ValueError
             if not ids:
                 out[k] = None
@@ -166,9 +230,8 @@ def price_for(kind, rid=None):
 
 
 def in_stock(kind, rid):
-    """True when the paint shop sells (kind, rid). Kinds 0/1 (the pilot
-    locker) are not paint and are never filtered here."""
-    if kind not in BUY_KIND_CAT or events.is_medal(kind, rid):
+    """True when the shop sells (kind, rid) under FMO_COSMETIC_STOCK."""
+    if kind not in PAINT_KINDS or events.is_medal(kind, rid):
         return True
     if kind not in COSMETIC_STOCK:
         return False
@@ -185,14 +248,15 @@ def parse_buy(payload):
     return rid, kind, price
 
 
-def buy_verdict(rid, kind, nation, money, owned_ids):
+def buy_verdict(rid, kind, nation, money, owned_ids, char=None):
     """Decide a paint purchase. Pure. `owned_ids` = inventory.owned_paint_ids()
     for the pilot. Returns {ok, why, cat, price, name, new}; ok with `new`
     False means the pilot already owns it (granted again, charged nothing)."""
     cat = BUY_KIND_CAT.get(kind)
     v = {"ok": False, "cat": cat, "price": 0, "name": "", "new": False}
     if cat is None:
-        v["why"] = f"kind {kind} is not a paint kind (2 camo, 3 colour, 4 insignia)"
+        v["why"] = (f"kind {kind} is not a shop kind (0 accessory, 1 suit, 2 camo, "
+                    f"3 colour, 4 insignia)")
         return v
     row = next((r for r in events.with_medal(COSMETICS).get(kind, ()) if r[0] == rid), None)
     if row is None:
@@ -203,11 +267,18 @@ def buy_verdict(rid, kind, nation, money, owned_ids):
         v["why"] = (f"{row[2]!r} belongs to nation {row[1]} and the pilot is "
                     f"nation {nation} (the catalogue never offered it)")
         return v
-    if rid in (owned_ids or {}).get(cat, ()):
+    from .inventory import OWNED_PAINT_CATS
+    if rid in (owned_ids or {}).get(cat, ()) or rid < OWNED_PAINT_CATS[cat][2]:
+        # an id below its table's bias reads as owned on the client (a
+        # starting suit or hat), so it is never charged
         v.update(ok=True, why=f"{row[2]!r} is already owned: granted again, free")
         return v
     if not in_stock(kind, rid):
         v["why"] = f"{row[2]!r} is not stocked (FMO_COSMETIC_STOCK)"
+        return v
+    gate = gate_refusal(kind, rid, char)
+    if gate:
+        v["why"] = f"{row[2]!r} {gate} (FMO_COSMETIC_GATES; never listed for this pilot)"
         return v
     price = price_for(kind, rid)
     v["price"] = price
@@ -219,7 +290,7 @@ def buy_verdict(rid, kind, nation, money, owned_ids):
 
 
 def on_buy(sess, p):
-    """The 0x01A4 arm for paint (kinds 2/3/4): verdict, debit, bank, push.
+    """The 0x01A4 arm for every shop kind (0..4): verdict, debit, bank, push.
     Returns the packets, or None to leave the message to the generic
     lobby-API acknowledgement (another kind, or FMO_COSMETIC_BUY=0)."""
     from . import charstore, economy, inventory, packet, resultpush, status, zoneentry
@@ -230,20 +301,21 @@ def on_buy(sess, p):
     refuse = [packet.build(2, b"", sess.reply_seq(), p["conn"])]
     char = sess.playing_char() if charstore.CHAR_STORE else None
     if char is None:
-        log(f"{sess.peer}   0x01A4 PAINT BUY kind {kind} id {rid}: no pilot in the "
+        log(f"{sess.peer}   0x01A4 SHOP BUY kind {kind} id {rid}: no pilot in the "
             f"store -- REFUSED (message 2, a numbered [FM] box, nothing moves)")
         return refuse
     nation = zoneentry.script_nation(char)[0]
     money = economy.wallet_money(char)[0]
-    v = buy_verdict(rid, kind, nation, money, inventory.owned_paint_ids(char, nation))
-    log(f"{sess.peer}   0x01A4 = PAINT BUY: kind {kind} ({v['cat']}) id {rid} "
+    v = buy_verdict(rid, kind, nation, money, inventory.owned_paint_ids(char, nation),
+                    char=char)
+    log(f"{sess.peer}   0x01A4 = SHOP BUY: kind {kind} ({v['cat']}) id {rid} "
         f"{v['name']!r}, client price {wire_price}, ours {v['price']}, wallet "
         f"{money}, nation {nation}: {'OK' if v['ok'] else 'REFUSED'} - {v['why']}")
     if not v["ok"]:
         return refuse
     if v["new"]:
         inventory.add_owned_paint(char, v["cat"], rid)
-    why = f"bought paint {v['cat']} {rid} {v['name']!r}"
+    why = f"bought {v['cat']} {rid} {v['name']!r}"
     if v["price"]:
         if sess.credit_money(why, money=-v["price"]) is None:
             return refuse
@@ -293,25 +365,27 @@ def load_cosmetics(path=COSMETIC_TSV):
 COSMETICS = load_cosmetics()
 
 
-def cosmetics_for(screen, nation):
+def cosmetics_for(screen, nation, char=None):
     """[(kind, id, english)] this screen offers this nation, in table order.
 
     A row is offered when its nation flag is 0 (both) or equals the character's
-    nation -- the client's own rule for insignia. Capped at A3_ROW_MAX."""
+    nation -- the client's own rule for insignia -- and, given the pilot, when
+    it passes SE's gates (gate_refusal). Capped at A3_ROW_MAX."""
     rows = []
     for kind in A2_KINDS.get(screen, ()):
         for rid, flag, en in events.with_medal(COSMETICS).get(kind, ()):
-            if flag in (0, nation) and in_stock(kind, rid):
+            if (flag in (0, nation) and in_stock(kind, rid)
+                    and not gate_refusal(kind, rid, char)):
                 rows.append((kind, rid, en))
     return rows[:A3_ROW_MAX]
 
 
-def reply_01a3(need, req, nation):
+def reply_01a3(need, req, nation, char=None):
     """The 0x01A3 body for this 0x01A2 request, or None to fall back to zeros."""
     screen = req[0] if req else 0
     if not COSMETIC_SHOP or screen not in A2_KINDS or not COSMETICS:
         return None
-    rows = cosmetics_for(screen, nation)
+    rows = cosmetics_for(screen, nation, char)
     if not rows:
         return None
     b = bytearray(need)

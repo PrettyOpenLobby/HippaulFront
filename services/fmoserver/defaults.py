@@ -24,7 +24,7 @@ RELEASE_DEFAULTS = {
     # Room B and C the bar 124, Hangar 141 (fmoserver/move.py)
     "FMO_ROOM_MAPS": "1:121,2:122/123,3:121,4:121,5:141",
     "FMO_UDP_POP_POS_MAP": ("101:-2.57,2.99,-43.44,0;102:0.52,3.11,9.41,0;"
-                            "121:4.00,0.00,1.56,1.571;122:0.20,0.00,3.11,0;"
+                            "121:0.48,0.00,10.37,3.122;122:0.20,0.00,3.11,0;"
                             "123:-5.10,0.00,-0.83,0;124:-0.46,0.00,16.69,0;"
                             "141:1.47,0.50,24.59,0;142:6.82,0.27,18.73,0;"
                             "143:-0.23,0.50,24.50,0;144:0.71,0.50,24.51,0;"
@@ -37,7 +37,15 @@ RELEASE_DEFAULTS = {
     "FMO_START_STATUS": "1", "FMO_RANK": "21", "FMO_STATUS_MONEY": "12345",
     "FMO_STATUS_MP": "67", "FMO_STATUS_CONTRIB": "890", "FMO_STATUS_NAMES": "1",
     "FMO_STATUS_SEX": "roster", "FMO_STATUS_NATION": "1",
-    "FMO_STATUS_FLAGS": "8,9,10,11,12,13,128=99", "FMO_SQUADRON": "1",
+    # FMO_STATUS_FLAGS is NOT set (2026-10-08): a new pilot is born as retail
+    # made one, byte 128 = 0 and every zone unvisited, so Son's welcome, the
+    # First Sergeant's registration and the training sortie all play
+    # (scriptcall @step / @report on byte 128, training.END_SCENE, the 101
+    # visited bit). The seed applies only at creation (economy.
+    # seed_new_character), so a stored pilot keeps its own block. The old
+    # shortcut for test pilots, born registered with the entry scenes off:
+    # FMO_STATUS_FLAGS=8,9,10,11,12,13,128=99
+    "FMO_SQUADRON": "1",
     "FMO_UDP_POP_NATION": "1",
     # a NEW pilot (FMO_RANK / FMO_STATUS_* above stay the fallback for a record
     # with no value of its own, so no existing pilot is demoted): Conscript,
@@ -83,8 +91,9 @@ RELEASE_DEFAULTS = {
     # the client runs the enemy (brain 101): a squad of 3, 120 units out, 40 apart
     "FMO_BATTLE_DUMMY_AI": "101", "FMO_BATTLE_ENEMIES": "3:120:40",
     # the player trade service, the phase-end ceasefire bonus, and the officer
-    # review above Captain (keep or promote, never demote)
-    "FMO_TRADE": "1", "FMO_CEASEFIRE": "1", "FMO_REVIEW": "promote",
+    # review above Captain (SE's rule: keep, promote, or demote after a period
+    # with no mission success)
+    "FMO_TRADE": "1", "FMO_CEASEFIRE": "1", "FMO_REVIEW": "full",
     # play between pilots: the peer link, the character ids the client sees,
     # the defeat delay, group voice routing and Change Nations
     "FMO_UDP_PEER_LINK": "1", "FMO_CHAR_WIRE_BASE": "0x1000",
@@ -129,7 +138,16 @@ RELEASE_DEFAULTS = {
     "FMO_MISSION_ACCEPT": "gate", "FMO_MISSION_FEE": "1", "FMO_MISSION_REPORT": "1",
     "FMO_ANSWER_018D": "short", "FMO_MSN_WINS": "1:1",
     "FMO_MSN_ZONES": "1:200,2:509,3:200,4:207", "FMO_MSN_END_OPS": "0x08",
-    "FMO_COUNTER_MISSION": "3", "FMO_AREA_TARGETS": "1", "FMO_PARTS_STOCK": "0x13",
+    "FMO_COUNTER_MISSION": "3", "FMO_AREA_TARGETS": "1",
+    # the hangar shop sells every kind; the client applies SE's level window,
+    # nation and job tier itself (partsstock.py), so 'all' is the retail stock
+    "FMO_PARTS_STOCK": "all", "FMO_ACQUIRE_KINDS": "all",
+    # Battle Fee rates (0x019F +0x18, rate[0..7] = HP, weight, defence, speed,
+    # ammo, damage, range, recoil): SE's values were never published. OURS:
+    # 25 each, the same 25/100000 SE's own remodel cost uses, so one sortie
+    # of a part costs what one remodel step of it costs per rank
+    # (economy.py). 0 everywhere = no fee.
+    "FMO_BATTLE_FEE_RATES": "25,25,25,25,25,25,25,25",
     "FMO_WAR": "1", "FMO_WAR_MAP": "nation=0x05:b,bg_max=0x31:b,bg_min=0x55:b",
     "FMO_WARMAP_MAPS": "418",
     # one Controlled Zone (HQ) pass on promotion to Private First Class, rank
@@ -137,13 +155,14 @@ RELEASE_DEFAULTS = {
     "FMO_SALARY": "1", "FMO_PERMIT": "0", "FMO_PERMIT_RANKS": "4:hq",
     # the paint shop (0x01A4): SE's cosmetic prices are not in any data we
     # hold; ours, sized against a ~2500 H$ sortie and the 1000/2000 H$ passes:
-    # camouflage 3000, a colour 1500, an insignia 1000
-    "FMO_COSMETIC_PRICES": "2:3000,3:1500,4:1000",
-    # battle exp: about 10 wins a Pilot level in the easiest sectors, twice as
-    # fast at NPC rank 5, the Frontline a quarter more again (battleend's
-    # note; SE's shape, our numbers). With 70% wins that is roughly 75 battles
-    # to Pilot Lv 10 (Occupied Zone, Coliseum) and 145 to Lv 20 (Frontline)
-    "FMO_EXP_PACE": "10", "FMO_EXP_SECTOR_PCT": "200", "FMO_EXP_FRONT_PCT": "125",
+    # camouflage 3000, a colour 1500, an insignia 1000; the PILOT.LOCKER
+    # (2026-10-08, ours too): an accessory 1000, a pilot suit 2000
+    "FMO_COSMETIC_PRICES": "2:3000,3:1500,4:1000,0:1000,1:2000",
+    # battle exp: the exp formula (battleend.EXP_FORMULA, SE's shape: per kill,
+    # per room-mate's kill, per sortie and per win, our numbers), twice as
+    # fast at NPC rank 5, the Frontline a quarter more again. FMO_EXP_PACE is
+    # an override now (0 = the formula); 10 was the 2026-10-06 flat pace
+    "FMO_EXP_PACE": "0", "FMO_EXP_SECTOR_PCT": "200", "FMO_EXP_FRONT_PCT": "125",
     # log back in where you logged out (manual p.42); armed 2026-09-30; the Coliseum band stays excluded (zoneentry.py)
     "FMO_RESUME_ZONE": "1",
     "FMO_ANNOUNCE": "Huffman Island. Welcome back, pilot.",

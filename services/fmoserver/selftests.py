@@ -1938,11 +1938,10 @@ def _coliseum_pins():
     else:
         print("  coliseum: fmo_coliseum round trip: SKIP (no test database)")
 
-    # --- 8. off by default
-    _off_ok = (bool(os.environ.get("FMO_COLISEUM", "").strip() not in ("", "0"))
-               == _co.COLISEUM)
-    print(f"  coliseum: FMO_COLISEUM is off unless the env sets it (the desks keep the "
-          f"zero stubs): {'OK' if _off_ok else 'FAIL'}")
+    # --- 8. ON by default (2026-10-08): only an explicit 0 keeps the stubs
+    _off_ok = ((os.environ.get("FMO_COLISEUM", "").strip() != "0") == _co.COLISEUM)
+    print(f"  coliseum: FMO_COLISEUM is on unless the env sets 0 (then the desks keep "
+          f"the zero stubs): {'OK' if _off_ok else 'FAIL'}")
     ok &= _off_ok
     return ok
 
@@ -3177,7 +3176,8 @@ def _paint_shop_pins():
                      and cz.parse_prices("2:500, 4:0") == {2: 500, 4: 0} and _bad)
             # (2) prod fmo.log 2026-09-11 23:57:03Z, the first 0x01A4 ever seen
             ok &= _c(2, cz.parse_buy(bytes.fromhex("830004000000000000")) == (131, 4, 0)
-                     and cz.BUY_KIND_CAT == {2: "camo", 3: "colour", 4: "insignia"})
+                     and cz.BUY_KIND_CAT == {2: "camo", 3: "colour", 4: "insignia",
+                                             0: "accessory", 1: "suit"})
             cz.COSMETIC_STOCK = cz.parse_stock("")
             cz.COSMETIC_PRICES = {2: 500, 3: 300, 4: 200}
             # (3) camo 105 "Grayish Red 1" is nation 1's, bit 105-101 = 4 at +0x110
@@ -3209,9 +3209,12 @@ def _paint_shop_pins():
             ok &= _c(5, _ids(o5) == [resultpush.MSG_RESULT_PUSH, handshake.MSG_SESSION_START]
                      and rich["money"] == 4500
                      and struct.unpack_from("<i", o5[0], H + resultpush.S15A_MONEY)[0] == 0)
-            # (6) kind 1 (a pilot suit) is not paint: the generic ack, no verdict
+            # (6) kind 1 id 1 (a starting pilot suit, below the suit table's
+            # bias 101, which the client reads as owned): since 2026-10-08 the
+            # locker gets a verdict too, and this one is a free re-grant
             o6 = _buy(rich, 1, 1)
-            ok &= _c(6, _ids(o6) == [handshake.MSG_SESSION_START] and rich["money"] == 4500)
+            ok &= _c(6, _ids(o6) == [resultpush.MSG_RESULT_PUSH, handshake.MSG_SESSION_START]
+                     and rich["money"] == 4500 and "suit" not in rich.get("paint_owned", {}))
             # (7) FMO_SETUP_PAINT=0 drops starter/worn paint, never a purchase
             inventory.SETUP_PAINT = False
             ok &= _c(7, inventory.owned_paint_bits(rich, 1) == {0x110: 0x10}
@@ -3239,6 +3242,155 @@ def _paint_shop_pins():
           f"free, locker kinds untouched, stock filters 0x01A3: "
           f"{'OK' if ok else 'FAIL at ' + str(fails)}")
     return ok
+
+
+def _personnel_orders_pins():
+    """THE PERSONNEL OFFICER'S ORDERS (servicerecord.personnel_visit, static
+    2026-10-07), no client. (1) ranks.orders_pending is 0x61175510 transcribed,
+    and its twin: the old "promote at the desk" reply (+0x0D = the new rank
+    while this login's ordered rank is the old one) leaves the mission desk
+    locked; (2) 0x014A carries the pending order at +0x58E and the held rank at
+    +0x2F; (3) a Captain's review: 3 sector wins -> an ORDER (not shown this
+    session, 36:2), the next login gates the desk, the officer's next 0x0176
+    carries +0x0D = the order (36:12) and the gate clears; (4) 'full' with no
+    wins -> a demotion order (36:23), delivered as First Lieutenant at ~90% of
+    the bar (36:13); 'promote' mode keeps (36:4); a full Major slot passes
+    over (36:14); (5) a contribution step is banked at once but +0x0D stays
+    this session's rank; (6) the outlook below the review band; (7) the same
+    flow through Session.on_packet(0x0175)."""
+    import tempfile as _tf
+    fails = []
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    sr, rk = servicerecord, ranks
+    ok = True
+    # (1) the predicate, transcribed, at floor 0 (today's wire) and 21 (SE's)
+    ok &= _c(1, not rk.orders_pending(20, 0, 20) and rk.orders_pending(21, 0, 20)
+             and rk.orders_pending(19, 0, 20)
+             and not rk.orders_pending(20, 21, 19) and not rk.orders_pending(5, 21, 0)
+             and rk.orders_pending(20, 21, 21) and rk.orders_pending(21, 21, 20)
+             and not rk.orders_pending(22, 21, 22) and rk.orders_pending(22, 21, 21))
+    # served floor: SE's 21 (squadron 0x019F +0x14) unless FMO_RANK_ORDER_FLOOR
+    # says otherwise; the scenarios below were written for the floor-0 wire,
+    # so they run pinned to 0 and restore it
+    _sv_floor = rk.RANK_ORDER_FLOOR
+    ok &= _c(1, rk.RANK_ORDER_FLOOR == (int(os.environ.get("FMO_RANK_ORDER_FLOOR", "") or 21)))
+    rk.RANK_ORDER_FLOOR = 0
+    _T = 1_800_000_000
+    _iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    _wins = lambda n, cat=2: [{"cat": cat, "status": "complete",
+                               "reported": _iso(_T - (i + 1) * 3600)} for i in range(n)]
+    _save = (sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS, sr.REVIEW_CAPS, sr.CEASEFIRE,
+             sr.OUTLOOK_AUTO, status.STATUS_ACKRANK, charstore.CHAR_STORE)
+    try:
+        sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS = "full", 3, 7
+        sr.REVIEW_CAPS, sr.CEASEFIRE, sr.OUTLOOK_AUTO = {21: 2}, False, True
+        status.STATUS_ACKRANK = None
+        # (2)
+        _oc = {"rank": 20, "rank_order": {"rank": 21, "kind": "promote", "why": "review"}}
+        _ob = status.reply_014a(char=_oc)
+        ok &= _c(2, _ob[status.S14A_RANK] == 20 and _ob[status.S14A_BE1A] == 21
+                 and status.rank_and_ack(_oc) == (20, 21)
+                 and status.rank_and_ack({"rank": 20}) == (20, 20))
+        # (3) promotion by review: issued, then delivered after a relog
+        _cap = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * sr.DAY,
+                "missions": _wins(3), "nation_byte": 1}
+        _v1 = sr.personnel_visit(_cap, 20, 20, now=_T, held=lambda r, n: 0)
+        _a, _cc = status.rank_and_ack(_cap)
+        _locked = rk.orders_pending(_a, 0, _cc)
+        _v2 = sr.personnel_visit(_cap, _a, _cc, now=_T + 60)
+        ok &= _c(3, _v1["verdict"] == "promote" and _v1["send_rank"] == 20
+                 and _v1["outlook"] == sr.OUTLOOK_ORDERS_SOON and _v1["issued"]["rank"] == 21
+                 and (_a, _cc) == (20, 21) and _locked
+                 and _v2["delivered"]["rank"] == 21 and _v2["send_rank"] == 21
+                 and _v2["outlook"] == sr.OUTLOOK_PROMOTED and _cap["rank"] == 21
+                 and "rank_order" not in _cap and _cap["review_at"] == _T + 60
+                 and not rk.orders_pending(_v2["send_rank"], 0, _cc))
+        # (4) demotion ('full'), keep ('promote'), passed over (cap full)
+        _dn = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * sr.DAY}
+        _d1 = sr.personnel_visit(_dn, 20, 20, now=_T)
+        _d1["issued"] = dict(_d1["issued"] or {}, held=_dn["rank"])
+        _d2 = sr.personnel_visit(_dn, 20, 19, now=_T + 60)
+        _kp = {"rank": 20, "review_at": _T - 8 * sr.DAY}
+        _k1 = sr.personnel_visit(_kp, 20, 20, now=_T, mode="promote")
+        _po = {"rank": 20, "review_at": _T - 8 * sr.DAY, "missions": _wins(4)}
+        _p1 = sr.personnel_visit(_po, 20, 20, now=_T, held=lambda r, n: 2)
+        ok &= _c(4, _d1["verdict"] == "demote" and _d1["outlook"] == sr.OUTLOOK_DEMOTION_SOON
+                 and _d1["issued"]["rank"] == 19 and _d1["issued"]["held"] == 20
+                 and _d1["send_rank"] == 20)
+        ok &= _c(4, _d2["delivered"] and _d2["send_rank"] == 19 and _dn["rank"] == 19
+                 and _d2["outlook"] == sr.OUTLOOK_DEMOTED
+                 and _dn["contribution"] == sr.review_demoted_contribution(19)
+                 and "review_at" not in _dn
+                 and _k1["verdict"] == "keep" and _k1["outlook"] == sr.OUTLOOK_NO_MESSAGE
+                 and _kp["rank"] == 20 and "rank_order" not in _kp
+                 and _p1["verdict"] == "keep" and _p1["outlook"] == sr.OUTLOOK_PASSED_OVER)
+        # (5) a contribution step: banked, shown from the next login
+        _ct = {"rank": 5, "contribution": 294400}
+        _c1 = sr.personnel_visit(_ct, 5, 5, now=_T)
+        _c2 = sr.personnel_visit(_ct, 5, 5, now=_T + 60)
+        ok &= _c(5, _c1["send_rank"] == 5 and _ct["rank"] == 20 and "rank_order" not in _ct
+                 and _c1["outlook"] == sr.OUTLOOK_ORDERS_SOON and _c2["send_rank"] == 5
+                 and status.rank_and_ack(_ct) == (20, 20) and _ct["review_at"] == _T)
+        # (6) the outlook below the band and mid-period
+        _lo, _hi = rk.rank_threshold(10) or 0, rk.rank_threshold(11) or 0
+        ok &= _c(6, sr.contribution_outlook(10, _lo - 1) == sr.OUTLOOK_UNRECOGNISED
+                 and sr.contribution_outlook(10, _lo) == sr.OUTLOOK_NO_MESSAGE
+                 and sr.contribution_outlook(10, (_lo + _hi) // 2 + 1) == sr.OUTLOOK_REGARDED
+                 and sr.personnel_visit({"rank": 20, "review_at": _T - sr.DAY,
+                                         "missions": _wins(1)}, 20, 20, now=_T)["outlook"]
+                 == sr.OUTLOOK_REGARDED
+                 and sr.personnel_visit({"rank": 20, "review_at": _T - sr.DAY}, 20, 20,
+                                        now=_T)["outlook"] == sr.OUTLOOK_UNRECOGNISED
+                 and sr.personnel_visit({"rank": 24}, 24, 24, now=_T)["outlook"]
+                 == sr.OUTLOOK_NO_MESSAGE)
+        # (7) through the handler: issue on visit 1, +0x0D unchanged; a new
+        # session (relog) delivers it
+        with _tf.TemporaryDirectory() as _td:
+            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+            _pl = {"id": 1, "first": "Pin", "last": "Orders", "rank": 20,
+                   "contribution": 300000, "review_at": int(time.time()) - 8 * sr.DAY,
+                   "missions": [{"cat": 2, "status": "complete",
+                                 "reported": _iso(int(time.time()) - 3600)}] * 3}
+
+            def _visit(sess):
+                _o = sess.on_packet(packet.parse(packet.build(sr.MSG_0175_REQ, b"", 0x175)))
+                _b = packet.parse(_o[0])["payload"][0x20:]
+                return _b[sr.S176_RANK], _b[sr.S176_OUTLOOK]
+
+            def _sess():
+                _s = session.Session("selftest-orders:1")
+                _s._roster = [_pl]
+                _s.playing_char = lambda: _pl
+                _s.commit = lambda what: None
+                _s.all_rosters = lambda: [("a", [_pl])]
+                return _s
+            _s1 = _sess()
+            _h1 = _visit(_s1)
+            _h1b = _visit(_s1)
+            _gate = status.rank_and_ack(_pl)
+            _h2 = _visit(_sess())
+            ok &= _c(7, _h1 == (20, sr.OUTLOOK_ORDERS_SOON) and _h1b == (20, sr.OUTLOOK_ORDERS_SOON)
+                     and _gate == (20, 21) and _h2 == (21, sr.OUTLOOK_PROMOTED)
+                     and _pl["rank"] == 21 and status.rank_and_ack(_pl) == (21, 21))
+    finally:
+        (sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS, sr.REVIEW_CAPS, sr.CEASEFIRE,
+         sr.OUTLOOK_AUTO, status.STATUS_ACKRANK, _cs) = _save
+        flat_globals()["CHAR_STORE"] = _cs
+        rk.RANK_ORDER_FLOOR = _sv_floor
+    _skip = (None if rk.RANK_LADDER else
+             "SKIP (fmodata/fmo-ranks.tsv missing; build it with tools/fmodata_build.py)")
+    _hard = [n for n in fails if not (_skip and n in (4, 5, 6, 7))]
+    print(f"  personnel orders: the desk gate 0x61175510 (twin: promoting at the desk "
+          f"locks it), the order at 0x014A +0x58E, review promote/demote as ORDERS "
+          f"delivered at the next visit after a relog, keep / passed-over lines, a "
+          f"contribution step shown from the next login, through 0x0175: "
+          f"{'OK' if not fails else ('FAIL at ' + str(fails)) if _hard else _skip}")
+    return not _hard
 
 
 def _shop_acquire_pins():
@@ -3453,6 +3605,219 @@ def _part_fit_pins():
     return ok
 
 
+def _hangar_economy_pins():
+    """THE HANGAR ECONOMY (static 2026-10-08), driven through Session.on_packet.
+    (1) every one of the 18 master-table kinds is BOUGHT on the defaults
+        (FMO_ACQUIRE_KINDS / FMO_PARTS_STOCK unset = all): a 0x016B the
+        reader 0x61177B30 takes (gate 1, the client's own id/kind, zero
+        +0x0C..+0x17, a unique serial), the price banked once, the item kept;
+    (2) each wanzer kind FITS: placed in the slot its category opens
+        (0x6138A5C0, weapons on mount 4), saved with 0x0167, served back by
+        0x0165 at that item index and listed by 0x0133 under the same serial;
+    (3) SELL pays SE's sell price (row +0x04) and cuts a higher figure to it;
+    (4) REMODEL 0x017E: SE's cost (price*25/100000 per rank step), 0x017F
+        mode 0 with the owned-table bytes echoed, wallet and stored record
+        (and its setup copy) updated; refused (message 2, nothing moves) when
+        not owned, over a cap, under SE's cost, or unaffordable;
+    (5) BATTLE FEE: the client's own sum over the sortied setup at the 0x019F
+        rates, debited once by settle_battle with a 0x01A1 queued (+0x04 fee,
+        +0x08 0); an Arena battle charges nothing and sets +0x08;
+    (6) the 0x019F block carries the earned other-nation series at +0x710."""
+    import tempfile as _tf
+    ok, fails = True, []
+
+    def _c(n, v):
+        if not v:
+            fails.append(n)
+        return bool(v)
+
+    def _sess(char, peer="selftest-econ"):
+        s = session.Session(peer)
+        s._roster = [char]
+        s.playing_char = lambda: char
+        s.commit = lambda what: None
+        return s
+
+    def _msg(pk):
+        return struct.unpack_from("<H", pk, 6)[0]
+
+    tbl = economy.PART_SHOP
+    if not tbl:
+        print("  hangar economy: SKIPPED (fmodata/fmo-part-shop.tsv absent; "
+              "tools/fmodata_build.py builds it from the client)")
+        return True
+    # the client's slot -> kind table 0x6138A5C0 (arms, body, leg, leg, the
+    # four weapon mounts, two unused, backpack)
+    slot_kind = [0x21, 0x11, 0x31, 0x31, 0, 0, 0, 0, 0, 0, 0x41]
+    _was = (charstore.CHAR_STORE, shop.ACQUIRE_KINDS, partsstock.PARTS_STOCK,
+            squadron.BATTLE_FEE_RATES, warstate.WAR)
+    with _tf.TemporaryDirectory() as _td:
+        try:
+            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+            shop.ACQUIRE_KINDS = shop.parse_acquire_kinds(
+                os.environ.get("FMO_ACQUIRE_KINDS", "").strip() or "all")
+            partsstock.PARTS_STOCK = partsstock.parse_parts_stock("all")
+            warstate.WAR = "0"
+            ok &= _c(0, shop.ACQUIRE_KINDS is None and shop.ANSWER_017E == "1")
+            pilot = {"id": 3, "first": "Econ", "last": "Test", "money": 50_000_000,
+                     "nation": 1, "nation_byte": 1, "cls": 1}
+            s = _sess(pilot)
+            bought, serials = {}, set()
+            for kind in sorted(partsstock.PART_TABLE_COUNT):
+                iid = min(i for (k, i), r in tbl.items() if k == kind and r["buy"])
+                price = tbl[(kind, iid)]["buy"]
+                was = pilot["money"]
+                o = s.on_packet(packet.parse(packet.build(
+                    shop.MSG_ACQUIRE, struct.pack("<HBBI", iid, kind, 0, price) + bytes(16), 0x168)))
+                pk = o[0] if len(o) == 1 else b""
+                rec = pk[0x2C:0x44]
+                good = (len(pk) >= 0x44 and _msg(pk) == shop.MSG_ACQUIRE_REPLY
+                        and struct.unpack_from("<I", pk, 0x28)[0] == 1
+                        and struct.unpack_from("<H", rec, inventory.ITEM_ID)[0] == iid
+                        and rec[inventory.ITEM_KIND] == kind
+                        and kind in inventory.VALID_ITEM_KINDS
+                        and rec[0x0C:0x18] == bytes(12)
+                        and pilot["money"] == was - price)
+                ser = struct.unpack_from("<Q", rec, 0)[0] if rec else 0
+                ok &= _c(f"1:{kind:#04x}", good and ser and ser not in serials)
+                serials.add(ser)
+                bought[kind] = (iid, bytes(rec))
+            ok &= _c("1:kept", {it["serial"] for it in inventory.stored_items(pilot)} >= serials)
+            # (2) fit each wanzer kind into the slot its category opens, save, reload
+            s.on_packet(packet.parse(packet.build(inventory.MSG_0165_REQ, bytes(16), 0x165)))
+            for kind, (iid, rec) in bought.items():
+                if kind == 0x13:
+                    continue
+                slot = slot_kind.index(kind) if kind in slot_kind else 4
+                idx = inventory.SLOT_TO_ITEM[slot]
+                blk = bytearray(s.setups_block())
+                off = inventory.SETUP_ITEM_OFF + idx * inventory.INV_ENTRY_LEN
+                blk[off:off + 24] = rec
+                save = bytearray(4428)
+                save[0] = 1
+                save[8:8 + inventory.REPLY_0166_LEN] = blk
+                a = s.on_packet(packet.parse(packet.build(shop.MSG_SETUP_SAVE, bytes(save), 0x167)))
+                g = s.on_packet(packet.parse(packet.build(inventory.MSG_0165_REQ, bytes(16), 0x165)))
+                inv = s.on_packet(packet.parse(packet.build(inventory.MSG_0132_REQ, bytes(8), 0x132)))
+                body = inv[0][packet.HDR:] if inv else b""
+                n = struct.unpack_from("<I", body, 0)[0] if body else 0
+                listed = {struct.unpack_from("<Q", body, 8 + i * 24)[0] for i in range(n)}
+                served = g[0][packet.HDR + off:packet.HDR + off + 24] if g else b""
+                packed = (iid << 16) | kind
+                ok &= _c(f"2:{kind:#04x}", a and _msg(a[0]) == 1 and served == rec
+                         and struct.unpack_from("<Q", rec, 0)[0] in listed
+                         and packed >> 16 and (kind & 0x0F) in (1, 2)
+                         and (kind >> 4) >= 1)
+            # (3) sell the body: SE's sell price; an inflated figure is cut
+            iid, rec = bought[0x11]
+            row = tbl[(0x11, iid)]
+
+            def _sell(r, price):
+                b = bytearray(40)
+                struct.pack_into("<I", b, shop.S169_PRICE, price)
+                b[shop.S169_RECORD:shop.S169_RECORD + 24] = r
+                return s.on_packet(packet.parse(packet.build(shop.MSG_ITEM_SELL, bytes(b), 0x169)))
+            was = pilot["money"]
+            o = _sell(rec, row["sell"] * 3)
+            ok &= _c(3, o and _msg(o[0]) == 1 and pilot["money"] == was + row["sell"]
+                     and struct.unpack_from("<Q", rec, 0)[0]
+                     not in {it["serial"] for it in inventory.stored_items(pilot)}
+                     and shop.sale_price(5, 0x11, iid)[0] == 5
+                     and row["sell"] == row["buy"] * 3 // 4)
+            # (4) remodel Type 67C (body id 9: Lv45, max rank 5, caps 5/1/1/5)
+            r9 = tbl.get((0x11, 9))
+            p9 = {"id": 4, "first": "Mod", "last": "Test", "money": 10_000,
+                  "nation": 1, "nation_byte": 1, "cls": 1}
+            s9 = _sess(p9, "selftest-remodel")
+            ser9 = 0x6B000000000A0001
+            inventory.add_stored_item(p9, ser9, 9, 0x11, r9["buy"])
+            blk = bytearray(s9.setups_block())
+            blk[inventory.SETUP_ITEM_OFF + 24:inventory.SETUP_ITEM_OFF + 48] = \
+                inventory.item_record(ser9, 9, 0x11)
+            p9["setups"] = bytes(blk).hex()
+
+            def _mod(ranks, cost, serial=ser9, iid=9):
+                r = bytearray(inventory.item_record(serial, iid, 0x11))
+                r[0x0C:0x12] = bytes(ranks)
+                b = bytearray(40)
+                struct.pack_into("<I", b, shop.S169_PRICE, cost)
+                b[shop.S169_RECORD:shop.S169_RECORD + 24] = r
+                return s9.on_packet(packet.parse(packet.build(shop.MSG_ITEM_REMODEL, bytes(b), 0x17E))), bytes(r)
+            step = r9["buy"] * 25 // 100000
+            want = step * 2
+            o, newrec = _mod([2, 0, 0, 0, 0, 0], want)
+            stored = inventory.stored_item_records({"items": [it for it in inventory.stored_items(p9)
+                                                              if it["serial"] == ser9]})
+            sblk = bytes.fromhex(p9["setups"])
+            # the client's own 0x017F arm: mode 0 copies the pending record
+            body = o[0][packet.HDR:] if o else b""
+            ok &= _c(4, r9["max_rank"] == 5 and r9["caps"][:4] == (5, 1, 1, 5)
+                     and economy.remodel_cost(r9["buy"], (0,) * 6, (2, 0, 0, 0, 0, 0)) == want == 526
+                     and o and _msg(o[0]) == shop.MSG_ITEM_REMODEL_REPLY
+                     and len(body) == shop.REPLY_017F_LEN and body[0] == 0
+                     and p9["money"] == 10_000 - want
+                     and stored and stored[0][0x0C:0x12] == bytes([2, 0, 0, 0, 0, 0])
+                     and sblk[inventory.SETUP_ITEM_OFF + 24:inventory.SETUP_ITEM_OFF + 48] == newrec)
+            # lowering is free, raising again charges only the raise
+            o2, _ = _mod([1, 0, 0, 1, 0, 0], step)
+            ok &= _c("4b", o2 and _msg(o2[0]) == shop.MSG_ITEM_REMODEL_REPLY
+                     and p9["money"] == 10_000 - want - step)
+            m0 = p9["money"]
+            refused = [_mod([1, 2, 0, 1, 0, 0], step)[0],              # stat 1 cap is 1
+                       _mod([5, 0, 0, 1, 0, 0], step * 4)[0],          # total 6 > 5
+                       _mod([2, 0, 0, 1, 0, 0], step - 1)[0],          # under SE's cost
+                       _mod([2, 0, 0, 1, 0, 0], step, serial=0x77)[0],  # not owned
+                       _mod([2, 0, 0, 1, 0, 0], 10**9)[0]]             # wallet
+            ok &= _c("4c", all(x and _msg(x[0]) == 2 for x in refused) and p9["money"] == m0)
+            # (5) Battle Fee: the remodelled body is on setup 1 (ranks 1,0,0,1)
+            squadron.BATTLE_FEE_RATES = (25,) * 8
+            fee_want = r9["buy"] * 1 * 25 // 100000 + r9["buy"] * 1 * 25 // 100000
+            fee, _lines = economy.setup_battle_fee(bytes.fromhex(p9["setups"]), 1,
+                                                   squadron.BATTLE_FEE_RATES, p9)
+            m1 = p9["money"]
+            s9.in_arena = lambda: False
+            st = s9.settle_battle("selftest fee", won=False)
+            q = [x for x in (getattr(s9, "other_pushes", None) or ()) if x[0] == pushes.MSG_FEE_PUSH]
+            fb = q[-1][1] if q else b""
+            ok &= _c(5, fee == fee_want > 0 and st.get("battle_fee") == fee
+                     and p9["money"] == m1 + st["money"] - fee
+                     and len(fb) == pushes.S1A1_LEN
+                     and struct.unpack_from("<I", fb, pushes.S1A1_SORTIE_COST)[0] == fee
+                     and fb[pushes.S1A1_MOD_REFUSED] == 0
+                     and struct.unpack_from("<I", fb, pushes.S1A1_MONEY)[0] == p9["money"])
+            sa = _sess(p9, "selftest-fee-arena")
+            sa.in_arena = lambda: True
+            m2 = p9["money"]
+            ch, _now = sa.battle_fee_settle("selftest arena fee")
+            qa = [x for x in (getattr(sa, "other_pushes", None) or ()) if x[0] == pushes.MSG_FEE_PUSH]
+            ok &= _c("5b", ch == 0 and p9["money"] == m2 and qa
+                     and qa[-1][1][pushes.S1A1_MOD_REFUSED] == 1
+                     and economy.battle_fee_verdict(100, False, 5, 12)[1]
+                     and economy.battle_fee_verdict(100, False, 0, 12)[0] == 100)
+            # (6) the earned U.S.N. Tiran series sits at 0x019F +0x710 for a U.S.N. pilot
+            fl = partsstock.foreign_sale_list(2, earned={0x11: {176, 177}, 0x21: {51}})
+            blk6 = bytearray(squadron.INSIGNIA_LIST_LEN)
+            partsstock.put_foreign_sale_list(blk6, fl)
+            ok &= _c(6, fl == [(176, 0x11), (177, 0x11)]
+                     and struct.unpack_from("<I", blk6, 0x710)[0] == 2
+                     and struct.unpack_from("<HB", blk6, 0x714) == (176, 0x11)
+                     and squadron.INSIGNIA_ROW_OFF + squadron.INSIGNIA_MAX * 8 <= 0x710)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"  hangar economy: EXC {e!r}")
+            ok = False
+        finally:
+            flat_globals()["CHAR_STORE"] = _was[0]
+            (shop.ACQUIRE_KINDS, partsstock.PARTS_STOCK, squadron.BATTLE_FEE_RATES,
+             warstate.WAR) = _was[1:]
+    print(f"  hangar economy: all 18 kinds bought on the defaults and kept, every wanzer "
+          f"kind fitted/saved/served, sale at SE's 75%, remodel at SE's price/4000 per "
+          f"rank with refusals, Battle Fee debited once + 0x01A1, Arena waived, "
+          f"0x019F +0x710 list: {'OK' if ok else 'FAIL at ' + str(fails)}")
+    return ok
+
+
 def _change_room_pins():
     """CHANGE ROOM maps and casts (move.ROOM_MAPS, roomcast.py, 2026-10-06):
     Room = 121, Briefing 122 / 123 by nation, Room B / C = 124, Hangar 141;
@@ -3525,7 +3890,7 @@ def _change_room_pins():
     try:
         _ze.NATION_PER_CHARACTER = True
         _hq, _hq3, _oc, _oc4, _fz, _col = (_cast(z) for z in (100, 300, 200, 400, 509, 600))
-        _sg = (102, (-0.46, 0.0, 13.69, _fw(0)))
+        _sg = (102, (-6.34, 0.0, -18.29, _fw(0)))
         _d_ok = (_hq == ("room_hq", {0x82081022: (300, (5.42, 0.0, 1.56, _fw(270))),
                                      0x82081023: (302, (6.58, 0.0, 11.03, _fw(90))),
                                      0x82080800: _sg})
@@ -3563,7 +3928,8 @@ def _change_room_pins():
         _nc.NPC_LAYOUT.set_band("room_hq", 121, [{"key": 0x82081022, "x": 5.0, "y": 0.0,
                                                   "z": 1.0, "face": 270, "cat": 300}])
         _q100, _q200 = _cast(100), _cast(200)
-        _l_ok = (_p100 == ("room", {0x82080800: _sg}) and _p200 == _p100 and _p600 == _p100
+        _l_ok = (_p100 == ("room", {0x82080800: (102, (-0.46, 0.0, 13.69, _fw(0)))})
+                 and _p200 == _p100 and _p600 == _p100
                  and _q100 == ("room_hq", {0x82081022: (300, (5.0, 0.0, 1.0, _fw(270)))})
                  and _q200 == _p100)
         print(f"  an old plain 'room' layout band is still honoured; a zone band wins "
@@ -3714,7 +4080,12 @@ def _war_phase_pins():
         warstate.war_state = lambda: w
         p13 = partsstock.parse_parts_stock("0x13")
         partsstock.PARTS_STOCK = p13
+        # "owed" needs a shop that refuses parts: FMO_ACQUIRE_KINDS defaults
+        # to every kind since 2026-10-08, so narrow it for this one reading
+        _acq_was = shop.ACQUIRE_KINDS
+        shop.ACQUIRE_KINDS = shop.parse_acquire_kinds("0x13")
         st13, why = partsstock.victory_stock(OCU)
+        shop.ACQUIRE_KINDS = _acq_was
         partsstock.PARTS_STOCK = partsstock.parse_parts_stock("0x11,0x13")
         fw._now = lambda: ts(2026, 11, 6)           # the shop asks at "now"
         st11, _ = partsstock.victory_stock(OCU)
@@ -3821,6 +4192,11 @@ def selftest():
     flat_globals()["CHAR_STORE"] = os.path.join(
         tempfile.mkdtemp(prefix="fmo-selftest-"), "fmo_characters.json")
     charstore._db_ready[0] = False              # this database's own first use
+    # the event battle table is date-driven: run every pin with it empty, so
+    # a run in an event's window cannot change a keepalive's pushes (the
+    # event battle pins drive it with their own rows)
+    _ev_was = events.EVENT_BATTLES, events.MEDAL_SPEC, fmoarena.COI_SEASONS
+    events.EVENT_BATTLES, events.MEDAL_SPEC, fmoarena.COI_SEASONS = [], "0", []
     try:
         if fmodb is None:
             flat_globals()["FMO_DB"] = ""
@@ -3830,6 +4206,7 @@ def selftest():
                 flat_globals()["FMO_DB"] = ""
             return _selftest_run(url)
     finally:
+        events.EVENT_BATTLES, events.MEDAL_SPEC, fmoarena.COI_SEASONS = _ev_was
         flat_globals()["CHAR_STORE"] = _store_was
         flat_globals()["FMO_DB"] = _db_was[0]
         charstore._db_ready[0] = _db_was[1]
@@ -3939,8 +4316,11 @@ def _pvp_room_pins():
     ok = True
     T0 = 1_900_000_000.0
     _knobs = ("MATCHING", "JUDGE", "WAR", "PVP_WAIT", "PVP_SELECTORS", "OBJECTIVE_KIND",
-              "DEATH_WAIT", "NPC_VS_PILOTS")
+              "DEATH_WAIT", "NPC_VS_PILOTS", "CH_MAPS")
     _sv = {k: getattr(_pv, k) for k in _knobs}
+    # these pins are about the room, not its objective: Team Deathmatch on
+    # every map (the old FMO_PVP_CH_MAPS switch, set to none)
+    _pv.CH_MAPS = set()
     _sv_bs = dict(referee.BATTLE_STATE)
     _sv_mt = missionblock.MISSION_TIME
     _sv_ws = (warstate.war_state, warstate._war_tick, warstate.WAR)
@@ -4221,6 +4601,243 @@ def _pvp_room_pins():
         referee.BATTLE_STATE.update(_sv_bs)
         missionblock.MISSION_TIME = _sv_mt
         warstate.war_state, warstate._war_tick, warstate.WAR = _sv_ws
+    return ok
+
+
+def _pvp_capture_hold_pins():
+    """CAPTURE & HOLD (pvproom.py P4, static 2026-10-07), no client: the rect
+    and cmd 133 layouts, the block a Capture & Hold room serves (areas,
+    group, kind 3) and that a TDM room's block is unchanged, a capture that
+    stops when the captor moves or dies, the countdown, the owner every cmd
+    133 carries, the late joiner's cmd 148 rects, all three areas = the win,
+    and the time-limit rule. Every global it touches is restored."""
+    from . import pvproom as _pv
+    ok = True
+    T0 = 1_900_000_000.0
+    _knobs = ("MATCHING", "JUDGE", "WAR", "PVP_WAIT", "PVP_SELECTORS", "OBJECTIVE_KIND",
+              "DEATH_WAIT", "NPC_VS_PILOTS", "CH_MAPS", "CH_KIND", "CH_HOLD", "CH_HALF",
+              "CH_STILL", "CH_ZONE_ROWS")
+    _sv = {k: getattr(_pv, k) for k in _knobs}
+    _sv_bs = dict(referee.BATTLE_STATE)
+    _sv_mt = missionblock.MISSION_TIME
+    _sv_ws = (warstate.war_state, warstate._war_tick, warstate.WAR)
+    _sv_on = trade.session_for_account
+    _sv_pd = dict(battleend.PILOT_DEATHS)
+
+    class _Ch:
+        def __init__(self, acct, port, pos=None):
+            self.addr, self.account, self.key = ("198.51.100.9", port), acct, b"1234battle"
+            self.popped, self.pending, self.pos, self.pos_src = True, [], pos, "state"
+
+    def _recs(ch, cmd=None):
+        out = [(struct.unpack_from("<I", r, 4)[0], r[0x10:]) for r in ch.pending]
+        return [o for o in out if cmd is None or o[0] == cmd]
+
+    def _z133(body):
+        g, i, msg = struct.unpack_from("<III", body, 0)
+        return g, i, msg, body[0x0D]
+
+    class _Sess:
+        def __init__(self, acct):
+            self.account, self.peer, self.battle_end_done, self.ends = acct, acct, False, []
+
+        def battle_key(self):
+            return self.account
+
+        def battle_result_push(self, conn, occasion, won=None):
+            return None
+
+        def penalty_report_push(self, conn):
+            return None
+
+        def battle_end_push(self, conn, why="", won=None):
+            self.ends.append(won)
+            return b"014c"
+
+    class _War:
+        def __init__(self):
+            self.calls = []
+
+        def settle(self, tile, nation, won=True, pvp=False, now=None):
+            self.calls.append((tile, nation, won, pvp))
+            return {"nation": nation, "control": 50}, "pinned"
+
+    try:
+        _pv.MATCHING = _pv.JUDGE = _pv.WAR = True
+        _pv.PVP_WAIT, _pv.PVP_SELECTORS, _pv.OBJECTIVE_KIND = 1200, {505, 509, 513}, 5
+        _pv.DEATH_WAIT, _pv.NPC_VS_PILOTS = 300, False
+        _pv.CH_MAPS, _pv.CH_KIND, _pv.CH_HOLD, _pv.CH_HALF, _pv.CH_STILL = {418}, 3, 20, 40, 12
+        _pv.CH_ZONE_ROWS = {418: [(0.0, 30.0, 0.0), (500.0, 30.0, 0.0), (1000.0, 30.0, 0.0)]}
+        missionblock.MISSION_TIME = 1800
+        trade.session_for_account = lambda a: (object() if str(a).startswith("ch:")
+                                               else _sv_on(a))
+        _pv.reset()
+
+        # --- the layouts, pure: rect = id, owner, flags, type, f32 MIN, f32 MAX
+        # (0x61054A22 tests min <= pos <= max); cmd 133 = group, index, the
+        # D24 line, flag, owner, unit; the lines A..E
+        _rr = missionblock.rect_record(10, (-40, 22, -40), (40, 46, 40), 2)
+        _zs = fmoworld.record_zone_state(1, 2, 1, fmoworld.zone_msg("done", 2))
+        _lay = (_rr[:4] == bytes([10, 2, 2, 0])
+                and struct.unpack_from("<6f", _rr, 4) == (-40, 22, -40, 40, 46, 40)
+                and struct.unpack_from("<IIII", _zs, 0)[:2] == (0x10 + 0x14, 133)
+                and _z133(_zs[0x10:]) == (1, 2, (11 << 16) | 47, 1)
+                and fmoworld.zone_msg("start", 0) == 0xB0000
+                and fmoworld.zone_msg("count", 1, 15) == (11 << 16) | 14
+                and missionblock.MB_RECT_MAX == 32 and missionblock.MB_RECTGROUP_MAX == 10
+                and _pv.parse_ch_maps("") == set() and _pv.parse_ch_maps("all") == "all"
+                and _pv.parse_ch_maps("471, 418") == {471, 418})
+        print(f"  capture&hold: rect = id/owner/flags/type + f32 min/max, cmd 133 = "
+              f"group/index/D24 line/flag/owner (0x14 B), the D24 line numbers: "
+              f"{'OK' if _lay else 'FAIL'}")
+        ok &= _lay
+
+        # --- the block: map 418 (FMO_PVP_CH_MAPS) is served three areas, one
+        # owned group and kind 3; map 471 stays Team Deathmatch, byte for byte
+        _role, _plan = _pv.peek(509, 418, T0)
+        _kn = _pv.block_knobs(_role, _plan)
+        _b = sortie.reply_013a(mapno="418", ep_enable=False, start_time=0, **_kn)
+        _bb = sortie.R13A_BLOCK
+        _u = lambda o: struct.unpack_from("<I", _b, _bb + o)[0]
+        _r0 = _b[_bb + missionblock.MB_RECTDATA:_bb + missionblock.MB_RECTDATA + 28]
+        _r2 = _b[_bb + missionblock.MB_RECTDATA + 56:_bb + missionblock.MB_RECTDATA + 84]
+        _g0 = _b[_bb + missionblock.MB_RECTGROUP:_bb + missionblock.MB_RECTGROUP + 2]
+        _tr, _tp = _pv.peek(509, 471, T0)
+        _t471 = sortie.reply_013a(mapno="471", ep_enable=False, start_time=0,
+                                  **_pv.block_knobs(_tr, _tp))
+        _pv.CH_MAPS = set()
+        _t471_off = sortie.reply_013a(mapno="471", ep_enable=False, start_time=0,
+                                      **_pv.block_knobs(*_pv.peek(509, 471, T0)))
+        _pv.CH_MAPS = {418}
+        _blk = (_role == "create" and _plan["mode"] == "ch" and _tp["mode"] == "tdm"
+                and _u(missionblock.MB_OBJECTIVE_KIND) == 3
+                and _u(missionblock.MB_RECTGROUPCNT) == 1 and _g0 == bytes([1, 5])
+                and _u(missionblock.MB_RECTDATACNT) == 3
+                and _r0[:4] == bytes([10, 0, 2, 0]) and _r2[0] == 12
+                and struct.unpack_from("<6f", _r0, 4) == (-40, 22, -40, 40, 46, 40)
+                and _t471 == _t471_off)
+        print(f"  capture&hold: a room on a FMO_PVP_CH_MAPS map is served +0x50 = 3, "
+              f"one group (id 1, type 5) and three neutral drawn areas (ids 10..12 = "
+              f"A..C); any other map's block is unchanged: {'OK' if _blk else 'FAIL'}")
+        ok &= _blk
+
+        # --- a capture: O.C.U. 'ch:al' and U.S.N. 'ch:bo' on map 418
+        _pv.join("ch:al", "ch:al", 509, 418, 94101, 1, T0)
+        _pv.join("ch:bo", "ch:bo", 509, 418, 94101, 2, T0 + 5)
+        al, bo = _Ch("ch:al", 6001, (5.0, 31.0, 5.0)), _Ch("ch:bo", 6002, (700.0, 31.0, 0.0))
+        _pv.tick_chan(al, al.addr, T0 + 6)
+        _pv.tick_chan(bo, bo.addr, T0 + 10)          # the hostile pop starts the room
+        _room = _pv.room_of("ch:al")
+        al.pending.clear()
+        _pv.tick_chan(al, al.addr, T0 + 11)          # al is inside A -> capture starts
+        _s = [_z133(b) for _c, b in _recs(al, 133)]
+        bo.pos = (5.0, 31.0, 0.0)                    # bo walks into A: cannot start one
+        _pv.tick_chan(bo, bo.addr, T0 + 12)
+        _pv.tick_chan(al, al.addr, T0 + 16)          # 15 s left
+        _c = [_z133(b) for _c, b in _recs(al, 133)]
+        _cap = _room["ch"]["zones"][0]["cap"] or {}
+        _start = (_s == [(1, 0, 0xB0000, 0)] and _cap.get("who") == "ch:al"
+                  and _c[-1] == (1, 0, (11 << 16) | 6, 0)
+                  and _room["ch"]["zones"][0]["owner"] == 0)
+        al.pos = (25.0, 31.0, 5.0)                   # moved 20 > FMO_PVP_CH_STILL 12
+        _pv.tick_chan(al, al.addr, T0 + 17)
+        _stopped = _room["ch"]["zones"][0]["cap"] is None
+        bo.pos = (700.0, 31.0, 0.0)
+        al.pending.clear()
+        _pv.tick_chan(al, al.addr, T0 + 18)          # restarts where it now stands
+        _pv.tick_chan(al, al.addr, T0 + 38)          # 20 s still -> taken
+        _t = [_z133(b) for _c, b in _recs(al, 133)]
+        _taken = (_t[0][2] == 0xB0000 and _t[-1] == (1, 0, (11 << 16) | 45, 1)
+                  and _room["ch"]["zones"][0]["owner"] == 1)
+        print(f"  capture&hold: a pilot inside area A starts the capture (\"A started\" "
+              f"to everyone), an enemy inside cannot start a second one, the countdown "
+              f"follows; moving off the spot stops it; 20 s still takes A (owner 1 + "
+              f"\"A captured\"): {'OK' if _start and _stopped and _taken else 'FAIL'}")
+        ok &= _start and _stopped and _taken
+
+        # --- bo takes B back from nobody, then dies inside C: stopped; every
+        # cmd 133 carries its area's owner (A's never goes back to 0)
+        bo.pos = (500.0, 31.0, 10.0)
+        _pv.tick_chan(bo, bo.addr, T0 + 40)
+        _pv.tick_chan(bo, bo.addr, T0 + 60)
+        bo.pos = (1000.0, 31.0, 0.0)
+        _pv.tick_chan(bo, bo.addr, T0 + 61)
+        battleend.PILOT_DEATHS["ch:bo"] = T0 + 62
+        _pv.tick_chan(al, al.addr, T0 + 63)
+        _owners = [z["owner"] for z in _room["ch"]["zones"]]
+        _all133 = [_z133(b) for _c, b in _recs(bo, 133)]
+        _st, _owner_ok = [0, 0, 0], bool(_all133)
+        for _g, _i, _m, _o in _all133:
+            if _m & 0xFFFF == 45 + _i:
+                _st[_i] = _o
+            _owner_ok &= _o == _st[_i]
+        _owner_ok &= _st == [1, 2, 0]
+        _dead = (_owners == [1, 2, 0] and _room["ch"]["zones"][2]["cap"] is None
+                 and _room["verdict"] is None)
+        print(f"  capture&hold: U.S.N. takes B; its captor DESTROYED inside C stops "
+              f"that capture; every cmd 133 carries its area's current owner: "
+              f"{'OK' if _dead and _owner_ok else 'FAIL'}")
+        ok &= _dead and _owner_ok
+
+        # --- the late joiner's cmd 148 carries each area's id/owner/flags
+        del battleend.PILOT_DEATHS["ch:bo"]
+        _lr, _lroom = _pv.peek(509, 418, T0 + 70)
+        _lk = _pv.block_knobs(_lr, _lroom)
+        _pv.join("ch:cy", "ch:cy", 509, 418, 94101, 2, T0 + 70)
+        cy = _Ch("ch:cy", 6003, (-500.0, 31.0, -500.0))
+        _pv.tick_chan(cy, cy.addr, T0 + 71)
+        _r148 = _recs(cy, 148)
+        _late = (_lr == "late" and [r[1] for r in _lk["rects"]] == [1, 2, 0]
+                 and len(_r148) == 1
+                 and _r148[0][1][8:20] == bytes([10, 1, 2, 0, 11, 2, 2, 0, 12, 0, 2, 0]))
+        print(f"  capture&hold: a late joiner's block and cmd 148 carry the areas' "
+              f"owners (A O.C.U., B U.S.N., C nobody): {'OK' if _late else 'FAIL'}")
+        ok &= _late
+
+        # --- all three: al takes B and C -> O.C.U. wins; the war settles once
+        _ws = _War()
+        warstate.war_state, warstate._war_tick, warstate.WAR = (lambda: _ws), (lambda st: None), "1"
+        bo.pos = cy.pos = (-500.0, 31.0, -500.0)
+        _pv.tick_chan(bo, bo.addr, T0 + 72)        # bo walks out of C
+        for _x, _t0 in ((500.0, 80), (1000.0, 110)):
+            al.pos = (_x, 31.0, 0.0)
+            _pv.tick_chan(al, al.addr, T0 + _t0)
+            _pv.tick_chan(al, al.addr, T0 + _t0 + 21)
+        _v = _room.get("verdict") or {}
+        _as, _bs = _Sess("ch:al"), _Sess("ch:bo")
+        _pv.end_due(_as, 1, T0 + 140, lambda a: True, {})
+        _pv.end_due(_bs, 1, T0 + 141, lambda a: True, {})
+        _win = (_v.get("winner") == 1 and "all 3 areas" in _v.get("why", "")
+                and _as.ends == [True] and _bs.ends == [False]
+                and _ws.calls == [(94101, 1, True, True), (94101, 2, False, True)])
+        print(f"  capture&hold: the nation holding all three areas wins at once; each "
+              f"pilot's 0x014C follows the room, the war settles once (PvP): "
+              f"{'OK' if _win else 'FAIL'}")
+        ok &= _win
+
+        # --- the time limit (OUR rule): more areas wins; a tie goes to the
+        # units-standing rule; and the twin: a TDM room never reads areas
+        _fake = {"started": T0, "ch": {"zones": [{"owner": 1}, {"owner": 1}, {"owner": 2}]}}
+        _tie = {"started": T0, "ch": {"zones": [{"owner": 1}, {"owner": 2}, {"owner": 0}]}}
+        _tv = (_pv.ch_time_verdict(_fake, {1: 1, 2: 3}, {1, 2}, T0 + 1800, 1800)[0] == 1
+               and _pv.ch_time_verdict(_tie, {1: 1, 2: 3}, {1, 2}, T0 + 1800, 1800)[0] == 2
+               and _pv.ch_time_verdict(_tie, {1: 2, 2: 2}, {1, 2}, T0 + 1800, 1800)[0] == 0
+               and _pv.ch_tick({"mode": "tdm", "started": T0, "verdict": None}) == [])
+        print(f"  capture&hold: at the time limit more areas held wins, a tie falls to "
+              f"the units standing (then a draw); a TDM room is never run as areas: "
+              f"{'OK' if _tv else 'FAIL'}")
+        ok &= _tv
+    finally:
+        for k, v in _sv.items():
+            setattr(_pv, k, v)
+        _pv.reset()
+        referee.BATTLE_STATE.clear()
+        referee.BATTLE_STATE.update(_sv_bs)
+        missionblock.MISSION_TIME = _sv_mt
+        warstate.war_state, warstate._war_tick, warstate.WAR = _sv_ws
+        trade.session_for_account = _sv_on
+        battleend.PILOT_DEATHS.clear()
+        battleend.PILOT_DEATHS.update(_sv_pd)
     return ok
 
 
@@ -4655,6 +5272,10 @@ def _selftest_run(test_db):
          "pre": None, "own": 169, "pre_byte": None}], 2: []}
     # 2026-09-30: the level test is the PILOT level (class 12 exp), not rank
     _pr_ok = bool(fmostore) and bool(classes.CLASS_CURVE)
+    # the older frontier rule (byte 0 missions complete too) is a test lever
+    # since 2026-10-08 (FMO_PROGRESS_NEED_ACCEPT); these pins drive it
+    _na_was = progress.PROGRESS_NEED_ACCEPT
+    progress.PROGRESS_NEED_ACCEPT = False
     if fmostore and classes.CLASS_CURVE:
         _c = {"nation_byte": 1, "rank": 24,
               "flags": fmostore.flags_hex(byte_values={128: 99, 135: 99})}
@@ -4672,8 +5293,10 @@ def _selftest_run(test_db):
         _m, _what, _ra = progress.advance_progress(_ct, _tbl, tile=50003, tiles=_tiles)
         _pr_ok &= _m is None and "no open mission" in _what and _ct["flags"] == _c["flags"]
         _m, _what, _ra = progress.advance_progress(_ct, _tbl, tile=50001, tiles=_tiles)
+        # FMO_PROGRESS_LEVEL_FOLLOW is off by default since 2026-10-08 (retail
+        # raised the Pilot level by battle exp only): the level stays 24
         _pr_ok &= bool(_m) and _m["title"] == "Defend Sakata Industry" \
-            and progress.pilot_level(_ct) == 29
+            and progress.pilot_level(_ct) == (29 if progress.PROGRESS_LEVEL_FOLLOW else 24)
         _pr_ok &= progress.progress_done(_c, _tbl) >= {
             "Enemy Prototype Weapon Sighted", "Enemy Heavy Combat Helicopter Incursion",
             "Guide the Special EMP Carrier", "Enemy Unit Annihilation"}
@@ -4684,13 +5307,19 @@ def _selftest_run(test_db):
         _pr_ok &= sorted(_f0) == ["Defend Sakata Industry", "Lure the Large Mobile Weapon"]
         _m, _what, _ra = progress.advance_progress(_c, _tbl)
         _pr_ok &= _m is None and _what.startswith("ambiguous")
-        # close Lure by hand, then the loop must run: Sakata done, rank 29
+        # close Lure by hand, then the loop must run: Sakata done, Pilot level
+        # 29; the rank stays (FMO_PROGRESS_RANK_FOLLOW is off by default since
+        # 2026-10-08: SE promoted by contribution only)
         fmostore.set_flag_byte(_c, 169, 99)
         _m, _what, _ra = progress.advance_progress(_c, _tbl)
         _fl = fmostore.flags_bytes(_c["flags"])
         _pr_ok &= (_m and _m["title"] == "Defend Sakata Industry"
-                   and _fl[173] == 99 and _ra == 29 and _c["rank"] == 29
-                   and progress.pilot_level(_c) == 29)
+                   and _fl[173] == 99 and _ra is None and _c["rank"] == 24
+                   and progress.pilot_level(_c) == (29 if progress.PROGRESS_LEVEL_FOLLOW else 24))
+        # the induction test (Lv29) opens once BATTLE exp brings the pilot there
+        _pr_ok &= [m["title"] for m in progress.progress_frontier(_c, _tbl)] == \
+            (["Special Mobile Force Induction Test"] if progress.PROGRESS_LEVEL_FOLLOW else [])
+        progress.set_pilot_level(_c, 29)
         _pr_ok &= [m["title"] for m in progress.progress_frontier(_c, _tbl)] == \
             ["Special Mobile Force Induction Test"]
         # a default pilot (rank 21, only 128=99) has exactly the campaign's
@@ -4701,6 +5330,7 @@ def _selftest_run(test_db):
         progress.set_pilot_level(_d, 21)
         _pr_ok &= [m["title"] for m in progress.progress_frontier(_d, _tbl)] == \
             ["Enemy Unit Annihilation"]
+    progress.PROGRESS_NEED_ACCEPT = _na_was
     print(f"  progression frontier/advance by Pilot level (Sakata -> induction, "
           f"ambiguity refuses, the sortie's tile picks the mission): "
           f"{'OK' if _pr_ok else 'FAIL'}")
@@ -6468,6 +7098,59 @@ def _selftest_run(test_db):
     print(f"  a PS2 0x0321 is answered with 0x0322, {handshake.CRED_REPLY_LEN}B, "
           f"endpoint 1 at +0x{addressing.EP1_OFF:02X}  {'OK' if ps2_ok else 'FAIL'}")
     ok &= ps2_ok
+
+    # THE CREDENTIAL BLOB (2026-10-08). The first 52 bytes of 0x0321 decode to
+    # a hash the core filed on this login's 4:5, naming the member without the
+    # address. Filed -> adopted on the login connection (PS2 and PC forms);
+    # unfiled or garbage -> the old address path, which with no account
+    # database here is addr:<ip>. And the per-address table is the last
+    # fallback: a connection that adopted its own account never reads it,
+    # even after another login from the same address overwrote the entry.
+    from .deps import contentauth
+    if contentauth is not None and hasattr(contentauth, "blob_for_selftest"):
+        from polcore import kv as _kv
+        _kv.reset(_kv.MemoryKV(prefix="fmotest:"))
+        try:
+            _h = contentauth.hash_for(b"\0" * 16, 0x68E6A5B8, b"\0" * 8)
+            _filed = contentauth.blob_for_selftest(_h)
+            _unfiled = contentauth.blob_for_selftest(b"\x5a" * 16)
+            contentauth.file_hashes([_h], 7, "uFMO7", 4, "203.0.113.7")
+
+            def _login(peer, payload):
+                _s = session.Session(peer)
+                _s.on_packet(packet.parse(packet.build(handshake.MSG_VERSION, bytes(40), 0x1001)))
+                _s.on_packet(packet.parse(packet.build(handshake.MSG_CREDENTIALS, payload, 0x1002)))
+                return _s
+            _sa = _login("203.0.113.7:50001", _filed)                    # PS2 form
+            _sb = _login("203.0.113.7:50002", _filed + b"\xAA" * 28)     # PC form, same blob
+            _sc = _login("203.0.113.8:50003", _unfiled)
+            _sd = _login("203.0.113.9:50004", b"\xff" * 52)
+            _blob_ok = (_sa._account == "member:7" and _sb._account == "member:7"
+                        and _sa.account == "member:7")
+            # the old path adopts nothing on the login connection; the account
+            # is read back through account_for (the per-address carry)
+            _twins_ok = (_sc._account is None and _sd._account is None
+                         and _sc.account == "addr:203.0.113.8"
+                         and _sd.account == "addr:203.0.113.9")
+            identity.remember_identity("203.0.113.7", "member:99")
+            _own_first = (_sa.account == "member:7" and _sb.account == "member:7"
+                          and identity.account_for("203.0.113.7") == "member:99")
+        finally:
+            _kv.reset()
+            with identity._store_lock:
+                for _ip in ("203.0.113.7", "203.0.113.8", "203.0.113.9"):
+                    identity._identity_by_ip.pop(_ip, None)
+        print(f"  credential blob: a filed blob names member 7 on the PS2 and PC "
+              f"forms and the connection adopts it: {'OK' if _blob_ok else 'FAIL'}; "
+              f"unfiled and garbage blobs fall back to the address path: "
+              f"{'OK' if _twins_ok else 'FAIL ' + repr((_sc.account, _sd.account))}; "
+              f"the per-address table is read only by a connection that proved "
+              f"nothing: {'OK' if _own_first else 'FAIL'}")
+        ok &= _blob_ok and _twins_ok and _own_first
+    else:
+        print("  credential blob: contentauth (or its blob builder) not importable "
+              "here - the blob twins did NOT run")
+        ok = False
 
     # THE CONSOLE'S MAP SET. A PS2 session must not be handed the PC's MapNo:
     # 102 rendered as an empty void on the console 2026-09-09 (entities drew,
@@ -8742,16 +9425,21 @@ def _selftest_run(test_db):
           f"({len(pblk)}B), which is what 0x6117EC6D mallocs: "
           f"{'OK' if plen else 'FAIL'}")
     ok &= plen
-    # Default OFF, and a bad spec must be refused rather than served as "".
-    poff = (partsstock.PARTS_STOCK is None and partsstock.parts_stock_push(0) is None
-            if not partsstock.PARTS_STOCK_SPEC else True)
+    # Default EVERY KIND (2026-10-08: the client applies SE's level, nation and
+    # tier rules itself), and a bad spec must be refused rather than served as "".
+    _all = partsstock.parse_parts_stock("all")
+    poff = (set(_all) == set(partsstock.PART_TABLE_COUNT)
+            and all(len(_all[k]) == n for k, n in partsstock.PART_TABLE_COUNT.items())
+            and (partsstock.PARTS_STOCK == _all
+                 if os.environ.get("FMO_PARTS_STOCK", "").strip() in ("", "all") else True)
+            and partsstock.parse_parts_stock("") is None)
     pbad = 0
     for _spec in ("0x99", "0x11:0", "0x11:9999", "nonsense", "0x11:1-x"):
         try:
             partsstock.parse_parts_stock(_spec)
         except ValueError:
             pbad += 1
-    print(f"  0x016A: FMO_PARTS_STOCK defaults OFF (no push) and refuses a "
+    print(f"  0x016A: FMO_PARTS_STOCK defaults to every kind's whole table and refuses a "
           f"bad kind/id ({pbad}/5): {'OK' if poff and pbad == 5 else 'FAIL'}")
     ok &= poff and pbad == 5
     # THE PHASE VICTORY REWARD (guide/phase, topics060306): the winner's shop
@@ -9075,7 +9763,10 @@ def _selftest_run(test_db):
         # A 255 ("any") row must go out carrying the PLAYER's nation, because
         # 0x611BE344 compares for EQUALITY against byte[lobby+0x8B4]. Serving
         # 255 there would make the client skip every shared insignia.
-        _any = [i for i, f, _e in squadron.INSIGNIA if f == 255]
+        # (the commemorative service medal's two 255 rows are kept out: SE
+        # did not allow it as a squadron insignia, events.py)
+        _any = [i for i, f, _e in squadron.INSIGNIA if f == 255
+                and i not in events.MEDAL_IDS.values()]
         _o1, _o2 = squadron.insignia_for(1), squadron.insignia_for(2)
         _in_nat = (all(i in {x for x, _n in _o1} for i in _any)
                    and all(i in {x for x, _n in _o2} for i in _any)
@@ -9303,11 +9994,14 @@ def _selftest_run(test_db):
     # WARNING: FMO_ZONE_CONTROL rides the SAME poll, so every frame count here is
     # the city expectation plus that push when it is armed.
     _zextra = 1 if zonecontrol.ZONE_CONTROL else 0
+    # and the 0x01AC poll also carries the 0x016A shop stock (FMO_PARTS_STOCK,
+    # every kind by default); a Move grant does not
+    _sextra = 1 if partsstock.PARTS_STOCK else 0
     if not citytable.city_rows():
         cpush_off = citytable.city_table_push(1) is None
         s2 = session.Session("selftest:0")
         outs = s2.on_packet(packet.parse(packet.build(0x01AC, bytes(4), seq=0x99, conn_id=1)))
-        cgen = len(outs) == 1 + _zextra
+        cgen = len(outs) == 1 + _zextra + _sextra
         print(f"  city: no city rows (FMO_CITY_TABLE empty and FMO_WAR=0) -- no "
               f"push, 0x01AC is one frame{' + the zone push' if _zextra else ''}: "
               f"{'OK' if cpush_off and cgen else 'FAIL'}")
@@ -9317,7 +10011,7 @@ def _selftest_run(test_db):
         outs = [packet.parse(o) for o in
                 s2.on_packet(packet.parse(packet.build(0x01AC, bytes(4), seq=0x99,
                                                        conn_id=1)))]
-        con = (len(outs) == 2 + _zextra
+        con = (len(outs) == 2 + _zextra + _sextra
                and outs[0]["msg"] == lobapi.LOBAPI[0x01AC][0]
                and outs[1]["msg"] == citytable.MSG_CITY_TABLE
                and outs[1]["seq"] == pushes.QUEUE_SEQ
@@ -9594,8 +10288,16 @@ def _selftest_run(test_db):
             # ...but NOT the training sortie itself: the sergeant's 0xE30A sends
             # 0x0139 with create 3 (2 = retraining) right after 104 [128]
             # (0x8074 0x627e), and refusing it locked every new pilot out
+            # (2026-10-08) once the sergeant has SENT the pilot: byte 128 == 1.
+            # On 0 the registration training is refused too (training.
+            # registration_refusal), so a client cannot skip the sergeant.
             _tq = bytearray(sortie.REQ_0139_LEN)
             struct.pack_into("<I", _tq, sortie.Q139_CREATE, penalty.CREATE_TRAINING)
+            _rt0 = [packet.parse(o) for o in s7g.on_packet(packet.parse(packet.build(
+                sortie.MSG_SORTIE_REQ, bytes(_tq), seq=0x5169, conn_id=1)))]
+            _gate_ok = _gate_ok and _rt0 and _rt0[0]["msg"] == charselect.MSG_FAIL
+            if _gpc is not None and fmostore is not None:
+                fmostore.set_flag_byte(_gpc, 128, 1)
             _rt = [packet.parse(o) for o in s7g.on_packet(packet.parse(packet.build(
                 sortie.MSG_SORTIE_REQ, bytes(_tq), seq=0x5168, conn_id=1)))]
             _gate_ok = (_gate_ok and not s7g.pilot_trained()
@@ -9604,7 +10306,8 @@ def _selftest_run(test_db):
                 fmostore.set_flag_byte(_gpc, 128, 99)
                 _gate_ok = _gate_ok and s7g.pilot_trained()
             print(f"  training gate: untrained pilot's 0x0139 -> message 2, its "
-                  f"training sortie (create 3) passes; byte 128 = 99 opens it: "
+                  f"training sortie (create 3) is refused on byte 128 = 0 and "
+                  f"passes on 1; byte 128 = 99 opens it: "
                   f"{'OK' if _gate_ok else 'FAIL'}")
             ok &= _gate_ok
             s7c = session.Session("selftest:0")
@@ -9973,10 +10676,10 @@ def _selftest_run(test_db):
     # ------------------------------------------------------------------ #
     # THE ITEM COUNTER -- 0x0169 / 0x017E (static 2026-09-09).
     # ------------------------------------------------------------------ #
-    # The asymmetry is the whole point and it is what gets pinned: the SELL
-    # price is on the wire, the BUY price is not, so a sale can be paid for
-    # correctly and a purchase cannot be charged for at all. If a later change
-    # makes these two symmetrical, this check should fail.
+    # RETRACTED 2026-10-08: "the BUY price is not on the wire". 0x017E is the
+    # REMODEL and its cost IS at payload+0x0C (0x611793F8); shop.py has the
+    # reading and _hangar_economy_pins drives it. Pinned here: the record
+    # decodes at the sender's offsets, sell/discard take message 1.
     def _item_body(mode, price, iid=1234, kind=7, serial=0xAABBCCDDEEFF0011):
         b = bytearray(40)
         struct.pack_into("<I", b, shop.S169_PRICE, price)
@@ -10001,15 +10704,15 @@ def _selftest_run(test_db):
         and _sell and _sell[0]["msg"] == handshake.MSG_SESSION_START
         and _sell[0]["seq"] == 0x777 and _sell[0]["payload"] == b""
         and _disc and _disc[0]["msg"] == handshake.MSG_SESSION_START
-        # WARNING: BUY IS REFUSED, and refused with an id that is NOT 0x017F --
-        # the debit lives inside the 0x017F-matched path, so this is what
-        # keeps money from moving.
-        and len(_buy) == 1 and _buy[0]["msg"] != shop.MSG_ITEM_BUY_REPLY
+        # 0x017E is the REMODEL (2026-10-08, shop.py): a record this pilot
+        # does not own is refused with an id that is NOT 0x017F -- the
+        # client's own debit lives inside the 0x017F-matched path
+        and len(_buy) == 1 and _buy[0]["msg"] != shop.MSG_ITEM_REMODEL_REPLY
         and _buy[0]["msg"] == 2 and _buy[0]["seq"] == 0x777
-        and shop.ANSWER_017E == "fail")
+        and shop.ANSWER_017E == "1")
     print(f"  item counter: sell/discard accepted with message "
-          f"{handshake.MSG_SESSION_START}, BUY refused with an id that is NOT "
-          f"0x{shop.MSG_ITEM_BUY_REPLY:04X} (the debit is inside that path): "
+          f"{handshake.MSG_SESSION_START}, a remodel of an item not owned refused "
+          f"with an id that is NOT 0x{shop.MSG_ITEM_REMODEL_REPLY:04X} (the debit is inside that path): "
           f"{'OK' if _it_ok else 'FAIL'}")
     ok &= _it_ok
 
@@ -10316,7 +11019,7 @@ def _selftest_run(test_db):
         print(f"  platoon auto-disband: 2 battles, do not continue -> +0x0F4 after "
               f"battle 1, group gone after battle 2: {'OK' if _ad_ok else 'FAIL'}")
         ok &= _ad_ok
-        # (5) PLATOON EXP: +10% per extra member (ours) on a win, every row
+        # (5) PLATOON EXP: SE's chart (x1.3 at ten, ours between) on a win, every row
         # scaled alike (the Pilot row stays its share of the job exp), +0x0F2
         # filled through a real settlement.
         _px = battleend.platoon_exp_rows([(3, 1000), (12, 1000)], 120)
@@ -10334,14 +11037,17 @@ def _selftest_run(test_db):
         _ps.commit = lambda what: None
         _pm, _prw = _ps.platoon_battle_settle(True, 0, [(3, 1000), (12, 1000)], {"kill_bonus_hs": 0})
         _pbody = battleend.battle_end_body(**_ps.platoon_end)
-        _px_ok = (battlegroups.platoon_exp_pct(1) == 100 and battlegroups.platoon_exp_pct(3) == 120
-                  and battlegroups.platoon_exp_pct(10) == 150
+        # SE's chart (BOOT CAMP Lesson 4): 1.0 alone, ~1.3 for ten -> +30% over 9
+        _px_ok = (battlegroups.platoon_exp_pct(1) == 100 and battlegroups.platoon_exp_pct(3) == 106
+                  and battlegroups.platoon_exp_pct(10) == 130
+                  and battlegroups.platoon_exp_pct(12) == 130
+                  and battlegroups.platoon_exp_pct(3, per=10) == 120
                   and battlegroups.platoon_exp_pct(3, per=0) == 100
                   and _px == [(3, 1200), (12, 1200)]
-                  and _prw == [(3, 1200), (12, 1200)] and _pm == 0
-                  and struct.unpack_from("<h", _pbody, battleend.S14C_PLATOON_PCT)[0] == 120)
-        print(f"  platoon exp: 3 members -> 120% on the job AND Pilot rows, +0x0F2 = "
-              f"120 (8:45): {'OK' if _px_ok else 'FAIL'}")
+                  and _prw == [(3, 1060), (12, 1060)] and _pm == 0
+                  and struct.unpack_from("<h", _pbody, battleend.S14C_PLATOON_PCT)[0] == 106)
+        print(f"  platoon exp: 3 members -> 106% (SE's chart: ten pilots x1.3) on the job "
+              f"AND Pilot rows, +0x0F2 = 106 (8:45): {'OK' if _px_ok else 'FAIL'}")
         ok &= _px_ok
         # (6) JOIN TIMING: 5-minute window, 10 a side, 120% -> 50% for the late
         # side, 100% for the creating side, the 20-minute wait for an opponent.
@@ -10492,6 +11198,10 @@ def _selftest_run(test_db):
     try:
         lobbymessage.ANNOUNCE = "Welcome to Huffman."
         s14b = session.Session("selftest:0")
+        # an earlier pin's battle on this host must not make the keepalive
+        # answer with a 0x0199 (FMO_TIME_SYNC answers only during a battle)
+        referee.BATTLE_STATE.pop(s14b.battle_key(), None)
+        s14b.events_announced = True      # a December run must not add one
         _ka = packet.parse(packet.build(charselect.MSG_KEEPALIVE, struct.pack("<II", 0, 1),
                                         seq=pushes.QUEUE_SEQ, conn_id=1))
         _o1 = [packet.parse(o) for o in s14b.on_packet(_ka)]
@@ -10516,6 +11226,10 @@ def _selftest_run(test_db):
     # this must never reach a real character store.
     if gatetool.fmogates is not None:
         sg = session.Session("selftest:gates")
+        # an earlier pin's battle on this host must not make the keepalive
+        # answer with a 0x0199 (FMO_TIME_SYNC answers only during a battle)
+        referee.BATTLE_STATE.pop(sg.battle_key(), None)
+        sg.events_announced = True      # a December run must not add one
         sg._account = "selftest:gates"
         sg._roster = [{"id": 7, "first": "Gate", "last": "Test", "rank": 24, "flags": "",
                        "gender": 1, "nation_byte": 1}]
@@ -10895,20 +11609,24 @@ def _selftest_run(test_db):
     # class 1 (Arco, body id 1); Remy-shaped (raw +0x28 = 2) U.S.N. (Husky, 51).
     _save_ld = flat_globals().get("load_roster")
     try:
-        _molly = {"id": 1, "first": "Molly", "last": "Test", "nation": 2,
+        _patty = {"id": 1, "first": "Molly", "last": "Test", "nation": 2,
                   "sex": 1, "gender": 2, "nation_byte": 1, "cls": 1}
         _praw = bytearray(0x50)
         _praw[0x26], _praw[0x28], _praw[0x39] = 1, 2, 1
         _paul = {"id": 1, "first": "Remy", "last": "Test", "nation": 1,
                  "sex": 2, "cls": 1, "raw": bytes(_praw).hex()}
-        _pl_nat = (popnation.character_nation(_molly)[0], popnation.character_nation(_paul)[0])
+        _pl_nat = (popnation.character_nation(_patty)[0], popnation.character_nation(_paul)[0])
         _nat_ok = (_pl_nat == (1, 2)
                    and popnation.character_nation({"id": 1, "raw_0177": "00" * 56})[0]
                    is None and popnation.character_nation({})[0] is None)
         _ids = []
-        for _rec in (_molly, _paul):
+        for _rec in (_patty, _paul):
             flat_globals()["load_roster"] = lambda a, _r=_rec: [_r]
-            _o = [packet.parse(o) for o in session.Session("selftest:0").on_packet(packet.parse(
+            _s0165 = session.Session("selftest:0")
+            # parts sell by default, so 0x0165 owns the equipped parts and
+            # commits: keep this stubbed roster out of the shared store
+            _s0165.commit = lambda what: None
+            _o = [packet.parse(o) for o in _s0165.on_packet(packet.parse(
                 packet.build(inventory.MSG_0165_REQ, bytes(16), seq=0x165, conn_id=1)))]
             _ids.append(struct.unpack_from(
                 "<H", _o[0]["payload"], inventory.SETUP_ITEM_OFF + inventory.ITEM_ID)[0])
@@ -11573,7 +12291,10 @@ def _selftest_run(test_db):
             flat_globals()["MISSION_FEE"] = True
             flat_globals()["MISSION_REPORT"] = True
             flat_globals()["CHAR_STORE"] = "selftest-stub"
-            _fpc = {"rank": 21, "mp": 600, "money": 0, "missions": []}
+            # registered (byte 128 = 99): an unregistered pilot's accept is
+            # refused before the Fee is judged (session, FMO_TRAINING_GATE)
+            _fpc = {"rank": 21, "mp": 600, "money": 0, "missions": [],
+                    "flags": fmostore.flags_hex((), {128: 99}) if fmostore else ""}
             _fs = session.Session("audit:0")
             _fs.playing_char = lambda: _fpc
             _fs.commit = lambda why: None
@@ -12357,7 +13078,8 @@ def _selftest_run(test_db):
             flat_globals()["MSN_ROWS"] = ["13/3:Deep Strike", "7/1:Recon Alpha"]
             flat_globals()["MSN_FIELDS"] = ""
             rooms.WORLD_ZONES["area"] = 200
-            _ac = {"missions": [], "nation_byte": 1}
+            _ac = {"missions": [], "nation_byte": 1,   # registered (byte 128 = 99)
+                   "flags": fmostore.flags_hex((), {128: 99}) if fmostore else ""}
             _as = session.Session("area:0")
             _as.playing_char = lambda: _ac
             _as.commit = lambda why: None
@@ -12494,41 +13216,41 @@ def _selftest_run(test_db):
                                                           if missionboard.ORDER else 0x0195)
                      and _os10.log_order(b"short") is None)
         for _lbl, _v in (
-                ("round 3b: the sector-win ledger is saved and reloaded "
+                ("the sector-win ledger is saved and reloaded "
                  "(FMO_SECTOR_WINS, the database), pruned to FMO_SECTOR_WINS_KEEP; "
                  "an empty table loads nothing; the old JSON file fills an empty "
                  "table once; memory only saves nothing", _persist_ok),
-                ("round 3b: -8 (27:13): another pilot's ACTIVE area accept on "
+                ("-8 (27:13): another pilot's ACTIVE area accept on "
                  "the same (zone, tile) refuses the pick; own, other zone, "
                  "closed ones do not", _taken_ok),
-                ("round 3b: the ORDER submit 0x0194 is decoded field by field, "
+                ("the ORDER submit 0x0194 is decoded field by field, "
                  "kept on the pilot and answered (0x0195, or the 27:4 refusal "
                  "when FMO_ORDER has no served source row)", _order_ok),
-                ("round 3: AREA missions pick their target: 0x01A8 -> 0x01A9 "
+                ("AREA missions pick their target: 0x01A8 -> 0x01A9 "
                  "lists the zone's on-disk sectors not held by the nation as "
                  "903M + tile (count +0x20, rows +0x24, 256 max); the pick in "
                  "0x018A +0x28/+0x2C is snapshotted or refused -9; met from "
                  "the war state at FMO_AREA_CONTROL; knob off = zeros",
                  _area_ok),
-                ("round 3: a per-accept KEY at record+0x00 (id + n<<16): two "
+                ("a per-accept KEY at record+0x00 (id + n<<16): two "
                  "accepts of one row list apart, Report/Cancel act on the row "
                  "the key names, an old accept keys on its id", _key_ok),
-                ("round 3: the battlefield is (ZONE, tile): the same tile in "
+                ("the battlefield is (ZONE, tile): the same tile in "
                  "another zone settles nothing; no stored zone = tile only",
                  _zone_bind_ok),
-                ("round 3: SECTOR missions: N wins on (zone, tile) by the "
+                ("SECTOR missions: N wins on (zone, tile) by the "
                  "nation after the accept and inside the deadline, whoever "
                  "fought; a battle end feeds the ledger and reads 'met (sector "
                  "wins)'; FMO_MISSION_DEADLINE_SECTOR", _sec2_ok),
-                ("round 3: the COUNTER-MISSION arrow: an enemy fighting on the "
+                ("the COUNTER-MISSION arrow: an enemy fighting on the "
                  "map with an open mission for (zone, tile) -> row +0x0A = "
                  "FMO_COUNTER_MISSION; own mission wins; off = 0; a win there "
                  "owes a kind-2 Kill bonus line of FMO_COUNTER_BONUS_HS",
                  _counter_ok),
-                ("round 3: FMO_PERMIT_RANKS: '<rank>:<hq|oc|flz|id>' passes "
+                ("FMO_PERMIT_RANKS: '<rank>:<hq|oc|flz|id>' passes "
                  "by rank, the nation picking the id; below = nothing, held = "
                  "nothing, FMO_PERMIT off leaves only these", _permit_rank_ok),
-                ("round 3: FMO_MSN_ZONES: the op-9 query's MapKind leaves out "
+                ("FMO_MSN_ZONES: the op-9 query's MapKind leaves out "
                  "rows issued in another area; unzoned rows/queries pass",
                  _msn_zone_ok),
                 ("every grant stores the pilot's zone on their record (the "
@@ -12770,15 +13492,18 @@ def _selftest_run(test_db):
           f"refused before it can vanish at 0x6117F86D: "
           f"{'OK' if _pp_ok else 'FAIL'}")
     ok &= _pp_ok
-    # (d) the knobs are OFF unless this run's env says otherwise.
+    # (d) the probe knobs are OFF unless this run's env says otherwise, and
+    # the two retail pushes (0x0199, 0x01C5) are ON (2026-10-08)
     _off_ok = all(
         (not v) or bool(os.environ.get(k, "").strip())
-        for k, v in (("FMO_TIME_SYNC", timesync.TIME_SYNC), ("FMO_SORTIE_COST", pushes.SORTIE_COST),
+        for k, v in (("FMO_SORTIE_COST", pushes.SORTIE_COST),
                      ("FMO_BATTLE_END", battleend.BATTLE_END),
-                     ("FMO_INSIGNIA_PUSH", squadron.INSIGNIA_PUSH),
                      ("FMO_PUSH_PROBE", pushes.PUSH_PROBE)))
-    print(f"  knobs: FMO_TIME_SYNC / FMO_SORTIE_COST / FMO_BATTLE_END / "
-          f"FMO_INSIGNIA_PUSH / FMO_PUSH_PROBE are off unless the env sets them: "
+    _off_ok &= all(v or bool(os.environ.get(k, "").strip())
+                   for k, v in (("FMO_TIME_SYNC", timesync.TIME_SYNC),
+                                ("FMO_INSIGNIA_PUSH", squadron.INSIGNIA_PUSH)))
+    print(f"  knobs: FMO_SORTIE_COST / FMO_BATTLE_END / FMO_PUSH_PROBE are off and "
+          f"FMO_TIME_SYNC / FMO_INSIGNIA_PUSH on unless the env says otherwise: "
           f"{'OK' if _off_ok else 'FAIL'}")
     ok &= _off_ok
 
@@ -13915,9 +14640,10 @@ def _selftest_run(test_db):
               and struct.unpack_from("<III", _out, scriptcall.S159_PARAMS) == (0, 0, 130)
               and _out[scriptcall.S159_B418] == 7 and _out[:4] == _rec[:4]
               and all(r["note"] for r in scriptcall.load_event_table())  # shipped file parses
-              # the armed rows (2026-10-01): 200/205 mark bit p1, 201 is an ack
+              # the armed rows (2026-10-01): 200/205 mark bit p1, 201 is an ack;
+              # 2026-10-08: 101 marks the zone's LEV visited bit (@visited)
               and [(r["event"], r["p1"], r["set"]) for r in scriptcall.load_event_table()]
-              == [(104, None, "@step"), (105, None, "@report"),
+              == [(104, None, "@step"), (105, None, "@report"), (101, None, "@visited"),
                   (200, None, "p1"), (201, None, ""), (205, None, "p1")])
     # what the shipped rows DO: the sergeant's 205 [34] sets bit 34 and leaves
     # byte 128 alone; 201 [job] stores nothing (it used to write the job into
@@ -14058,10 +14784,12 @@ def _selftest_run(test_db):
             _la = scriptcall.apply_event_rule(_r105, [130] + [0] * 15, _lb)[1]
             _lw = progress.completions_follow(_lc, _lb, _la)
             _sp_ok &= (len(_lw) == 1 and "Enemy Unit Annihilation" in _lw[0]
-                       and progress.pilot_level(_lc) == 9)
+                       and progress.pilot_level(_lc)
+                       == (9 if progress.PROGRESS_LEVEL_FOLLOW else 6))
         print(f"  story steps: a return on an accepted mission's tile clears it to 3 "
               f"(reported byte) or 99 (no report), once; a report completes it and "
-              f"the Pilot level follows: {'OK' if _sp_ok else 'FAIL'}")
+              f"the Pilot level stays (FMO_PROGRESS_LEVEL_FOLLOW off): "
+              f"{'OK' if _sp_ok else 'FAIL'}")
         ok &= _sp_ok
     finally:
         progress.MISSIONS, progress.REPORT_BYTES, progress.REWARDS = _sm_save
@@ -14216,19 +14944,574 @@ def _selftest_run(test_db):
     ok &= _wanzer_paint_pins()      # hangar paint -> 0x0166 starter + battle self-POP
     ok &= _paint_shop_pins()        # paint shop buy 0x01A4: verdict, debit, owned bit (cosmetics.py)
     ok &= _pvp_room_pins()          # Frontline PvP rooms: waiting, start, judge, war (pvproom.py)
+    ok &= _pvp_capture_hold_pins()  # Frontline Capture & Hold areas (pvproom.py P4)
+    from . import selftests_frontline as _stf
+    ok &= _stf.run()                # CTF / Beacon / Demolition + mode rotation; Resupply Items
     ok &= _group_persist_pins()     # battle groups across a restart, p.54 offer, 0x0131/0x0189
     ok &= _btlreview_token_pins()   # field A = character wire id (Battle Review folder)
     ok &= _battle_position_pins()   # battle position from cmd 23/24, lobby cmd 240 unchanged
     ok &= _war_phase_pins()         # a whole war phase offline: judge, reset, reward, restart (fmowar)
     ok &= _shop_acquire_pins()      # item shop buy 0x0168 -> 0x016B: gate at packet+0x28 (shop.py)
-    ok &= _part_fit_pins()          # part buy = fit of pending+8: real record, stock, owned (shop.py)
-    ok &= _training_events_pins()   # training ranking feed (0x014C +0x110) + service medal
-    ok &= _pilot_search_pins()      # kind 0 = the war map's pilot search (PC op 6 / PS2 op 2)
     ok &= _personnel_orders_pins()  # Personnel Officer orders + outlook (servicerecord.personnel_visit)
+    ok &= _part_fit_pins()          # part buy = fit of pending+8: real record, stock, owned (shop.py)
+    ok &= _hangar_economy_pins()    # every kind bought + fitted, sell, remodel 0x017E, Battle Fee
     ok &= _community_ps2_pins()     # PS2 community dialect (op 1 HELLO) + mission nation rules
+    ok &= _pilot_search_pins()      # kind 0 = the war map's pilot search (PC op 6 / PS2 op 2)
+    ok &= _training_events_pins()   # training ranking feed (0x014C +0x110) + service medal
+    ok &= _gap_round3_pins()        # gap pins: arena squad gate, /anon, voice, builder 3, cmds 21/112, 0x0161
+    ok &= _story_verdict_pins()     # story step from the battle verdict, rewards, caps, bit 17
+    ok &= _story_round2_pins()      # exp formula, no level follow, story battles, leader only
+    ok &= _registration_chain_pins()  # new pilot: seed, 101 visited bit, sergeant, training end scene, report
+    ok &= _housekeeping_pins()      # fmo.log rotation, the hexdump knob, the peer sweep
+    from . import selftests_round3 as _st3
+    ok &= _st3.run()                # defaults, training pay, shop gates, 0x0161, escape, CoI, report, events
 
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _registration_chain_pins():
+    """THE NEW-PILOT REGISTRATION CHAIN (2026-10-08), through the session's
+    real arms (0x0150, 0x0159, 0x0139, the 0x014C battle end, 0x018A). Returns ok.
+
+    Pins: (1) the seed: no FMO_STATUS_FLAGS in the release defaults, a new
+    record gets no registered byte, a stored block is never re-seeded, and
+    the documented test shortcut still parses. (2) The visited bit: the
+    opening (a room entry) sends 101 and marks nothing; the first HQ entry
+    runs LobbyEntry_t (bit 8 clear, so its map attach runs) and its 101 sets
+    bit 8 with an answer push; the next HQ entry runs no entry script and a
+    stray 101 changes nothing. (3) The sergeant: 201 [job] is a plain ack;
+    the registration training is refused on byte 128 = 0 and the mission
+    accept is refused while unregistered; 104 [128] 0 -> 1. (4) The training:
+    the 102 names scene 0x2710, the create-3 0x013A is map 70; a LOST battle
+    serves block +0x00 = 0 and byte 128 stays 1; the retry is granted on 1;
+    a WON battle serves 0x2710 at payload +0x104, which is the gates
+    catalogue's kind-4 row for SCP 0x8084, whose 104 [128] moves 1 -> 2.
+    (5) 105 [128] 2 -> 99 grants the base insignia; the pilot is trained."""
+    import json as _json
+    ok = True
+    if not fmostore:
+        print("  registration chain: SKIP (no character store)")
+        return ok
+    _gates = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "fmodata", "fmo-gates.json")
+    # --- 1. the seed
+    _seed = economy.seed_new_character({"id": 5})
+    _kept = economy.seed_new_character({"id": 6, "flags": fmostore.flags_hex((8,), {128: 99})})
+    _sc = status._parse_status_flags("8,9,10,11,12,13,128=99")
+    _seed_ok = ("FMO_STATUS_FLAGS" not in defaults.RELEASE_DEFAULTS
+                and (not status.STATUS_FLAGS and not status.STATUS_FLAG_BYTES)
+                and fmostore.flags_bytes(_seed.get("flags") or "").ljust(256, b"\0")[128] == 0
+                and fmostore.flags_bytes(_kept["flags"])[128] == 99
+                and _sc == ([8, 9, 10, 11, 12, 13], {128: 99}))
+    print(f"  registration: the release seed is empty (byte 128 = 0, zones unvisited "
+          f"at birth), a stored block is kept, the test shortcut still parses: "
+          f"{'OK' if _seed_ok else 'FAIL'}")
+    ok &= _seed_ok
+
+    _pc = {"id": 7, "first": "Reg", "last": "Chain", "nation_byte": 1, "money": 0,
+           "contribution": 0}
+    _commits = []
+
+    def _mk_sess():
+        _s = session.Session("regchain:0")
+        _s._roster = [_pc]
+        _s.playing_char = lambda: _pc
+        _s.commit = lambda why: _commits.append(why)
+        _s.credit_money = lambda why, money=0, contribution=0: (money, contribution)
+        _s.credit_class_exp = lambda why, rows: {}
+        _s.owe_kill_bonus = lambda hs, n: None
+        _s.stored_money = lambda: (0, 0)
+        return _s
+
+    def _call(sess, ev, ps):
+        _rec = bytearray(scriptcall.S159_BODY_LEN)
+        struct.pack_into("<I", _rec, scriptcall.S159_EVENT, ev)
+        if ps:
+            struct.pack_into("<%dI" % len(ps), _rec, scriptcall.S159_PARAMS, *ps)
+        return [struct.unpack_from("<H", o, 6)[0] for o in sess.on_packet(packet.parse(
+            packet.build(scriptcall.MSG_0159_REQ, bytes(_rec), 0x300)))]
+
+    def _flags():
+        return fmostore.flags_bytes(_pc.get("flags") or "").ljust(256, b"\0")
+
+    def _bit(n):
+        return bool(_flags()[n >> 3] & (1 << (n & 7)))
+
+    def _enter(sess):
+        _o = [packet.parse(x) for x in sess.on_packet(packet.parse(packet.build(
+            zoneentry.MSG_0150_REQ, bytes(8), seq=0x66, conn_id=1)))]
+        _b = _o[0]["payload"]
+        return (struct.unpack_from("<H", _b, zoneentry.R153_MAPKIND)[0],
+                struct.unpack_from("<I", _b, zoneentry.R153_FIELD_18)[0])
+
+    def _sortie(sess, create=3, infoid=3030):
+        _q = bytearray(sortie.REQ_0139_LEN)
+        struct.pack_into("<I", _q, sortie.Q139_CREATE, create)
+        struct.pack_into("<I", _q, sortie.Q139_INFOID, infoid)
+        return [packet.parse(o) for o in sess.on_packet(packet.parse(packet.build(
+            sortie.MSG_SORTIE_REQ, bytes(_q), seq=0x5170, conn_id=1)))]
+
+    _sv = (charstore.CHAR_STORE, zoneentry.FIELD_18, zoneentry.MAPKIND,
+           zoneentry.OPENING, zoneentry.RESUME_ZONE, resultpush.RESULT_PUSH,
+           missionboard.MISSION_ACCEPT, sortie.SERVE_SORTIE, charstore.TRAINING_GATE)
+    try:
+        flat_globals()["CHAR_STORE"] = charstore.CHAR_STORE or "selftest-not-written"
+        zoneentry.FIELD_18 = 0                 # the release value: a lobby entry
+        zoneentry.MAPKIND = 100                # the O.C.U. HQ
+        zoneentry.OPENING = "first"
+        zoneentry.RESUME_ZONE = False
+        resultpush.RESULT_PUSH = True
+        flat_globals()["MISSION_ACCEPT"] = "gate"
+        flat_globals()["SERVE_SORTIE"] = True
+        charstore.TRAINING_GATE = True
+        _s = _mk_sess()
+        # --- 2. the visited bit
+        _e1 = _enter(_s)                                   # the opening: a room
+        _r1 = _call(_s, 101, [])
+        _b8_after_opening = _bit(8)
+        _e2 = _enter(_s)                                   # the HQ lobby
+        _runs2 = zoneentry.entry_script_runs(_flags(), _e2[0], _e2[1])
+        _r2 = _call(_s, 101, [])
+        _e3 = _enter(_s)
+        _runs3 = zoneentry.entry_script_runs(_flags(), _e3[0], _e3[1])
+        _r3 = _call(_s, 101, [])
+        _vis_ok = (_e1[1] == 1 and _r1 == [1] and not _b8_after_opening
+                   and _e2 == (100, 0) and _runs2 and _r2 == [resultpush.MSG_RESULT_PUSH, 1]
+                   and _bit(8) and not _runs3 and _r3 == [1]
+                   and zoneentry.lev_visited_bit(509, 0) == 12
+                   and zoneentry.lev_visited_bit(100, 1) is None
+                   and zoneentry.lev_visited_bit(600, 1) == 13)
+        print(f"  registration: the opening's 101 marks nothing; the first HQ entry runs "
+              f"LobbyEntry_t (its map attach) and its 101 sets bit 8 with an answer "
+              f"push; the next HQ entry runs no entry script (Son's welcome does not "
+              f"replay): {'OK' if _vis_ok else 'FAIL ' + str((_e1, _r1, _e2, _runs2, _r2, _runs3, _r3))}")
+        ok &= _vis_ok
+        # --- 3. the sergeant (byte 128 == 0)
+        _no_train = _sortie(_s)
+        _acc = [packet.parse(o) for o in _s.on_packet(packet.parse(packet.build(
+            missionboard.MSG_MISSION_ACCEPT, struct.pack("<I", 7) + bytes(120),
+            seq=0x5171, conn_id=1)))]
+        _j = _call(_s, 201, [2])
+        _g1 = _call(_s, 104, [128])
+        _sg_ok = (_no_train and _no_train[0]["msg"] == charselect.MSG_FAIL
+                  and _acc and _acc[0]["msg"] == charselect.MSG_FAIL and _acc[0]["conn"] == 0
+                  and _j == [1] and _g1 == [resultpush.MSG_RESULT_PUSH, 1]
+                  and _flags()[128] == 1 and not _s.pilot_trained())
+        print(f"  registration: on byte 128 = 0 the training sortie and a mission accept "
+              f"are refused; 201 [job] is a plain ack; the sergeant's 104 [128] 0 -> 1: "
+              f"{'OK' if _sg_ok else 'FAIL ' + str((_no_train[:1], _acc[:1], _j, _g1, _flags()[128]))}")
+        ok &= _sg_ok
+        # --- 4. the training: 102 then 0x0139 create 3, lost, then retried and won
+        _c102 = _call(_s, 102, [0, 3, 30, 1, 0x2710])
+        _gr = _sortie(_s)
+        _mn = (struct.unpack_from("<I", _gr[0]["payload"], sortie.R13A_BLOCK
+                                  + missionblock.MB_MAPNO)[0]
+               if _gr and _gr[0]["msg"] == sortie.MSG_SORTIE_REPLY else None)
+        _lost = packet.parse(_s.battle_end_push(0x1234, why="selftest", won=False))
+        _lost_scene = struct.unpack_from("<I", _lost["payload"], battleend.S14C_BLOCK)[0]
+        _after_loss = _flags()[128]
+        _call(_s, 102, [0, 3, 30, 1, 0x2710])              # case 1 re-fires 0xE30A
+        _gr2 = _sortie(_s)
+        _s.battle_settlement = None
+        _won = packet.parse(_s.battle_end_push(0x1234, why="selftest", won=True))
+        _scene = struct.unpack_from("<I", _won["payload"], battleend.S14C_BLOCK)[0]
+        # the client: lobby+0x69C6 -> 0x610F6ED0(scene, kind 4) -> the zone's
+        # kind-4 row for that key -> its script's server calls
+        _row_scp, _row_calls = None, []
+        if os.path.exists(_gates):
+            with open(_gates, encoding="utf-8") as _fh:
+                _gj = _json.load(_fh)
+            _row = next((r for r in _gj.get("event_rows") or []
+                         if r.get("kind") == 4 and int(r["entity_key"], 16) == _scene
+                         and r.get("table", "").endswith("D39.DAT")), None)
+            _row_scp = _row and _row.get("scp")
+            _row_calls = [(c["event"], c["params"]) for sc in _gj.get("scripts") or []
+                          if sc.get("scp") == _row_scp for c in sc.get("server_calls") or []]
+        for _ev, _ps in _row_calls:
+            _call(_s, _ev, list(_ps))
+        if _row_scp is None:                               # no catalogue: model 0x8084
+            _call(_s, 104, [128])
+        _tr_ok = (_c102 == [1] and _mn == 70 and _lost_scene == 0 and _after_loss == 1
+                  and _gr2 and _gr2[0]["msg"] == sortie.MSG_SORTIE_REPLY
+                  and _scene == 0x2710
+                  and (_row_scp is None or (_row_scp == "0x8084"
+                                            and _row_calls == [(104, [128])]))
+                  and _flags()[128] == 2)
+        print(f"  registration: the 102 names scene 0x2710; the training sortie is map "
+              f"{_mn}; a LOST battle serves block +0x00 = {_lost_scene} and leaves "
+              f"byte 128 at {_after_loss} (the sergeant's retry); the retry is granted; a "
+              f"WON battle serves {_scene:#x} at 0x014C +0x104, the kind-4 row of SCP "
+              f"{_row_scp or '(no gates json)'}, whose 104 [128] moves 1 -> 2: "
+              f"{'OK' if _tr_ok else 'FAIL'}")
+        ok &= _tr_ok
+        # --- 5. the report
+        _rep = _call(_s, 105, [128])
+        _ins = progress.base_insignia_for_zone(100)
+        _rp_ok = (_flags()[128] == 99 and _s.pilot_trained()
+                  and _rep[:1] == [resultpush.MSG_RESULT_PUSH]
+                  and _ins in inventory.owned_paint_ids(_pc, 1)["insignia"])
+        print(f"  registration: 105 [128] 2 -> 99 hands over base insignia {_ins} and "
+              f"opens the terminals (pilot trained): {'OK' if _rp_ok else 'FAIL ' + str(_rep)}")
+        ok &= _rp_ok
+    finally:
+        flat_globals()["CHAR_STORE"] = _sv[0]
+        (zoneentry.FIELD_18, zoneentry.MAPKIND, zoneentry.OPENING,
+         zoneentry.RESUME_ZONE, resultpush.RESULT_PUSH) = _sv[1:6]
+        flat_globals()["MISSION_ACCEPT"] = _sv[6]
+        flat_globals()["SERVE_SORTIE"] = _sv[7]
+        charstore.TRAINING_GATE = _sv[8]
+    return ok
+
+
+def _story_verdict_pins():
+    """THE STORY FLOW FIXES (2026-10-08), no client. Returns ok.
+
+    Pins: (1) a WON battle end on the tile a sortie was taken on moves the
+    accepted mission's byte to 3 and queues the flags push; a LOST one moves
+    nothing; a 0x013D withdraw drops the snapshot so a late battle end moves
+    nothing; an arena battle moves nothing; the snapshot comes from the war
+    map for a leader and from the group's sortie for a 9:10 follower.
+    (2) FMO_PROGRESS_RANK_FOLLOW is off by default and, when forced on, is
+    clamped to the highest earnable rank. (3) The Pilot level is capped at 50
+    (SE update 050906ap6wh2) in the store and in the battle's exp rows; a job
+    at the curve's last row. (4) A 105 report through the real 0x0159 arm
+    pays the money, the contribution and the paint (owned bit) or the OC pass
+    the catalogue names, and the sergeant's 105 [128] hands over the base
+    squadron insignia of the zone of the talk; the 0x015A carries both
+    deltas. (5) Bit 17 is set once on the first Frontline entry. (6) The
+    hangar sale's rows 0 / 1 are the script's, SE's prices, and the pass a
+    sale mints is the one Change Area then spends."""
+    import tempfile as _tf
+    ok = True
+    H = 0x14
+    _curve = classes.CLASS_CURVE
+    if not (fmostore and _curve and progress.MISSION_TILES):
+        print("  story verdict: SKIP (no character store, class curve or gates json)")
+        return ok
+
+    def _sess(peer, char, **attrs):
+        s = session.Session.__new__(session.Session)
+        s.peer, s.ip = peer, peer
+        s.battle_settlement = None
+        s.last_0159 = b""
+        s.playing_char = lambda _c=char: _c
+        s.stored_money = lambda: (0, 0)
+        s.credit_money = lambda why, money=0, contribution=0: (money, contribution)
+        s.credit_class_exp = lambda why, rows: {}
+        s.owe_kill_bonus = lambda hs, n: None
+        s.commit = lambda what: None
+        for k, v in attrs.items():
+            setattr(s, k, v)
+        return s
+
+    _tile130 = sorted(progress.MISSION_TILES.get(130) or [])[0]
+    _store_was = charstore.CHAR_STORE
+    _rp_was = resultpush.RESULT_PUSH
+    try:
+        charstore.CHAR_STORE = charstore.CHAR_STORE or "selftest-not-written"
+        resultpush.RESULT_PUSH = False
+        # --- 1. the verdict moves the byte
+        _won = {"nation_byte": 1, "money": 0, "contribution": 0,
+                "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+        progress.set_pilot_level(_won, 6)
+        _sw = _sess("selftest-story-won", _won,
+                    sortie_story={"tile": _tile130, "zone": 100, "at": 0, "settled": False})
+        _sw.battle_end_push(0x1234, why="selftest", won=True)
+        _fw = fmostore.flags_bytes(_won["flags"])
+        _lost = {"nation_byte": 1, "money": 0, "contribution": 0,
+                 "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+        progress.set_pilot_level(_lost, 6)
+        _sl = _sess("selftest-story-lost", _lost,
+                    sortie_story={"tile": _tile130, "zone": 100, "at": 0, "settled": False})
+        _sl.battle_end_push(0x1234, why="selftest", won=False)
+        _fl_ = fmostore.flags_bytes(_lost["flags"])
+        # a second battle end on the same sortie moves nothing more
+        _sw.battle_settlement = None
+        _sw.battle_end_push(0x1234, why="selftest again", won=True)
+        _v_ok = (_fw[130] == 3 and getattr(_sw, "flags_push_due", False)
+                 and _sw.sortie_story["settled"]
+                 and _fl_[130] == 2 and not getattr(_sl, "flags_push_due", False)
+                 and fmostore.flags_bytes(_won["flags"])[130] == 3
+                 and progress.advance_progress(dict(_lost), tile=_tile130, won=False)[0] is None)
+        print(f"  story verdict: a WON battle end on the sortie's tile {_tile130} moves "
+              f"byte 130 2 -> 3 once and queues the flags push; a LOST one leaves 2: "
+              f"{'OK' if _v_ok else 'FAIL ' + str((_fw[130], _fl_[130]))}")
+        ok &= _v_ok
+        # an arena battle moves nothing, whatever the snapshot says
+        _ar = {"nation_byte": 1, "money": 0, "contribution": 0,
+               "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+        progress.set_pilot_level(_ar, 6)
+        _sa = _sess("selftest-story-arena", _ar,
+                    sortie_story={"tile": _tile130, "zone": 600, "at": 0, "settled": False})
+        _wz_was = rooms.WORLD_ZONES.get("selftest-story-arena")
+        rooms.WORLD_ZONES["selftest-story-arena"] = 600
+        try:
+            _sa.battle_end_push(0x1234, why="selftest arena", won=True)
+        finally:
+            if _wz_was is None:
+                rooms.WORLD_ZONES.pop("selftest-story-arena", None)
+            else:
+                rooms.WORLD_ZONES["selftest-story-arena"] = _wz_was
+        _a_ok = fmostore.flags_bytes(_ar["flags"])[130] == 2 or not settlement.ARENA_NO_PAY
+        # the withdraw through the real arm drops the snapshot
+        _wd = {"id": 31, "first": "With", "last": "Draw", "nation_byte": 1, "money": 0,
+               "contribution": 0, "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+        progress.set_pilot_level(_wd, 6)
+        _swd = session.Session("selftest-story-withdraw")
+        _swd._roster = [_wd]
+        _swd.playing_char = lambda: _wd
+        _swd.commit = lambda what: None
+        _swd.sortie_story = {"tile": _tile130, "zone": 100, "at": 0, "settled": False}
+        _swd.sortie_pending = True
+        _owd = _swd.on_packet(packet.parse(packet.build(withdraw.MSG_BATTLE_WITHDRAW, bytes(4), 0x301)))
+        _swd.battle_settlement = None
+        _swd.battle_end_push(0x1234, why="selftest after withdraw", won=True)
+        _w_ok = (_swd.sortie_story is None and bool(_owd)
+                 and fmostore.flags_bytes(_wd["flags"])[130] == 2
+                 and not getattr(_swd, "flags_push_due", False))
+        print(f"  story verdict: an arena battle and a 0x013D withdraw (snapshot dropped, "
+              f"late battle end ignored) move nothing: {'OK' if (_a_ok and _w_ok) else 'FAIL'}")
+        ok &= _a_ok and _w_ok
+        # the snapshot: the leader's war-map tile; a 9:10 follower's is the group's
+        class _Snap:
+            def __init__(self, account, sector, zone):
+                self.account, self.sector, self.sector_zone = account, sector, zone
+        _ld = _Snap("story:lead", (_tile130, 5, 267), 100)
+        _fo = _Snap("story:follow", None, None)
+        _gid_was = (groupchannel.GROUP_OF.get("story:follow"), groupchannel.GROUP_SORTIE.get("story-g"))
+        groupchannel.GROUP_OF["story:follow"] = "story-g"
+        groupchannel.GROUP_SORTIE["story-g"] = {"map": 267, "sector": 100 * 1_000_000 + _tile130,
+                                                 "by": "story:lead", "at": 0}
+        try:
+            _s1 = sortie.story_sortie_snapshot(_ld, {"id": 0}, now=5)
+            _s2 = sortie.story_sortie_snapshot(_fo, {"id": 267}, now=5)
+            _s3 = sortie.story_sortie_snapshot(_fo, {"id": 418}, now=5)
+        finally:
+            groupchannel.GROUP_OF.pop("story:follow", None)
+            groupchannel.GROUP_SORTIE.pop("story-g", None)
+            if _gid_was[0] is not None:
+                groupchannel.GROUP_OF["story:follow"] = _gid_was[0]
+            if _gid_was[1] is not None:
+                groupchannel.GROUP_SORTIE["story-g"] = _gid_was[1]
+        _s_ok = (_s1 == {"tile": _tile130, "zone": 100, "at": 5, "settled": False,
+                         "leader": True}
+                 and _s2["tile"] == _tile130 and _s3["tile"] is None)
+        print(f"  story verdict: the sortie snapshot is the war map's tile for a leader and "
+              f"the group's for a 9:10 follower on the group's map: {'OK' if _s_ok else 'FAIL'}")
+        ok &= _s_ok
+
+        # --- 2. rank follow: off by default, clamped when on
+        _tbl = {1: [{"title": "A", "level": 6, "pre": None, "own": 130, "pre_byte": None},
+                    {"title": "B", "level": 29, "pre": "A", "own": 137, "pre_byte": 130},
+                    {"title": "C", "level": 9, "pre": "B", "own": 139, "pre_byte": 137}], 2: []}
+        _rf_was = progress.PROGRESS_RANK_FOLLOW
+        try:
+            _r1 = {"nation_byte": 1, "rank": 4, "flags": fmostore.flags_hex(byte_values={128: 99})}
+            progress.PROGRESS_RANK_FOLLOW = False
+            _w1, _ra1 = progress.completion_follow(_r1, _tbl[1][0], _tbl)
+            progress.PROGRESS_RANK_FOLLOW = True
+            _r2 = {"nation_byte": 1, "rank": 4, "flags": fmostore.flags_hex(byte_values={128: 99})}
+            _w2, _ra2 = progress.completion_follow(_r2, _tbl[1][0], _tbl)   # successor Lv29
+            _r3 = {"nation_byte": 1, "rank": 4, "flags": fmostore.flags_hex(byte_values={128: 99})}
+            _w3, _ra3 = progress.completion_follow(_r3, _tbl[1][1], _tbl)   # successor Lv9
+        finally:
+            progress.PROGRESS_RANK_FOLLOW = _rf_was
+        _rf_ok = (not _rf_was and _ra1 is None and _r1["rank"] == 4
+                  and _ra2 == ranks.RANK_MAX_EARNABLE and _r2["rank"] == ranks.RANK_MAX_EARNABLE
+                  and _ra3 == 9 and _r3["rank"] == 9
+                  and progress.pilot_level(_r1) == (29 if progress.PROGRESS_LEVEL_FOLLOW else 1))
+        print(f"  rank follow: off by default (rank 4 stays; the Pilot level follow is off "
+              f"too, so it stays 1); "
+              f"forced on it is clamped to {ranks.RANK_MAX_EARNABLE} (Captain) for a Lv29 "
+              f"successor and gives 9 for a Lv9 one: {'OK' if _rf_ok else 'FAIL'}")
+        ok &= _rf_ok
+
+        # --- 3. the level cap
+        _cap = classes.PILOT_LEVEL_CAP
+        _cc = {"class_exp": {"12": _curve[_cap - 1] - 10, "1": _curve[-1] - 1, "3": 0},
+               "money": 0, "contribution": 0}
+        _sc = session.Session.__new__(session.Session)
+        _sc.peer = "selftest-cap"
+        _sc.playing_char = lambda: _cc
+        _sc.commit = lambda what: None
+        _new = _sc.credit_class_exp("selftest cap", [(12, 100), (1, 5), (3, 7)])
+        _cap_ok = (_new[12] == _curve[_cap - 1] and classes.class_level(_new[12]) == _cap
+                   and _new[1] == _curve[-1] and classes.class_level(_new[1]) == len(_curve)
+                   and _new[3] == 7
+                   and classes.exp_cap(12) == _curve[_cap - 1] and classes.exp_cap(5) == _curve[-1]
+                   and classes.cap_exp_rows({12: _curve[_cap - 1]}, [(12, 50), (2, 1)])
+                   == ([(2, 1)], [(12, 50)]))
+        # through the settlement: a capped pilot's battle has no Pilot row
+        _pace_was = (battleend.EXP_PACE, battleend.BATTLE_END_EXP, battleend.KILL_EXP,
+                     battleend.EXP_SECTOR_PCT, battleend.EXP_FRONT_PCT)
+        _rows_seen = []
+        try:
+            battleend.EXP_PACE, battleend.BATTLE_END_EXP, battleend.KILL_EXP = 4, "", ""
+            battleend.EXP_SECTOR_PCT, battleend.EXP_FRONT_PCT = 100, 100
+            _cp = {"class_exp": {"12": _curve[_cap - 1], "3": 0}, "money": 0, "contribution": 0,
+                   "nation_byte": 1}
+            _ss = _sess("selftest-cap-settle", _cp)
+            _ss.credit_class_exp = lambda why, rows: _rows_seen.extend(rows) or {}
+            _st = _ss.settle_battle("selftest cap", won=True)
+            _cap_ok &= (all(k != 12 for k, _a in _st["exp_rows"])
+                        and any(k == 3 for k, _a in _st["exp_rows"])
+                        and _rows_seen == _st["exp_rows"])
+        finally:
+            (battleend.EXP_PACE, battleend.BATTLE_END_EXP, battleend.KILL_EXP,
+             battleend.EXP_SECTOR_PCT, battleend.EXP_FRONT_PCT) = _pace_was
+        print(f"  level cap: Pilot exp stops at the Lv{_cap} threshold {_curve[_cap - 1]} "
+              f"(SE 050906ap6wh2), a job at the curve's last row (Lv{len(_curve)}), and a "
+              f"capped pilot's 0x014C carries no Pilot row: {'OK' if _cap_ok else 'FAIL'}")
+        ok &= _cap_ok
+
+        # --- 4. the 105 report through the real 0x0159 arm
+        def _report(char, byte):
+            _rec = bytearray(scriptcall.S159_BODY_LEN)
+            struct.pack_into("<I", _rec, 0, 105)
+            struct.pack_into("<I", _rec, scriptcall.S159_PARAMS, byte)
+            _s = session.Session("selftest-story-report")
+            _s._roster = [char]
+            _s.playing_char = lambda: char
+            _s.commit = lambda what: None
+            return _s.on_packet(packet.parse(packet.build(scriptcall.MSG_0159_REQ, bytes(_rec), 0x105)))
+
+        def _push(outs):
+            _p = next((x for x in outs if struct.unpack_from("<H", x, 6)[0] == resultpush.MSG_RESULT_PUSH), b"")
+            if len(_p) < H + resultpush.S15A_CONTRIB + 4:
+                return None, None, None
+            return (struct.unpack_from("<i", _p, H + resultpush.S15A_MONEY)[0],
+                    struct.unpack_from("<i", _p, H + resultpush.S15A_CONTRIB)[0],
+                    struct.unpack_from("<I", _p, H + scriptcall.S159_PARAMS + 4)[0])
+
+        # the "win" contribution pinned to SE-era knob values, so the delta
+        # check cannot pass on a zero (an earlier pin may have left them 0)
+        _kc_was = (resultpush.RESULT_CONTRIB, battleend.BATTLE_END_CONTRIB, battleend.WIN_CONTRIB,
+                   progress.REPORT_CONTRIB_RAW)
+        _mr_was = (status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER)
+        with _tf.TemporaryDirectory() as _td:
+            try:
+                resultpush.RESULT_CONTRIB, battleend.BATTLE_END_CONTRIB, battleend.WIN_CONTRIB = 11, 0, 30
+                progress.REPORT_CONTRIB_RAW = "win"
+                _rc = progress.report_contribution()
+                flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+                status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER = 1, False
+                # Enemy Unit Annihilation (130): 300 H$ + armor colour Mauve (D30 46)
+                _c130 = {"id": 41, "first": "Rep", "last": "Ort", "money": 10, "contribution": 5,
+                         "mapkind": 103, "flags": fmostore.flags_hex(byte_values={128: 99, 130: 3})}
+                _o130 = _report(_c130, 130)
+                _m130, _k130, _p2_130 = _push(_o130)
+                _f130 = fmostore.flags_bytes(_c130["flags"])
+                _paint130 = inventory.bought_paint_ids(_c130)
+                _r130_ok = (_f130[130] == 99 and _p2_130 == 1
+                            and _m130 == 300 and _k130 == _rc
+                            and _c130["money"] == 310 and _c130["contribution"] == 5 + _rc
+                            and 46 in _paint130["colour"])
+                # the Helicopter mission (139): 1000 H$ + the OC pass 27, minted
+                _c139 = {"id": 42, "first": "Hel", "last": "Ico", "money": 0, "contribution": 0,
+                         "mapkind": 203, "flags": fmostore.flags_hex(byte_values={128: 99, 139: 3})}
+                _o139 = _report(_c139, 139)
+                _ids139 = [struct.unpack_from("<H", x, 6)[0] for x in _o139]
+                _r139_ok = (_ids139 == [resultpush.MSG_RESULT_PUSH, shop.MSG_ACQUIRE_REPLY,
+                                        handshake.MSG_SESSION_START]
+                            and _c139["money"] == 1000
+                            and [it["id"] for it in inventory.stored_items(_c139)
+                                 if it["kind"] == permits.PASS_KIND] == [27])
+                # the Prototype (135): 5000 H$ + Chasm Owls (D31 110); EMP carrier (137): camo Blue 1 (D29 132)
+                _c135 = {"id": 43, "first": "Pro", "last": "To", "money": 0, "contribution": 0,
+                         "mapkind": 100, "flags": fmostore.flags_hex(byte_values={128: 99, 135: 3, 137: 3})}
+                _report(_c135, 135)
+                _report(_c135, 137)
+                _pp = inventory.bought_paint_ids(_c135)
+                _r135_ok = (110 in _pp["insignia"] and 132 in _pp["camo"]
+                            and _c135["money"] == 5400)
+                # the sergeant's 105 [128] in zone 103: base insignia 84 = D31 118, contribution
+                _c128 = {"id": 44, "first": "New", "last": "Pilot", "money": 0, "contribution": 0,
+                         "mapkind": 103, "flags": fmostore.flags_hex(byte_values={128: 2})}
+                _o128 = _report(_c128, 128)
+                _m128, _k128, _p2_128 = _push(_o128)
+                _f128 = fmostore.flags_bytes(_c128["flags"])
+                _r128_ok = (_f128[128] == 99 and _p2_128 == 0 and _m128 == 0 and _k128 == _rc
+                            and _c128["contribution"] == _rc
+                            and 118 in inventory.bought_paint_ids(_c128)["insignia"])
+                # a U.S.N. pilot in zone 305 gets 106 = D31 406; a stray 105 [128] on 99 pays nothing twice
+                _c305 = {"id": 45, "first": "Usn", "last": "Pilot", "money": 0, "contribution": 0,
+                         "nation_byte": 2, "mapkind": 305, "flags": fmostore.flags_hex(byte_values={128: 2})}
+                _report(_c305, 128)
+                _again = _report(_c305, 128)       # answers p1 = 99 again, grants nothing more
+                _r305_ok = (406 in inventory.bought_paint_ids(_c305)["insignia"]
+                            and _c305["contribution"] == _rc
+                            and len(inventory.bought_paint_ids(_c305)["insignia"]) == 1
+                            and (_push(_again)[1] or 0) == 0)
+            finally:
+                flat_globals()["CHAR_STORE"] = charstore.CHAR_STORE or "selftest-not-written"
+                status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER = _mr_was
+                (resultpush.RESULT_CONTRIB, battleend.BATTLE_END_CONTRIB, battleend.WIN_CONTRIB,
+                 progress.REPORT_CONTRIB_RAW) = _kc_was
+        _rc_ok = _rc == 41 and progress.report_contribution("25") == 25 and progress.report_contribution("0") == 0
+        print(f"  story report (105): 130 pays 300 H$ + contribution {_rc} + colour 46 (Mauve) "
+              f"into the record and the 0x015A deltas: {'OK' if _r130_ok else 'FAIL ' + str((_m130, _k130, _p2_130, _c130.get('money'), _paint130))}")
+        print(f"  story report (105): 139 mints OC pass 27 + 1000 H$; 135 / 137 grant insignia 110 "
+              f"and camo 132: {'OK' if (_r139_ok and _r135_ok) else 'FAIL ' + str((_ids139, _pp))}")
+        print(f"  registration report (105 [128]): base insignia by the zone of the talk (103 -> "
+              f"D31 118, U.S.N. 305 -> 406) + contribution {_rc}, once: "
+              f"{'OK' if (_r128_ok and _r305_ok) else 'FAIL ' + str((_f128[128], _p2_128, _k128))}")
+        ok &= _r130_ok and _r139_ok and _r135_ok and _r128_ok and _r305_ok and _rc_ok
+
+        # --- 5. bit 17 on the first Frontline entry
+        _b17 = {"flags": fmostore.flags_hex(byte_values={128: 99})}
+        _e1 = progress.note_frontline_entry(_b17, 509)
+        _bits = fmostore.flags_bytes(_b17["flags"])
+        _e2 = progress.note_frontline_entry(_b17, 505)
+        _e3 = progress.note_frontline_entry({"flags": ""}, 100)
+        _b17_ok = (_e1 and bool(_bits[17 >> 3] & (1 << (17 & 7))) and not _e2 and not _e3
+                   and not progress.note_frontline_entry({"flags": ""}, None))
+        print(f"  bit 17 (Frontline transfer): set once on the first 5xx entry, never on a "
+              f"1xx one: {'OK' if _b17_ok else 'FAIL'}")
+        ok &= _b17_ok
+
+        # --- 6. the hangar sale rows and the pass Change Area spends
+        _hs_ok = (permits.HANGAR_SALE_CHOICE == {0: "hq", 1: "oc"}
+                  and permits.HANGAR_SALE_PRICE["hq"] == 1000 and permits.HANGAR_SALE_PRICE["oc"] == 2000
+                  and permits.hangar_sale(0, 1, 5000)["pass_id"] == 25
+                  and permits.hangar_sale(1, 1, 5000)["pass_id"] == 27
+                  and permits.hangar_sale(1, 2, 5000)["pass_id"] == 28
+                  and not permits.hangar_sale(2, 1, 5000)["ok"]
+                  and not permits.hangar_sale(3, 1, 5000)["ok"])
+        _zc_was = zonecontrol.ZONE_CONTROL
+        with _tf.TemporaryDirectory() as _td:
+            try:
+                flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
+                status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER = 1, False
+                zonecontrol.ZONE_CONTROL = ["levels"]
+                _buyer = {"id": 46, "first": "Lv", "last": "Twelve", "money": 5000, "contribution": 0,
+                          "nation_byte": 1}
+                progress.set_pilot_level(_buyer, 12)          # tier 3: own Occupied needs a permit
+                _rec = bytearray(scriptcall.S159_BODY_LEN)
+                struct.pack_into("<I", _rec, 0, permits.HANGAR_SALE_EVENT)
+                struct.pack_into("<I", _rec, scriptcall.S159_PARAMS, 1)
+                _sb = session.Session("selftest-story-sale")
+                _sb._roster = [_buyer]
+                _sb.playing_char = lambda: _buyer
+                _sb.commit = lambda what: None
+                _sb.on_packet(packet.parse(packet.build(scriptcall.MSG_0159_REQ, bytes(_rec), 0x206)))
+                _held = [it["id"] for it in inventory.stored_items(_buyer) if it["kind"] == permits.PASS_KIND]
+                _spent = _sb.spend_area_pass(_buyer, 200)
+                _left = [it["id"] for it in inventory.stored_items(_buyer) if it["kind"] == permits.PASS_KIND]
+                _hs_ok &= (_buyer["money"] == 3000 and _held == [27] and len(_spent) == 1
+                           and _left == [] and _sb.spend_area_pass(_buyer, 200) == [])
+            finally:
+                flat_globals()["CHAR_STORE"] = charstore.CHAR_STORE or "selftest-not-written"
+                status.STATUS_NATION, zoneentry.NATION_PER_CHARACTER = _mr_was
+                zonecontrol.ZONE_CONTROL = _zc_was
+        print(f"  hangar sale: rows 0 hq / 1 oc (D93 var 0x700), SE's 1000 / 2000 H$ "
+              f"(update 050628gp4sc1), and the OC pass a Lv12 pilot buys is spent by "
+              f"Change Area into zone 200: {'OK' if _hs_ok else 'FAIL'}")
+        ok &= _hs_ok
+    finally:
+        charstore.CHAR_STORE = _store_was
+        resultpush.RESULT_PUSH = _rp_was
+    return ok
 
 
 def _group_persist_pins():
@@ -14286,10 +15569,10 @@ def _group_persist_pins():
         gc.GROUP_RULES = False
         _clear()
         # --- G1 ids never repeat
-        g1 = _make("198.51.100.1:1", "gp:a", "A.One")
-        g2 = _make("198.51.100.2:1", "gp:b", "B.Two")
+        g1 = _make("198.51.100.201:1", "gp:a", "A.One")
+        g2 = _make("198.51.100.202:1", "gp:b", "B.Two")
         bg.group_disband(g1, "selftest")
-        g3 = _make("198.51.100.3:1", "gp:c", "C.Three")
+        g3 = _make("198.51.100.203:1", "gp:c", "C.Three")
         _g1_ok = (g1, g2, g3) == (1, 2, 3)
         print(f"  groups: GroupIDs never repeat after a disband (the old len+1 "
               f"handed out 2 twice): {g1},{g2},{g3}: {'OK' if _g1_ok else 'FAIL'}")
@@ -14297,7 +15580,7 @@ def _group_persist_pins():
 
         # --- G2 round trip through the document
         _clear()
-        g = _make("198.51.100.1:1", "gp:lead", "Lead.Er", comment="vets only")
+        g = _make("198.51.100.201:1", "gp:lead", "Lead.Er", comment="vets only")
         gc.group_join(g, "gp:m1")
         gc.group_join(g, "gp:m2")
         gc.GROUP_READY["gp:m1"] = (1, 2)
@@ -14364,9 +15647,9 @@ def _group_persist_pins():
 
         # --- G4 lifetime rules
         _clear()
-        ga = _make("198.51.100.1:1", "gp:la", "L.A")
+        ga = _make("198.51.100.201:1", "gp:la", "L.A")
         gc.group_join(ga, "gp:ma")
-        gb = _make("198.51.100.2:1", "gp:lb", "L.B")
+        gb = _make("198.51.100.202:1", "gp:lb", "L.B")
         gc.group_join(gb, "gp:la")        # a stale leader moves (rules off)
         _left_ga = ga not in gc.GROUP_MEMBERS and "gp:ma" not in gc.GROUP_OF
         gc.group_leave("gp:la")
@@ -14440,7 +15723,9 @@ def _group_persist_pins():
         s = session.Session("198.51.100.8:1")
         _n = [s.on_packet(packet.parse(packet.build(m, b, pushes.QUEUE_SEQ)))
               for m, b in ((0x0131, b""), (0x0189, b"\x01\x00\x00\x00"))]
-        _g8_ok = _n == [[], []] and set(lobapi.CLIENT_NOTICES) == {0x0131, 0x0189}
+        # lobapi.CLIENT_NOTICES grew on 2026-10-08 (0x017A/0x0180/0x0193/0x01C8);
+        # the pin is that these two are named, not that the table is closed
+        _g8_ok = _n == [[], []] and {0x0131, 0x0189} <= set(lobapi.CLIENT_NOTICES)
         print(f"  lobby: 0x0131 and 0x0189 (client notices on the queue sequence) "
               f"are named and answered with silence: {'OK' if _g8_ok else 'FAIL'}")
         ok &= _g8_ok
@@ -14760,6 +16045,9 @@ from . import (  # noqa: E402
 )
 from . import loot, settlement  # noqa: E402  (the spoils / order pins)
 from . import missiongroups  # noqa: E402  (the mission group pins)
+from . import defaults  # noqa: E402  (the release seed pin)
+from . import events  # noqa: E402  (the service medal kept off the squadron picker)
+import fmoarena  # noqa: E402  (the Clash of Iron calendar, emptied for the run)
 
 
 def _training_events_pins():
@@ -14878,144 +16166,751 @@ def _training_events_pins():
     return ok
 
 
-def _personnel_orders_pins():
-    """THE PERSONNEL OFFICER'S ORDERS (servicerecord.personnel_visit, static
-    2026-10-07), no client. (1) ranks.orders_pending is 0x61175510 transcribed,
-    and its twin: the old "promote at the desk" reply (+0x0D = the new rank
-    while this login's ordered rank is the old one) leaves the mission desk
-    locked; (2) 0x014A carries the pending order at +0x58E and the held rank at
-    +0x2F; (3) a Captain's review: 3 sector wins -> an ORDER (not shown this
-    session, 36:2), the next login gates the desk, the officer's next 0x0176
-    carries +0x0D = the order (36:12) and the gate clears; (4) 'full' with no
-    wins -> a demotion order (36:23), delivered as First Lieutenant at ~90% of
-    the bar (36:13); 'promote' mode keeps (36:4); a full Major slot passes
-    over (36:14); (5) a contribution step is banked at once but +0x0D stays
-    this session's rank; (6) the outlook below the review band; (7) the same
-    flow through Session.on_packet(0x0175)."""
-    import tempfile as _tf
-    fails = []
-
-    def _c(n, v):
-        if not v:
-            fails.append(n)
-        return bool(v)
-
-    sr, rk = servicerecord, ranks
+def _gap_round3_pins():
+    """Gap pins, no client. R1 the NPC
+    squad is kept out of a Coliseum arena match, a spectator channel and an
+    arena zone, and a sector sortie keeps it; the judge decides a pilots-only
+    match from deaths. R2 /anon (0x0187): stored on the session and the
+    character (one commit per change), the 0x014A block carries +0x2C = 1,
+    the war map's pilot search hides the pilot, a Tell by exact name still
+    finds it. R3 voice: cmd 122 {0} rewrites the member blob's +0x58 to 0 on
+    every group channel of the group (cmd 191), {1} back to 1, the same value
+    twice sends nothing, cmd 121 is noted only, a cmd 190 introduction
+    carries the stored state. R4 every builder-3 id is in CLIENT_REQUESTS and
+    named; the four notices decode and answer nothing without falling to
+    "no handler". R5 battle cmds: 21 relayed on the sender's alias stream with
+    the header rewritten (not for another unit, not over a live peer link);
+    112 for an owned squad unit = cmd 8 REMOVE to the requester + the room,
+    refused for a unit it does not own; 14 / 111 named once per channel. R6
+    0x0161: 0x40-B rows at +0x14 the consumer 0x6118D360 walks (names, the
+    nation byte at +0x22 it filters on), only pilots on that map and not
+    ended, sorted, capped; 0x015F rows keep their 0x6C stride. Returns ok."""
+    import io as _io
+    import contextlib as _ctx
+    from . import coliseum as _co
+    from . import msgnames, pvproom
     ok = True
-    # (1) the predicate, transcribed, at floor 0 (today's wire) and 21 (SE's)
-    ok &= _c(1, not rk.orders_pending(20, 0, 20) and rk.orders_pending(21, 0, 20)
-             and rk.orders_pending(19, 0, 20)
-             and not rk.orders_pending(20, 21, 19) and not rk.orders_pending(5, 21, 0)
-             and rk.orders_pending(20, 21, 21) and rk.orders_pending(21, 21, 20)
-             and not rk.orders_pending(22, 21, 22) and rk.orders_pending(22, 21, 21)
-             and rk.RANK_ORDER_FLOOR == 0)
-    _T = 1_800_000_000
-    _iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-    _wins = lambda n, cat=2: [{"cat": cat, "status": "complete",
-                               "reported": _iso(_T - (i + 1) * 3600)} for i in range(n)]
-    _save = (sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS, sr.REVIEW_CAPS, sr.CEASEFIRE,
-             sr.OUTLOOK_AUTO, status.STATUS_ACKRANK, charstore.CHAR_STORE)
+    T0 = 1_800_000_000.0
+
+    # --- R1 the arena squad gate
+    _bk = battlepop.squad_blocked_for
+    _az = settlement.arena_zone
+    _r1 = (_bk({"arena_match": 7}, 509, _az) is not None
+           and _bk({"arena_spectate": 7}, 509, _az) is not None
+           and _bk({}, 600, _az) is not None and _bk({}, 607, _az) is not None
+           and _bk({}, 509, _az, in_match=True) is not None
+           and _bk({"mapno": 267}, 509, _az) is None
+           and _bk(None, 200, _az) is None
+           and _bk({"training": True}, 200, _az) is None
+           and _bk({}, 599, _az) is None and _bk({}, 608, _az) is None)
+    _sv1 = (_co.OFFICIAL, _co._COLISEUM)
     try:
-        sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS = "full", 3, 7
-        sr.REVIEW_CAPS, sr.CEASEFIRE, sr.OUTLOOK_AUTO = {21: 2}, False, True
-        status.STATUS_ACKRANK = None
-        # (2)
-        _oc = {"rank": 20, "rank_order": {"rank": 21, "kind": "promote", "why": "review"}}
-        _ob = status.reply_014a(char=_oc)
-        ok &= _c(2, _ob[status.S14A_RANK] == 20 and _ob[status.S14A_BE1A] == 21
-                 and status.rank_and_ack(_oc) == (20, 21)
-                 and status.rank_and_ack({"rank": 20}) == (20, 20))
-        # (3) promotion by review: issued, then delivered after a relog
-        _cap = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * sr.DAY,
-                "missions": _wins(3), "nation_byte": 1}
-        _v1 = sr.personnel_visit(_cap, 20, 20, now=_T, held=lambda r, n: 0)
-        _a, _cc = status.rank_and_ack(_cap)
-        _locked = rk.orders_pending(_a, 0, _cc)
-        _v2 = sr.personnel_visit(_cap, _a, _cc, now=_T + 60)
-        ok &= _c(3, _v1["verdict"] == "promote" and _v1["send_rank"] == 20
-                 and _v1["outlook"] == sr.OUTLOOK_ORDERS_SOON and _v1["issued"]["rank"] == 21
-                 and (_a, _cc) == (20, 21) and _locked
-                 and _v2["delivered"]["rank"] == 21 and _v2["send_rank"] == 21
-                 and _v2["outlook"] == sr.OUTLOOK_PROMOTED and _cap["rank"] == 21
-                 and "rank_order" not in _cap and _cap["review_at"] == _T + 60
-                 and not rk.orders_pending(_v2["send_rank"], 0, _cc))
-        # (4) demotion ('full'), keep ('promote'), passed over (cap full)
-        _dn = {"rank": 20, "contribution": 300000, "review_at": _T - 8 * sr.DAY}
-        _d1 = sr.personnel_visit(_dn, 20, 20, now=_T)
-        _d1["issued"] = dict(_d1["issued"] or {}, held=_dn["rank"])
-        _d2 = sr.personnel_visit(_dn, 20, 19, now=_T + 60)
-        _kp = {"rank": 20, "review_at": _T - 8 * sr.DAY}
-        _k1 = sr.personnel_visit(_kp, 20, 20, now=_T, mode="promote")
-        _po = {"rank": 20, "review_at": _T - 8 * sr.DAY, "missions": _wins(4)}
-        _p1 = sr.personnel_visit(_po, 20, 20, now=_T, held=lambda r, n: 2)
-        ok &= _c(4, _d1["verdict"] == "demote" and _d1["outlook"] == sr.OUTLOOK_DEMOTION_SOON
-                 and _d1["issued"]["rank"] == 19 and _d1["issued"]["held"] == 20
-                 and _d1["send_rank"] == 20)
-        ok &= _c(4, _d2["delivered"] and _d2["send_rank"] == 19 and _dn["rank"] == 19
-                 and _d2["outlook"] == sr.OUTLOOK_DEMOTED
-                 and _dn["contribution"] == sr.review_demoted_contribution(19)
-                 and "review_at" not in _dn
-                 and _k1["verdict"] == "keep" and _k1["outlook"] == sr.OUTLOOK_NO_MESSAGE
-                 and _kp["rank"] == 20 and "rank_order" not in _kp
-                 and _p1["verdict"] == "keep" and _p1["outlook"] == sr.OUTLOOK_PASSED_OVER)
-        # (5) a contribution step: banked, shown from the next login
-        _ct = {"rank": 5, "contribution": 294400}
-        _c1 = sr.personnel_visit(_ct, 5, 5, now=_T)
-        _c2 = sr.personnel_visit(_ct, 5, 5, now=_T + 60)
-        ok &= _c(5, _c1["send_rank"] == 5 and _ct["rank"] == 20 and "rank_order" not in _ct
-                 and _c1["outlook"] == sr.OUTLOOK_ORDERS_SOON and _c2["send_rank"] == 5
-                 and status.rank_and_ack(_ct) == (20, 20) and _ct["review_at"] == _T)
-        # (6) the outlook below the band and mid-period
-        _lo, _hi = rk.rank_threshold(10) or 0, rk.rank_threshold(11) or 0
-        ok &= _c(6, sr.contribution_outlook(10, _lo - 1) == sr.OUTLOOK_UNRECOGNISED
-                 and sr.contribution_outlook(10, _lo) == sr.OUTLOOK_NO_MESSAGE
-                 and sr.contribution_outlook(10, (_lo + _hi) // 2 + 1) == sr.OUTLOOK_REGARDED
-                 and sr.personnel_visit({"rank": 20, "review_at": _T - sr.DAY,
-                                         "missions": _wins(1)}, 20, 20, now=_T)["outlook"]
-                 == sr.OUTLOOK_REGARDED
-                 and sr.personnel_visit({"rank": 20, "review_at": _T - sr.DAY}, 20, 20,
-                                        now=_T)["outlook"] == sr.OUTLOOK_UNRECOGNISED
-                 and sr.personnel_visit({"rank": 24}, 24, 24, now=_T)["outlook"]
-                 == sr.OUTLOOK_NO_MESSAGE)
-        # (7) through the handler: issue on visit 1, +0x0D unchanged; a new
-        # session (relog) delivers it
-        with _tf.TemporaryDirectory() as _td:
-            flat_globals()["CHAR_STORE"] = os.path.join(_td, "chars.json")
-            _pl = {"id": 1, "first": "Pin", "last": "Orders", "rank": 20,
-                   "contribution": 300000, "review_at": int(time.time()) - 8 * sr.DAY,
-                   "missions": [{"cat": 2, "status": "complete",
-                                 "reported": _iso(int(time.time()) - 3600)}] * 3}
-
-            def _visit(sess):
-                _o = sess.on_packet(packet.parse(packet.build(sr.MSG_0175_REQ, b"", 0x175)))
-                _b = packet.parse(_o[0])["payload"][0x20:]
-                return _b[sr.S176_RANK], _b[sr.S176_OUTLOOK]
-
-            def _sess():
-                _s = session.Session("selftest-orders:1")
-                _s._roster = [_pl]
-                _s.playing_char = lambda: _pl
-                _s.commit = lambda what: None
-                _s.all_rosters = lambda: [("a", [_pl])]
-                return _s
-            _s1 = _sess()
-            _h1 = _visit(_s1)
-            _h1b = _visit(_s1)
-            _gate = status.rank_and_ack(_pl)
-            _h2 = _visit(_sess())
-            ok &= _c(7, _h1 == (20, sr.OUTLOOK_ORDERS_SOON) and _h1b == (20, sr.OUTLOOK_ORDERS_SOON)
-                     and _gate == (20, 21) and _h2 == (21, sr.OUTLOOK_PROMOTED)
-                     and _pl["rank"] == 21 and status.rank_and_ack(_pl) == (21, 21))
+        _co.OFFICIAL = _co.parse_official("1:4:30001")
+        _col = _co.Coliseum(load=False)
+        _col.save = lambda: True
+        _co._COLISEUM = _col
+        _col.match_of["r3:a"] = 1
+        _r1 &= (_co.account_in_match("r3:a") and not _co.account_in_match("r3:b")
+                and not _co.account_in_match(None))
+        _m = {"pushed": T0, "go": {"r3:a": T0 + 12, "r3:b": T0 + 12},
+              "teams": [{"members": ["r3:a"]}, {"members": ["r3:b"]}]}
+        _j = _col.judge(_m, T0 + 60, lambda a: True, {"r3:b": T0 + 50})
+        _r1 &= bool(_j) and _j[0] == 0
+        _co._COLISEUM = None
+        _r1 &= not _co.account_in_match("r3:a")
     finally:
-        (sr.REVIEW, sr.REVIEW_PROMOTE, sr.REVIEW_DAYS, sr.REVIEW_CAPS, sr.CEASEFIRE,
-         sr.OUTLOOK_AUTO, status.STATUS_ACKRANK, _cs) = _save
-        flat_globals()["CHAR_STORE"] = _cs
-    _skip = (None if rk.RANK_LADDER else
-             "SKIP (fmodata/fmo-ranks.tsv missing; build it with tools/fmodata_build.py)")
-    _hard = [n for n in fails if not (_skip and n in (4, 5, 6, 7))]
-    print(f"  personnel orders: the desk gate 0x61175510 (twin: promoting at the desk "
-          f"locks it), the order at 0x014A +0x58E, review promote/demote as ORDERS "
-          f"delivered at the next visit after a relog, keep / passed-over lines, a "
-          f"contribution step shown from the next login, through 0x0175: "
-          f"{'OK' if not fails else ('FAIL at ' + str(fails)) if _hard else _skip}")
-    return not _hard
+        _co.OFFICIAL, _co._COLISEUM = _sv1
+    print(f"  arena squad gate: an arena match / spectator / Coliseum zone pops no "
+          f"NPC squad, a sector or training sortie keeps it; a pilots-only match "
+          f"is judged from deaths: {'OK' if _r1 else 'FAIL'}")
+    ok &= _r1
+
+    # --- R2 /anon
+    class _AS:
+        peer = "selftest"
+
+        def __init__(self, ip, cid, first, last):
+            self.ip, self.anon, self.commits = ip, 0, []
+            self._c = {"id": cid, "first": first, "last": last}
+
+        def playing_char(self):
+            return self._c
+
+        def commit(self, what):
+            self.commits.append(what)
+
+        def grant_nation(self):
+            return 1, "selftest"
+
+    _s = _AS("198.51.100.9", 1, "Ann", "Onym")
+    _t = _AS("198.51.100.10", 2, "Bob", "Seen")
+
+    def _pk(v):
+        return packet.parse(packet.build(
+            community.MSG_ANON_SET, bytes([v, 0, 0, 0]), seq=pushes.QUEUE_SEQ, conn_id=0))
+
+    _sv2 = (flat_globals()["CHAR_STORE"], trade.live_pilots, community.PILOT_SEARCH,
+            community.PILOT_SEARCH_MAX, dict(rooms.WORLD_ZONES))
+    _r2 = True
+    try:
+        flat_globals()["CHAR_STORE"] = "selftest-stub"
+        _r2 &= (community.on_anon_set(_s, _pk(1)) == [] and _s.anon == 1
+                and _s._c["anon"] == 1 and _s.commits == ["/anon on"])
+        _r2 &= (community.on_anon_set(_s, _pk(0)) == [] and _s.anon == 0
+                and _s._c["anon"] == 0 and _s.commits == ["/anon on", "/anon off"])
+        community.on_anon_set(_s, _pk(0))
+        _r2 &= len(_s.commits) == 2 and community.pilot_anon(_s) is False
+        community.on_anon_set(_s, _pk(1))
+        _r2 &= len(_s.commits) == 3 and community.pilot_anon(_s) is True
+        _f1 = status.status_fields(rank=0, char={"anon": 1}, active_setup=0)
+        _f0 = status.status_fields(rank=0, char={"anon": 0}, active_setup=0)
+        _r2 &= (any(off == status.S14A_ANON and val == b"\x01" for _l, off, val, _sr in _f1)
+                and not any(off == status.S14A_ANON for _l, off, val, _sr in _f0)
+                and status.S14A_ANON == status.S14A_BLOCK + 0x2C == status.S14A_ACTIVE_SETUP + 1)
+        rooms.WORLD_ZONES.clear()
+        rooms.WORLD_ZONES.update({_s.ip: 100, _t.ip: 100})
+        trade.live_pilots = lambda now=None: [_s, _t]
+        community.PILOT_SEARCH, community.PILOT_SEARCH_MAX = True, 50
+        _recs, _tot, _note = community.pilot_search_rows(
+            fmomsn.PilotSearchQuery(fmomsn.OP6_BODY_LIVE))
+        _names = [r[4:21].split(b"\0")[0] for r in _recs]
+        _r2 &= _names == [b"Bob"] and _tot == 1 and "1 with /anon on hidden" in _note
+        _r2 &= trade.tell_target(_t, "Ann", "Onym")[0] is _s
+        _s._c["anon"] = 0
+        _recs2, _tot2, _note2 = community.pilot_search_rows(
+            fmomsn.PilotSearchQuery(fmomsn.OP6_BODY_LIVE))
+        _r2 &= _tot2 == 2 and "hidden" not in _note2
+    finally:
+        (flat_globals()["CHAR_STORE"], trade.live_pilots, community.PILOT_SEARCH,
+         community.PILOT_SEARCH_MAX) = _sv2[:4]
+        rooms.WORLD_ZONES.clear()
+        rooms.WORLD_ZONES.update(_sv2[4])
+    print(f"  /anon 0x0187: stored on session + character (one commit per change), "
+          f"0x014A +0x2C = 1 (8:49 at login), hidden from the pilot search, a Tell "
+          f"still finds the pilot: {'OK' if _r2 else 'FAIL'}")
+    ok &= _r2
+
+    # --- R3 voice on / off (cmds 121 / 122)
+    _r3 = True
+    if groupchannel.GROUP_TABLES is not None:
+        _ga, _gb = ("203.0.113.60", 1427), ("203.0.113.60", 19155)
+        _kA, _kB = _ga + ("group",), _gb + ("group",)
+        _cA, _cB = worldchannel.WorldChannel(_ga), worldchannel.WorldChannel(_gb)
+        _sv3 = (dict(groupchannel.GROUP_MEMBERS), dict(groupchannel.GROUP_OF),
+                dict(battlegroups.GROUP_CREATOR_ACCOUNT), dict(groupchannel.GROUP_VOICE))
+        try:
+            for _i, (_c, _k, _acc) in enumerate(((_cA, _kA, "r3:va"), (_cB, _kB, "r3:vb"))):
+                _c.key, _c.tables, _c.char_id = groupchannel.GROUP_KEY, groupchannel.GROUP_TABLES, 0
+                _c.peer_key, _c.account, _c.group_popped = _k, _acc, True
+                _c.group_uid, _c.seen_at = 0x1001 + _i, time.time()
+                groupchannel.WORLD_PEERS[_k] = _c
+            groupchannel.GROUP_MEMBERS.clear()
+            groupchannel.GROUP_OF.clear()
+            groupchannel.GROUP_VOICE.clear()
+            groupchannel.group_join(78, "r3:va")
+            groupchannel.group_join(78, "r3:vb")
+            battlegroups.GROUP_CREATOR_ACCOUNT[78] = "r3:va"
+            _al = _cA.alias_for(_kB)
+            _cA.pending.clear()
+            _cB.pending.clear()
+            _voff = groupchannel.G191_BLOB_FROM
+
+            def _vb(rec):
+                return rec[fmoworld.REC_HDR + 8 + groupchannel.G190_VOICE - _voff]
+
+            def _cmd(rec):
+                return struct.unpack_from("<I", rec, 4)[0]
+
+            def _uid(rec):
+                return struct.unpack_from("<I", rec, fmoworld.REC_HDR)[0]
+
+            _r3 &= groupchannel.group_member_voice("r3:vb") == 1
+            _n0 = groupchannel.on_voice_cmd(_cB, _gb, 122, bytes(4))
+            _r3 &= (_n0 == 2 and groupchannel.GROUP_VOICE["r3:vb"]["on"] is False
+                    and groupchannel.group_member_voice("r3:vb") == 0
+                    and len(_cA.pending) == 1 and len(_cB.pending) == 1
+                    and _cmd(_cA.pending[0]) == roomrelay.GROUP_BLOB_UPDATE_CMD
+                    and _uid(_cA.pending[0]) == _al and _vb(_cA.pending[0]) == 0
+                    and _uid(_cB.pending[0]) == 0x1002 and _vb(_cB.pending[0]) == 0)
+            _r3 &= groupchannel.on_voice_cmd(_cB, _gb, 122, bytes(4)) == 0 and len(_cA.pending) == 1
+            _r3 &= (groupchannel.on_voice_cmd(_cB, _gb, 121, b"\x01\0\0\0") == 0
+                    and groupchannel.GROUP_VOICE["r3:vb"]["talk"] is True
+                    and len(_cA.pending) == 1)
+            _rec190 = groupchannel.group_remote_member_record(
+                _al, "B", "B", False, groupchannel.GROUP_KEY, 0x41, "127.0.0.1", 61300,
+                voice=bool(groupchannel.group_member_voice("r3:vb")))
+            _r3 &= _rec190[fmoworld.REC_HDR + groupchannel.G190_VOICE] == 0
+            _n1 = groupchannel.on_voice_cmd(_cB, _gb, 122, b"\x01\0\0\0")
+            _r3 &= (_n1 == 2 and groupchannel.group_member_voice("r3:vb") == 1
+                    and _vb(_cA.pending[-1]) == 1 and _uid(_cA.pending[-1]) == _al)
+            _r3 &= groupchannel.on_voice_cmd(worldchannel.WorldChannel(("203.0.113.61", 5)),
+                                             ("203.0.113.61", 5), 122, bytes(4)) == 0
+        finally:
+            groupchannel.WORLD_PEERS.pop(_kA, None)
+            groupchannel.WORLD_PEERS.pop(_kB, None)
+            groupchannel.GROUP_MEMBERS.clear()
+            groupchannel.GROUP_MEMBERS.update(_sv3[0])
+            groupchannel.GROUP_OF.clear()
+            groupchannel.GROUP_OF.update(_sv3[1])
+            battlegroups.GROUP_CREATOR_ACCOUNT.clear()
+            battlegroups.GROUP_CREATOR_ACCOUNT.update(_sv3[2])
+            groupchannel.GROUP_VOICE.clear()
+            groupchannel.GROUP_VOICE.update(_sv3[3])
+        print(f"  voice 121/122: cmd 122 0 -> cmd 191 with +0x58 = 0 on both group "
+              f"channels (alias on the other's, own id on the sender's), 1 back to 1, "
+              f"a repeat sends nothing, 121 is noted only, a cmd 190 carries the stored "
+              f"state: {'OK' if _r3 else 'FAIL'}")
+    else:
+        print("  voice 121/122: SKIPPED (no group tables in this build)")
+    ok &= _r3
+
+    # --- R4 the third builder's ids
+    _r4 = (pushes.BUILDER3_IDS <= set(pushes.CLIENT_REQUESTS)
+           and all(i in msgnames.MSG_NAMES for i in pushes.BUILDER3_IDS)
+           and {0x017A, 0x0180, 0x0193, 0x01C8} <= set(lobapi.CLIENT_NOTICES)
+           and lobapi.notice_detail(0x017A, struct.pack("<I", 0x24) + bytes(16)) == "value 0x24"
+           and lobapi.notice_detail(0x0193, bytes(12)) == "empty body"
+           and lobapi.notice_detail(0x01C8, b"\x01" + bytes(19)) == "byte 1 (0x613955E4)"
+           and lobapi.notice_detail(0x0180, bytes(0x10) + bytes(range(1, 25))).startswith("item record 01 02")
+           and lobapi.notice_detail(0x0189, b"\x02") == "status byte 2")
+    for _mid, _sz in ((0x017A, 20), (0x0180, 40), (0x0193, 12), (0x01C8, 20), (0x0187, 4)):
+        _buf = _io.StringIO()
+        with _ctx.redirect_stdout(_buf):
+            _outs = session.Session("sweep:0").on_packet(packet.parse(packet.build(
+                _mid, bytes(_sz), seq=pushes.QUEUE_SEQ, conn_id=1)))
+        _r4 &= _outs == [] and "no handler" not in _buf.getvalue()
+    print(f"  builder 3 (0x6119A080): all {len(pushes.BUILDER3_IDS)} ids in CLIENT_REQUESTS "
+          f"and MSG_NAMES; 0x017A / 0x0180 / 0x0193 / 0x01C8 decode and answer nothing, "
+          f"0x0187 too: {'OK' if _r4 else 'FAIL'}")
+    ok &= _r4
+
+    # --- R5 battle cmds 21 / 112 / 14 / 111
+    _bh1, _bh2 = ("203.0.113.71", 19155), ("203.0.113.72", 19155)
+    _c1, _c2 = worldchannel.WorldChannel(_bh1), worldchannel.WorldChannel(_bh2)
+    _sv5 = (room.ROOM, room.ROOM_SAME_ZONE, squad.DEPOP_REQ,
+            rooms.SORTIE_MAP.get("r3:p1"), rooms.SORTIE_MAP.get("r3:p2"))
+    _r5 = True
+    try:
+        for _c, _a in ((_c1, "r3:p1"), (_c2, "r3:p2")):
+            _c.account, _c.key, _c.seen_at = _a, b"xbattle", time.time()
+            _c.loc = {"map": 418, "zone": 200}
+            _c.char_id = (charlist.CHAR_WIRE_BASE or 0) + 1
+            groupchannel.WORLD_PEERS[_c.addr] = _c
+        flat_globals()["ROOM"], flat_globals()["ROOM_SAME_ZONE"] = True, True
+        squad.DEPOP_REQ = True
+        referee.battle_state("r3:p1", reset=True)
+        referee.battle_state("r3:p2", reset=True)
+        rooms.SORTIE_MAP["r3:p1"] = rooms.SORTIE_MAP["r3:p2"] = 418
+        _al2 = _c2.alias_for(_c1.addr)
+        _c2.remotes[_al2].popped = True
+        _mine = _c1.self_unit()
+        _b21 = struct.pack("<IIII", 0x63, _mine, 0x2224, 5)
+        _n21 = squad.unit_event_relay(_c1, _bh1, 21, _b21, _mine)
+        _rs2 = _c2.remotes[_al2]
+        _rec = _rs2.pending[-1] if _rs2.pending else b""
+        _r5 &= (_n21 == 1 and len(_rec) == fmoworld.REC_HDR + 16
+                and struct.unpack_from("<III", _rec, 4)[:2] == (21, _al2)
+                and struct.unpack_from("<IIII", _rec, fmoworld.REC_HDR) == (0x63, _al2, 0x2224, 5))
+        _r5 &= squad.unit_event_relay(_c1, _bh1, 21, _b21, 0x2224) == 0
+        _r5 &= squad.unit_event_relay(_c1, _bh1, 23, _b21, _mine) == 0
+        _c1.remotes[_c1.alias_for(_c2.addr)].linked = True
+        _r5 &= (squad.unit_event_relay(_c1, _bh1, 21, _b21, _mine) == 0) == bool(room.PEER_LINK)
+        _c1.remotes[_c1.alias_for(_c2.addr)].linked = False
+        referee.BATTLE_STATE["r3:p1"]["squad"] = {
+            "owner": "r3:p1", "ids": [0x2222, 0x2223], "dead": set(), "pos": [], "nation": 2}
+        _c1.pending.clear()
+        _c2.pending.clear()
+        _n112 = squad.depop_request(_c1, _bh1, struct.pack("<IIII", 0x2222, _mine, 1, 0))
+        _d1 = fmoworld.parse_depop(_c1.pending[-1][fmoworld.REC_HDR:]) if _c1.pending else None
+        _d2 = fmoworld.parse_depop(_c2.pending[-1][fmoworld.REC_HDR:]) if _c2.pending else None
+        _r5 &= (_n112 == 2 and _d1 is not None and _d2 is not None
+                and struct.unpack_from("<I", _c1.pending[-1], 4)[0] == fmoworld.CMD_DEPOP
+                and (_d1["unit_id"], _d1["from_id"], _d1["status"]) == (0x2222, _mine, fmoworld.DEPOP_REMOVE)
+                and (_d2["unit_id"], _d2["from_id"], _d2["status"]) == (0x2222, _al2, fmoworld.DEPOP_REMOVE))
+        _r5 &= (squad.depop_request(_c1, _bh1, struct.pack("<IIII", 0x9999, _mine, 1, 0)) == 0
+                and len(_c1.pending) == 1 and len(_c2.pending) == 1)
+        _r5 &= squad.depop_request(_c2, _bh2, struct.pack("<IIII", 0x2222, _mine, 1, 0)) == 0
+        squad.DEPOP_REQ = False
+        _r5 &= squad.depop_request(_c1, _bh1, struct.pack("<IIII", 0x2223, _mine, 1, 0)) == 0
+        _r5 &= (squad.battle_cmd_note(_c1, _bh1, 14, bytes(12))
+                and not squad.battle_cmd_note(_c1, _bh1, 14, bytes(12))
+                and squad.battle_cmd_note(_c1, _bh1, 111, bytes(12))
+                and not squad.battle_cmd_note(_c1, _bh1, 21, b"")
+                and {14, 21, 111, 112, 121, 122} <= pvproom.KNOWN_BATTLE_CMDS)
+    finally:
+        flat_globals()["ROOM"], flat_globals()["ROOM_SAME_ZONE"] = _sv5[:2]
+        squad.DEPOP_REQ = _sv5[2]
+        for _k, _v in (("r3:p1", _sv5[3]), ("r3:p2", _sv5[4])):
+            if _v is None:
+                rooms.SORTIE_MAP.pop(_k, None)
+            else:
+                rooms.SORTIE_MAP[_k] = _v
+        groupchannel.WORLD_PEERS.pop(_c1.addr, None)
+        groupchannel.WORLD_PEERS.pop(_c2.addr, None)
+        referee.BATTLE_STATE.pop("r3:p1", None)
+        referee.BATTLE_STATE.pop("r3:p2", None)
+    print(f"  battle cmds: 21 relayed on the alias stream (header + body ids rewritten; "
+          f"not for another unit, not over a live link); 112 on an owned squad unit = "
+          f"cmd 8 REMOVE to requester + room, else refused; 14 / 111 named once: "
+          f"{'OK' if _r5 else 'FAIL'}")
+    ok &= _r5
+
+    # --- R6 0x0161 Player Information rows
+    class _PS:
+        def __init__(self, acct, first, last, nation):
+            self._a, self._c, self._n = acct, {"first": first, "last": last}, nation
+
+        def battle_key(self):
+            return self._a
+
+        def playing_char(self):
+            return self._c
+
+        def grant_nation(self):
+            return self._n, "selftest"
+
+    _states = {"w:a": {"mapno": 418, "ended": False}, "w:b": {"mapno": 418, "ended": False},
+               "w:c": {"mapno": 267, "ended": False}, "w:d": {"mapno": 418, "ended": True}}
+    _pilots = [_PS("w:b", "Zed", "Last", 2), _PS("w:a", "Abe", "First", 1),
+               _PS("w:c", "Cy", "Other", 1), _PS("w:d", "Dee", "Done", 1),
+               _PS("w:e", "Eve", "Lobby", 1)]
+    _rows = warmap.player_rows_for_map(418, _pilots, _states, T0, 20, warmap.session_nation)
+    _body = warmap.reply_warmap_list(0, _rows)
+    # the consumer's walk: count at +0x00, rows from +0x14 at stride 0x40
+    _cnt = struct.unpack_from("<I", _body, 0)[0]
+    _walk = [_body[0x14 + i * 0x40:0x14 + (i + 1) * 0x40] for i in range(_cnt)]
+    _two = warmap.reply_warmap_list(0, warmap.warmap_rows([418, 267]))
+    _r6 = (len(_rows) == 2 and _cnt == 2 and len(_body) == 0x14 + 2 * 0x40
+           and all(len(r) == warmap.S161_ROW_LEN for r in _walk)
+           and [r[:0x11].split(b"\0")[0] for r in _walk] == [b"Abe", b"Zed"]
+           and [r[0x11:0x22].split(b"\0")[0] for r in _walk] == [b"First", b"Last"]
+           and [r[0x22] for r in _walk] == [1, 2]
+           and [r for r in _walk if r[0x22] == 1][0][:3] == b"Abe"
+           and warmap.player_rows_for_map(418, _pilots, _states, T0, 1, warmap.session_nation)[0][:3] == b"Abe"
+           and warmap.player_rows_for_map(999, _pilots, _states, T0, 20, warmap.session_nation) == []
+           and warmap.reply_warmap_list(0, []) == bytes(0x14)
+           and len(_two) == 0x14 + 2 * 0x6C
+           and struct.unpack_from("<I", _two, 0x14 + 0x6C)[0] == 267
+           and len(warmap.player_row("x" * 40, "", 1)) == 0x40
+           and warmap.player_row("x" * 40, "", 1)[0x10] == 0)
+    print(f"  0x0161: count + 0x40-B rows from +0x14 (names at +0x00 / +0x11, nation "
+          f"at +0x22), only live pilots on that map, sorted and capped; 0x015F keeps "
+          f"0x6C rows: {'OK' if _r6 else 'FAIL'}")
+    ok &= _r6
+    return ok
+
+
+def _story_round2_pins():
+    """THE STORY FLOW, no client. Returns ok.
+
+    Pins: (1) the exp formula (battleend.EXP_FORMULA): per sortie, per kill,
+    per room-mate's kill and per win, in thousandths of the Pilot level step,
+    tapered by level, x1.5 on a won story battle, split over the set jobs;
+    FMO_EXP_PACE > 0 still overrides it; through settle_battle it pays the
+    kills the battle state holds. (2) FMO_PROGRESS_LEVEL_FOLLOW is off: a
+    completion raises nothing, and every catalogue row of both nations is
+    reachable by battle exp in order (progress.level_plan). (3) SE's platoon
+    chart. (4) A story sortie onto a Frontline sector that would CREATE a
+    waiting room starts at once with the mission's battle (topics/060804);
+    the same sector without the mission still waits. (5) Each objective kind
+    the story table serves: annihilate with waves, target, spare, count,
+    order, survive, a protected ally, the time limit; the target flag and
+    names on the POP. (6) Only the leader's story mission advances; a member
+    gets the battle's exp but not the step. (7) The table loads, every row
+    parses and the block carries a story time limit."""
+    import random as _rnd
+    ok = True
+    curve = classes.CLASS_CURVE
+
+    # --- (1) the exp formula
+    _f_ok = bool(curve)
+    if curve:
+        s1 = curve[1] - curve[0]
+        s2 = curve[2] - curve[1]
+        _f_ok = (battleend.formula_exp_total(1, True, 3, 0, curve) == s1 * 330 // 1000
+                 and battleend.formula_exp_total(1, False, 0, 0, curve) == s1 * 40 // 1000
+                 and battleend.formula_exp_total(1, False, 1, 2, curve)
+                 == s1 * (40 + 80 + 40) // 1000
+                 and battleend.formula_exp_total(2, True, 3, 0, curve)
+                 == s2 * 330 // 1000 * 6 // 7
+                 and battleend.formula_exp_total(1, True, 3, 0, curve, story=True)
+                 == s1 * 330 // 1000 * 150 // 100
+                 and battleend.formula_exp_total(1, False, 3, 0, curve, story=True)
+                 == s1 * 280 // 1000
+                 and battleend.formula_exp_total(len(curve), True, 3, 0, curve) == 0
+                 and battleend.formula_exp_rows(1, True, 3, 0, curve, [5, 1], main_pct=50)
+                 == [(5, s1 * 330 // 1000 // 2), (1, s1 * 330 // 1000 - s1 * 330 // 1000 // 2)]
+                 and battleend.formula_exp_rows(1, True, 3, 0, curve, []) == [])
+        # exp_kill_counts: own kills, and the squad's other deaths less friendly fire
+        _kst = {"enemies": {1, 2, 3, 4}, "kills": [(1, 0), (2, 0), (9, 0)],
+                "squad": {"dead": {1, 2, 3, 4}, "friendly_fire": [(4, 7)]}}
+        _f_ok &= settlement.exp_kill_counts(_kst) == (2, 1)
+        # through the settlement: no job set -> FMO_EXP_JOBS (Mechanic), Pilot row too
+        _saved = (battleend.EXP_PACE, battleend.EXP_FORMULA, battleend.BATTLE_END_EXP,
+                  battleend.KILL_EXP, battleend.EXP_SECTOR_PCT, battleend.EXP_FRONT_PCT,
+                  charstore.CHAR_STORE, battleend.PILOT_EXP_PCT)
+        _seen = []
+        try:
+            battleend.EXP_PACE, battleend.EXP_FORMULA = 0, True
+            battleend.BATTLE_END_EXP, battleend.KILL_EXP = "", ""
+            battleend.EXP_SECTOR_PCT, battleend.EXP_FRONT_PCT = 100, 100
+            battleend.PILOT_EXP_PCT = 100
+            charstore.CHAR_STORE = charstore.CHAR_STORE or "selftest-not-written"
+            _pc = {"money": 0, "contribution": 0, "nation_byte": 1}
+            referee.BATTLE_STATE["selftest-r2exp"] = {
+                "enemies": {0x2222, 0x2223, 0x2224}, "kills": [(0x2222, 1), (0x2223, 2)],
+                "squad": {"dead": {0x2222, 0x2223, 0x2224}}}
+            _s = session.Session.__new__(session.Session)
+            _s.peer, _s.ip = "selftest-r2exp", "selftest-r2exp"
+            _s.battle_settlement = None
+            _s.playing_char = lambda: _pc
+            _s.stored_money = lambda: (0, 0)
+            _s.credit_money = lambda why, money=0, contribution=0: (money, contribution)
+            _s.credit_class_exp = lambda why, rows: _seen.extend(rows) or {}
+            _s.owe_kill_bonus = lambda hs, n: None
+            _s.battle_key = lambda: "selftest-r2exp"
+            _st = _s.settle_battle("selftest story exp", won=True)
+            _tot = s1 * (40 + 2 * 80 + 1 * 20 + 50) // 1000
+            _f_ok &= dict(_st["exp_rows"]) == {3: _tot, 12: _tot}
+            # the pace override still wins when set
+            battleend.EXP_PACE = 4
+            _s.battle_settlement = None
+            _st4 = _s.settle_battle("selftest story pace", won=True)
+            _f_ok &= dict(_st4["exp_rows"]) == {3: s1 // 4, 12: s1 // 4}
+        finally:
+            (battleend.EXP_PACE, battleend.EXP_FORMULA, battleend.BATTLE_END_EXP,
+             battleend.KILL_EXP, battleend.EXP_SECTOR_PCT, battleend.EXP_FRONT_PCT,
+             charstore.CHAR_STORE, battleend.PILOT_EXP_PCT) = _saved
+            referee.BATTLE_STATE.pop("selftest-r2exp", None)
+    print(f"  story exp formula: sortie 40, kill 80, room-mate kill 20, win 50 per mille of the "
+          f"Pilot step, tapered by level, x1.5 on a won story battle, split over the "
+          f"jobs; settle_battle pays the battle's kills; FMO_EXP_PACE overrides: "
+          f"{'OK' if _f_ok else 'FAIL'}")
+    ok &= _f_ok
+
+    # --- (2) no level follow; every row reachable in order
+    _l_ok = (not progress.PROGRESS_LEVEL_FOLLOW) and bool(fmostore) and bool(curve)
+    _plan = {}
+    if _l_ok:
+        _c = {"nation_byte": 1, "flags": fmostore.flags_hex(byte_values={128: 99})}
+        progress.set_pilot_level(_c, 8)
+        _m143 = progress.mission_by_own(_c, 143)
+        _w, _ra = progress.completion_follow(_c, _m143) if _m143 else ("x", None)
+        _l_ok = _m143 is not None and _w == "" and progress.pilot_level(_c) == 8
+        for _nat in (1, 2):
+            _rows, _probs = progress.level_plan(_nat)
+            _plan[_nat] = (len(_rows), _probs)
+            _l_ok &= (bool(_rows) and _probs == []
+                      and all(r[5] is not None for r in _rows)
+                      and all(r[2] <= classes.PILOT_LEVEL_CAP for r in _rows))
+        _l_ok &= progress.wins_to_level(3) <= 10 and progress.wins_to_level(20) <= 200
+    print(f"  story level follow: off (Destroy the Enemy Remnants no longer jumps a "
+          f"Lv8 pilot to 27); both catalogues reachable by battle in order "
+          f"{_plan}; Lv3 in {progress.wins_to_level(3) if curve else '?'} solo wins, "
+          f"Lv20 in {progress.wins_to_level(20) if curve else '?'}: "
+          f"{'OK' if _l_ok else 'FAIL'}")
+    ok &= _l_ok
+
+    # --- (3) SE's platoon chart (BOOT CAMP Lesson 4)
+    _p_ok = (battlegroups.platoon_exp_pct(1) == 100 and battlegroups.platoon_exp_pct(10) == 130
+             and battlegroups.platoon_exp_pct(4) == 110)
+    print(f"  story platoon chart: 1 pilot 100%, 4 pilots 110%, 10 pilots 130% "
+          f"(SE: 1.0 / ~1.3): {'OK' if _p_ok else 'FAIL'}")
+    ok &= _p_ok
+
+    # --- (4) a story sortie on a Frontline tile does not wait
+    _n_ok = bool(fmostore) and bool(progress.MISSION_TILES.get(173))
+    _wire = {}
+    if _n_ok:
+        _tile = sorted(progress.MISSION_TILES[173])[0]
+        pvproom.reset()
+        _sv_ss = sortie.SERVE_SORTIE
+        _sv_sm = dict(rooms.SORTIE_MAP)
+        # a solo pilot: the mission's min/max size (storybattle.size_verdict,
+        # pinned in selftests_round3) is not what this pin is about
+        _sv_sz = storybattle.STORY_SIZE
+        try:
+            storybattle.STORY_SIZE = False
+            flat_globals()["SERVE_SORTIE"] = True
+            for _b173 in (1, 0):
+                _ch = {"nation_byte": 1, "money": 0, "contribution": 0,
+                       "flags": fmostore.flags_hex(byte_values={128: 99, 135: 99, 173: _b173})}
+                progress.set_pilot_level(_ch, 24)
+                _ss = session.Session("selftest-r2story:0")
+                _ss._account = "r2:story"
+                _ss.pilot_trained = lambda: True
+                _ss.playing_char = lambda _c=_ch: _c
+                _ss.sector, _ss.sector_zone = (_tile, 25, 418), 509
+                _ro = [packet.parse(o) for o in _ss.on_packet(packet.parse(packet.build(
+                    sortie.MSG_SORTIE_REQ, bytes(sortie.REQ_0139_LEN), seq=0x7001,
+                    conn_id=1)))]
+                _pl = (_ro[0]["payload"] if _ro and _ro[0]["msg"] == sortie.MSG_SORTIE_REPLY
+                       else b"")
+                _bst = referee.BATTLE_STATE.get(_ss.battle_key()) or {}
+                _bb = sortie.R13A_BLOCK
+                _wire[_b173] = (
+                    struct.unpack_from("<I", _pl, _bb + missionblock.MB_MATCH_FLAGS)[0]
+                    if _pl else None,
+                    pvproom.room_of(_ss.battle_key()) is not None,
+                    (_bst.get("story") or {}).get("byte"),
+                    (getattr(_ss, "sortie_story", None) or {}).get("leader"))
+                pvproom.reset()
+        finally:
+            storybattle.STORY_SIZE = _sv_sz
+            flat_globals()["SERVE_SORTIE"] = _sv_ss
+            rooms.SORTIE_MAP.clear()
+            rooms.SORTIE_MAP.update(_sv_sm)
+        _n_ok = (_wire.get(1) == (0, False, 173, True)
+                 and _wire.get(0) == (0x200, True, None, True))
+    print(f"  story no wait: Sakata accepted (byte 173 = 1) on Front.10 S25 -> no "
+          f"WAITING room, the mission's battle armed; not accepted -> the room waits "
+          f"{_wire}: {'OK' if _n_ok else 'FAIL'}")
+    ok &= _n_ok
+
+    # --- (5) the objective kinds
+    def _row(obj, enemies, allies="", tl=0, timeout="loss", bk=0):
+        return {"nation": 1, "byte": 999, "title": "T", "level": 10,
+                "objective": storybattle.parse_objective(obj),
+                "waves": storybattle.parse_units(enemies),
+                "allies": [u for w in storybattle.parse_units(allies) for u in w],
+                "time_limit": tl, "timeout": timeout, "block_kind": bk,
+                "win": "W", "lose": "L"}
+
+    def _sq(row, n=None):
+        n = n or storybattle.first_on_field(row)
+        sq = {"ids": [0x2222 + i for i in range(n)], "pos": [(10.0 * i, 0.0, 0.0, 0.0)
+                                                            for i in range(n)],
+              "nation": 2, "dead": set(), "parts": None}
+        storybattle.setup_squad(sq, {"story": row}, (0.0, 0.0, 0.0, 0.0),
+                                rnd=_rnd.Random(7))
+        return sq
+
+    def _kill(sq, uid):
+        sq["dead"].add(uid)
+        return storybattle.on_death(sq, uid)
+
+    _o = {}
+    # annihilate with a second wave
+    sq = _sq(_row("annihilate", "wanzer*2 | wanzer"))
+    a = [len(sq["ids"]), _kill(sq, 0x2222), sq["story"]["end"], _kill(sq, 0x2223)]
+    a += [len(sq["ids"]), sq["story"]["end"], _kill(sq, 0x2224), sq["story"]["end"]]
+    _o["annihilate"] = (a[0] == 2 and a[1] == [] and a[2] is None and a[3] == [2]
+                        and a[4] == 3 and a[5] is None and a[7] and a[7][1] is True)
+    # target: an escort down moves nothing, the target down wins; flag + name
+    sq = _sq(_row("target", "boss_big!=Big wanzer*2", bk=1))
+    _p0 = squad.enemy_pop(sq, 0, sq["ids"][0], sq["pos"][0], 0x1001, 0, 0, 101)
+    _p1 = squad.enemy_pop(sq, 1, sq["ids"][1], sq["pos"][1], 0x1001, 0, 0, 101)
+    _kill(sq, 0x2223)
+    e1 = sq["story"]["end"]
+    _kill(sq, 0x2222)
+    _o["target"] = (e1 is None and sq["story"]["end"][1] is True
+                    and sq["targets"] == {0}
+                    and _p0[fmoworld.REC_HDR + storybattle.POP_OBJECTIVE_UNIT] == 1
+                    and _p1[fmoworld.REC_HDR + storybattle.POP_OBJECTIVE_UNIT] == 0
+                    and _p0[fmoworld.REC_HDR + fmoworld.POP_NAME2:
+                            fmoworld.REC_HDR + fmoworld.POP_NAME2 + 4] == b"Big\0"
+                    and (sq["loadouts"][0] or {}).get("kind") in ("boss", None))
+    # spare: a spared unit destroyed loses; the others down win
+    sq = _sq(_row("spare", "wanzer*2 wanzer~=Keep"))
+    _kill(sq, 0x2222)
+    _kill(sq, 0x2223)
+    w_spare = sq["story"]["end"]
+    sq = _sq(_row("spare", "wanzer*2 wanzer~=Keep"))
+    _kill(sq, 0x2224)
+    _o["spare"] = (w_spare and w_spare[1] is True and sq["story"]["end"]
+                   and sq["story"]["end"][1] is False)
+    # count: 4 on the field, a new one per kill, the 6th kill wins
+    sq = _sq(_row("count:6:4", "wanzer*6"))
+    _c0 = len(sq["ids"])
+    _sp = []
+    for _k in range(6):
+        alive = [u for u in sq["ids"] if u not in sq["dead"]]
+        _sp.append(_kill(sq, alive[0]))
+    _o["count"] = (_c0 == 4 and len(sq["ids"]) == 6 and _sp[0] == [4] and _sp[1] == [5]
+                   and sq["story"]["end"][1] is True)
+    # order: call signs 11.., out of order loses
+    sq = _sq(_row("order", "wanzer*3"))
+    _names = dict(sq["names"])
+    _kill(sq, 0x2222)
+    e_ok = sq["story"]["end"]
+    _kill(sq, 0x2224)
+    _o["order"] = (_names == {0: "11", 1: "12", 2: "13"} and e_ok is None
+                   and sq["story"]["end"][1] is False)
+    # survive + protected ally: the time limit with the ally alive wins; the ally
+    # down loses; the ally POP is on the pilot's side with the target flag
+    sq = _sq(_row("survive", "wanzer*2", "heli!@200=Escortee", tl=300, timeout="win", bk=2))
+    _au = sq["allies"][0]
+    _ap = storybattle.ally_pop(sq, _au, 0x1001, 1, 0, 101)[fmoworld.REC_HDR:]
+    _st = {"squad": sq, "granted_at": 1000.0}
+    v_early = storybattle.verdict(_st, 1200.0)
+    v_late = storybattle.verdict(_st, 1300.0)
+    sq2 = _sq(_row("survive", "wanzer*2", "heli!@200=Escortee", tl=300, timeout="win", bk=2))
+    sq2.setdefault("ally_dead", set()).add(sq2["allies"][0])
+    storybattle.on_death(sq2, sq2["allies"][0])
+    _o["survive"] = (v_early is None and v_late and v_late[1] is True
+                     and sq2["story"]["end"] and sq2["story"]["end"][1] is False
+                     and _ap[fmoworld.POP_SIDE] == 1
+                     and _ap[storybattle.POP_OBJECTIVE_UNIT] == 1
+                     and _ap[fmoworld.POP_HP_SCALE] == squad.enemy_hp_scale(200)
+                     and sq["ally_info"][_au]["protected"] is True)
+    # a 'loss' time limit
+    sq = _sq(_row("annihilate", "heli_heavy!=H heli*2", tl=600, bk=1))
+    v = storybattle.verdict({"squad": sq, "granted_at": 0.0, "started_at": 100.0}, 650.0)
+    v2 = storybattle.verdict({"squad": sq, "granted_at": 0.0, "started_at": 100.0}, 700.0)
+    _o["time"] = v is None and v2 and v2[1] is False
+    # the end trigger takes the story verdict like the solo area's
+    _o["trigger"] = referee.battle_end_trigger(
+        {"squad": sq, "granted_at": 0.0}, ["limit"], 800.0, 1800) == v2
+    _k_ok = all(_o.values())
+    print(f"  story objectives: annihilate (waves), target (+0x116 flag, name), spare, "
+          f"count, order (call signs 11..), survive (protected ally, timeout win), the "
+          f"story time limit, the end trigger {_o}: {'OK' if _k_ok else 'FAIL'}")
+    ok &= _k_ok
+
+    # --- (6) only the leader's mission advances
+    _r_ok = bool(fmostore) and bool(progress.MISSION_TILES.get(130))
+    if _r_ok:
+        _t130 = sorted(progress.MISSION_TILES[130])[0]
+        _roles = (storybattle.sortie_role("a", 1, {}, {}, lambda g: None),
+                  storybattle.sortie_role("a", 5, {"a": 9}, {9: {"map": 5, "by": "b"}},
+                                          lambda g: "b")[0],
+                  storybattle.sortie_role("b", 5, {"b": 9}, {}, lambda g: "b"),
+                  storybattle.sortie_role("c", 7, {"c": 9}, {}, lambda g: "b"))
+        _r_ok = _roles == (("solo", None), "follower", ("leader", 9), ("member", 9))
+        _ch = {"nation_byte": 1, "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+        progress.set_pilot_level(_ch, 6)
+        _rm, _whym = storybattle.sortie_story_battle(_ch, _t130, "member")
+        _rl, _whyl = storybattle.sortie_story_battle(_ch, _t130, "solo")
+        _r_ok &= _rm is None and "leader" in _whym and (_rl is None or _rl["byte"] == 130)
+
+        def _sess(peer, char, leader):
+            s = session.Session.__new__(session.Session)
+            s.peer, s.ip = peer, peer
+            s.battle_settlement = None
+            s.last_0159 = b""
+            s.playing_char = lambda _c=char: _c
+            s.stored_money = lambda: (0, 0)
+            s.credit_money = lambda why, money=0, contribution=0: (money, contribution)
+            s.credit_class_exp = lambda why, rows: {}
+            s.owe_kill_bonus = lambda hs, n: None
+            s.commit = lambda what: None
+            s.sortie_story = {"tile": _t130, "zone": 100, "at": 0, "settled": False,
+                              "leader": leader}
+            return s
+        _store_was, _rp_was = charstore.CHAR_STORE, resultpush.RESULT_PUSH
+        try:
+            charstore.CHAR_STORE = charstore.CHAR_STORE or "selftest-not-written"
+            resultpush.RESULT_PUSH = False
+            _lead = {"nation_byte": 1, "money": 0, "contribution": 0,
+                     "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+            _mem = {"nation_byte": 1, "money": 0, "contribution": 0,
+                    "flags": fmostore.flags_hex(byte_values={128: 99, 130: 2})}
+            progress.set_pilot_level(_lead, 6)
+            progress.set_pilot_level(_mem, 6)
+            _sl = _sess("selftest-r2-lead", _lead, True)
+            _sm = _sess("selftest-r2-member", _mem, False)
+            _sl.battle_end_push(0x1234, why="selftest leader", won=True)
+            _sm.battle_end_push(0x1234, why="selftest member", won=True)
+            _r_ok &= (fmostore.flags_bytes(_lead["flags"])[130] == 3
+                      and fmostore.flags_bytes(_mem["flags"])[130] == 2
+                      and _sm.battle_settlement is not None
+                      and _sm.battle_settlement["won"] is True)
+        finally:
+            charstore.CHAR_STORE, resultpush.RESULT_PUSH = _store_was, _rp_was
+    print(f"  story leader only: a group member's WON battle pays it but leaves its "
+          f"accepted mission at 2; the leader's moves to 3 (SE BOOT CAMP Lesson 5): "
+          f"{'OK' if _r_ok else 'FAIL'}")
+    ok &= _r_ok
+
+    # --- (6b) the verdict needs an ACCEPTED mission (FMO_PROGRESS_NEED_ACCEPT)
+    _a_ok = bool(fmostore) and bool(progress.MISSION_TILES.get(130))
+    if _a_ok:
+        _t130 = sorted(progress.MISSION_TILES[130])[0]
+        _c0 = {"nation_byte": 1, "flags": fmostore.flags_hex(byte_values={128: 99})}
+        progress.set_pilot_level(_c0, 6)
+        _m0, _w0, _r0 = progress.advance_progress(_c0, tile=_t130, won=True)
+        _mn, _wn, _rn = progress.advance_progress(dict(_c0), tile=None, won=True)
+        _c1 = {"nation_byte": 1, "flags": fmostore.flags_hex(byte_values={128: 99, 130: 1})}
+        progress.set_pilot_level(_c1, 6)
+        _m1, _w1, _r1 = progress.advance_progress(_c1, tile=_t130, won=True)
+        _a_ok = (progress.PROGRESS_NEED_ACCEPT and _m0 is None and "ACCEPTED" in _w0
+                 and fmostore.flags_bytes(_c0["flags"])[130] == 0 and _mn is None
+                 and _m1 is not None and fmostore.flags_bytes(_c1["flags"])[130] == 3)
+    print(f"  story accept first: a won battle on Ctrl.01 S12 with byte 130 = 0 (never "
+          f"offered) moves nothing, nor does one with no tile; accepted (1) it clears to "
+          f"3: {'OK' if _a_ok else 'FAIL'}")
+    ok &= _a_ok
+
+    # --- (7) the table and the block's time limit
+    _t_ok = True
+    if storybattle.BATTLES:
+        _kinds = {r["objective"][0] for r in storybattle.BATTLES.values()}
+        _t_ok = (len(storybattle.BATTLES) == 50
+                 and _kinds == {"annihilate", "target", "spare", "count", "order", "survive"}
+                 and storybattle.battle_for(1, 139)["time_limit"] == 600
+                 and storybattle.battle_for(2, 183)["waves"][0][0]["name"] == "Griffin"
+                 and all(storybattle.first_on_field(r) <= storybattle.MAX_ON_FIELD
+                         for r in storybattle.BATTLES.values()))
+    _mf = dict((l, raw) for l, _o2, raw, _s2 in missionblock.mission_fields(seconds=600))
+    _t_ok &= _mf.get("TimeLimit") == struct.pack("<I", 600)
+    print(f"  story table: {len(storybattle.BATTLES)} rows (50 with the client's "
+          f"data), every objective kind present, the helicopter's 600 s limit, U.S.N. "
+          f"183 is the Griffin; a story time limit reaches block+0x4C: "
+          f"{'OK' if _t_ok else 'FAIL'}")
+    ok &= _t_ok
+    return ok
+from . import pvproom, storybattle, wirelog  # noqa: E402  (the story pins, the housekeeping pins)
+
+
+def _housekeeping_pins():
+    """fmo.log is kept open and rotated at the cap (wirelog), the per-payload
+    hexdump is off unless FMO_WIRE_HEXDUMP says so, and sweep_peers forgets a
+    channel silent past every reader's limit while keeping a live one."""
+    import tempfile
+    ok = True
+    _was = (wirelog.LOG_DIR, wirelog._LOG_MAX, wirelog._LOG_KEEP, wirelog._LOG_FILE)
+    _dir = tempfile.mkdtemp(prefix="fmo-wirelog-")
+    try:
+        wirelog.LOG_DIR, wirelog._LOG_MAX, wirelog._LOG_KEEP, wirelog._LOG_FILE = _dir, 2048, 2, None
+        for _i in range(60):
+            wirelog.log("rotation pin line %03d %s" % (_i, "x" * 80))
+        _names = sorted(n for n in os.listdir(_dir) if n.startswith("fmo.log"))
+        _sizes = {n: os.path.getsize(os.path.join(_dir, n)) for n in _names}
+        _r1 = ("fmo.log" in _names and "fmo.log.1" in _names and "fmo.log.3" not in _names
+               and all(v <= 2048 + 200 for v in _sizes.values())
+               and wirelog._LOG_FILE is not None and not wirelog._LOG_FILE.closed)
+        print(f"  wirelog: 60 lines at a 2 KiB cap -> {_names} sizes {_sizes}, handle kept open: "
+              f"{'OK' if _r1 else 'FAIL'}")
+        ok &= _r1
+    finally:
+        if wirelog._LOG_FILE is not None:
+            wirelog._LOG_FILE.close()
+        wirelog.LOG_DIR, wirelog._LOG_MAX, wirelog._LOG_KEEP, wirelog._LOG_FILE = _was
+    _r2 = (not os.environ.get("FMO_WIRE_HEXDUMP")) == (not wirelog.WIRE_HEXDUMP)
+    print(f"  wirelog: FMO_WIRE_HEXDUMP={os.environ.get('FMO_WIRE_HEXDUMP', '')!r} -> "
+          f"hexdump {'on' if wirelog.WIRE_HEXDUMP else 'off'}: {'OK' if _r2 else 'FAIL'}")
+    ok &= _r2
+
+    class _Ch:
+        def __init__(self, seen):
+            self.seen_at = seen
+    _now = time.time()
+    _peers = {("192.0.2.1", 1): _Ch(_now - 5),
+              ("192.0.2.2", 2): _Ch(_now - room.ROOM_TTL - 10),
+              ("192.0.2.3", 3, "group"): _Ch(_now - groupchannel.GROUP_LIVE_S - 10),
+              ("192.0.2.4", 4): object()}
+    _sweep_was = datagram._PEER_SWEEP_AT[0]
+    try:
+        datagram._PEER_SWEEP_AT[0] = 0.0
+        _gone = datagram.sweep_peers(_peers, now=_now)
+        _r3 = (("192.0.2.3", 3, "group") not in _peers and ("192.0.2.1", 1) in _peers
+               and ("192.0.2.4", 4) in _peers
+               and (("192.0.2.2", 2) in _peers) == (
+                   room.ROOM_TTL + 10 <= max(room.ROOM_TTL, groupchannel.GROUP_LIVE_S))
+               and datagram.sweep_peers(_peers, now=_now + 1) == 0)
+        print(f"  peer sweep: {_gone} forgotten, the live and undated ones kept, the next "
+              f"call within ROOM_TTL does nothing: {'OK' if _r3 else 'FAIL'}")
+        ok &= _r3
+    finally:
+        datagram._PEER_SWEEP_AT[0] = _sweep_was
+    return ok

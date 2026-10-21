@@ -59,8 +59,9 @@ def _row(key, cat, pos, face, label=None):
 
 
 def _sergeant():
-    # prod's layout 'room' band, 2026-10-06: Viduka, face 0
-    return _row(SERGEANT_KEY, 102, (-0.46, 0.0, 13.69), 0.0, "Training.Sergeant")
+    # beside the room's two consoles, facing into the room: measured in an
+    # FZ-10 room
+    return _row(SERGEANT_KEY, 102, (-6.34, 0.0, -18.29), 0.0, "Training.Sergeant")
 
 
 #: band id (fmolayout.ROOM_ZONE_BANDS) -> the default rows, in the layout

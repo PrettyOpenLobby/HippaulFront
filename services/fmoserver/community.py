@@ -388,13 +388,16 @@ def pilot_search_rows(q, pilots=None, now=None):
     want_nat = q.nation if (q.flags & fmomsn.PSF_NATION and q.nation in (1, 2)) else None
     f1 = (q.first or "").strip().lower() if q.flags & fmomsn.PSF_FIRST else ""
     f2 = (q.last or "").strip().lower() if q.flags & fmomsn.PSF_LAST else ""
-    rows, seen, unzoned = [], set(), 0
+    rows, seen, unzoned, hidden = [], set(), 0, 0
     for s in pilots:
         try:
             c = s.playing_char()
         except Exception:
             c = None
         if not c or not (c.get("first") or c.get("last")):
+            continue
+        if pilot_anon(s):
+            hidden += 1                     # /anon on: not listed (MSG_ANON_SET)
             continue
         first, last = (c.get("first") or "").strip(), (c.get("last") or "").strip()
         key = (first.lower(), last.lower())
@@ -424,6 +427,7 @@ def pilot_search_rows(q, pilots=None, now=None):
     cap = max(0, PILOT_SEARCH_MAX)
     note = (f"{total} pilot(s) match"
             + (f" ({unzoned} with no known zone kept)" if unzoned else "")
+            + (f" ({hidden} with /anon on hidden)" if hidden else "")
             + (f", {cap} served, the window adds '...over {total - cap} found'"
                if total > cap else ""))
     return [r for _k, r in rows[:cap]], total, note
@@ -445,6 +449,63 @@ def pilot_search_reply(peer, op, body, dialect="pc"):
         f"search WITHOUT the END arm that killed a client on 09-06 (kind 0 has "
         f"no job, END reads [NULL+0x34C]). FMO_PILOT_SEARCH=0 restores the silence.")
     return out
+
+
+#: KEY: /anon on | off (static; the message arrives as 0x0187, bodies 01 then
+#: 00, and once fell to "no handler"). The chat command
+#: table entry 0xA4 ("anon", 0x611E1428) runs 0x611DE730: the argument is
+#: compared with "on" (0x61343C5C) and "off" (0x61343C58), no argument
+#: toggles; the state goes to [cmd+0x2C], 14:42 "Anon set to %s." is printed,
+#: and 0x0187 (4 B, builder 3 at 0x611DE7F9, body+0x00 u8 = the state) is
+#: sent on the queue sequence with NO poll (the sender returns 1 at once).
+#: The server answers nothing and REMEMBERS: at login the 0x014A status block's
+#: +0x2C (lobby+0x8B8) is tested at 0x6117B37A and 8:49 "Anon is set to on."
+#: is printed when set (status.S14A_ANON), so the flag lives on the character
+#: record (`anon`), as SE's did. What anon hides: the client holds no reader
+#: of its own flag beyond those two prints, so the hiding is server-side; the
+#: only server listing of online pilots is the war map's pilot search (kind 0,
+#: pilot_search_rows), where an anon pilot is left out. OURS: a Tell by exact
+#: name still reaches an anon pilot (trade.tell_target), as it does in SE's
+#: other title with /anon; the Player Information list of a battle map
+#: (0x0161) shows fighters whatever their flag.
+MSG_ANON_SET = 0x0187
+ANON_KEY = "anon"
+
+
+def pilot_anon(s):
+    """True when session `s`'s pilot has /anon on: the character record's
+    `anon` (persisted), else the session's own flag (set this session)."""
+    try:
+        c = s.playing_char()
+    except Exception:
+        c = None
+    if c and c.get(ANON_KEY) is not None:
+        return bool(int(c.get(ANON_KEY) or 0))
+    return bool(getattr(s, "anon", 0))
+
+
+def on_anon_set(session, p):
+    """0x0187 from the /anon command: store the flag on the session and on
+    the playing character (commit), log it; no reply is owed."""
+    body = p["payload"]
+    val = 1 if (len(body) >= 1 and body[0]) else 0
+    session.anon = val
+    stored = ""
+    try:
+        c = session.playing_char()
+    except Exception:
+        c = None
+    if c is not None and charstore.CHAR_STORE:
+        if int(c.get(ANON_KEY) or 0) != val:
+            c[ANON_KEY] = val
+            session.commit(f"/anon {'on' if val else 'off'}")
+        stored = f"; stored on {c.get('first', '')}.{c.get('last', '')}"
+    log(f"{session.peer}   0x{MSG_ANON_SET:04X} = /ANON {'ON' if val else 'OFF'} "
+        f"(0x611DE730, body {body[:4].hex(' ')}): hidden from the war map's pilot "
+        f"search{stored}; the next login's 0x014A +0x2C "
+        f"{'prints 8:49 Anon is set to on' if val else 'is 0'}. No reply (the sender "
+        f"does not poll)")
+    return []
 
 
 #: FMO_MSN_PS2: answer the 2005 PS2 build's community connection (op 1 HELLO
@@ -721,4 +782,4 @@ def msn_reply_ps2(peer, op, body):
 # Called at run time only; imported last so that import cycles resolve.
 from . import battlegroups, groupchannel, sectorwins, warstate, zoneentry  # noqa: E402
 from . import missionboard, missionbook  # noqa: E402  (orders)
-from . import charlist, rooms, trade  # noqa: E402  (the pilot search)
+from . import charlist, charstore, rooms, trade  # noqa: E402  (the pilot search, /anon)

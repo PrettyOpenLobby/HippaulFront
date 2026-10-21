@@ -93,30 +93,36 @@ The core builds the profile the Viewer shows for a Front Mission Online Content 
 data only this title holds, so a small plugin runs inside the core's `login`
 and `authsess` processes (OpenLobby's `services/titles.py`, `POL_TITLES`).
 `Dockerfile.title` layers it on the core image and `docker-compose.title.yml`
-swaps that image into those two services. From this directory, with the core
-checked out beside it:
+swaps that image into those two services. The bring-up below includes it.
+To rebuild only those two, from this directory:
 
 ```
-docker compose --project-directory ../openlobby     -f ../openlobby/docker-compose.yml -f docker-compose.title.yml     up -d --build login authsess
+docker compose --project-directory ../openlobby \
+    -f ../openlobby/docker-compose.yml -f docker-compose.title.yml \
+    up -d --build login authsess
 ```
 
-Without it the game plays the same; only the Viewer's profile screen for a Front Mission Content ID stays empty. The plugin reads the pilots from the core's PostgreSQL database, which `login` and `authsess` are already connected to. To run several titles, build each title image on the previous
-one (`OPENLOBBY_IMAGE`) and list them all in `POL_TITLES` in OpenLobby's
-`.env`, for example `POL_TITLES=tmtitle,fmotitle`.
+Without it the game plays the same; only the Viewer's profile screen for a
+Front Mission Content ID stays empty. The plugin reads the pilots from the
+core's PostgreSQL database, which `login` and `authsess` are already
+connected to. With other games enabled, run
+`python ../openlobby/tools/stack.py compose up -d --build` instead: it builds
+each title image on the previous one and lists every plugin in `POL_TITLES`.
 
 ## Prerequisites
 
 - This repository checked out as `hippaulfront`, which is where the compose files
   look for it (`git clone https://github.com/PrettyOpenLobby/HippaulFront.git hippaulfront`).
   A checkout from before the rename, still named `crystalfront`, needs renaming.
-- The core lobby stack (OpenLobby) checked out beside this repository, with
-  its image built (`openlobby:latest`), because this service's image is built
-  on top of it
+- The core lobby stack (OpenLobby) checked out beside this repository as
+  `openlobby`; this service's image is built on top of the core's
 - A Front Mission Online client install of your own
 - Docker with Compose v2, and Python 3.10+ on the host for the two
   generation steps
 
 ## Bring-up
+
+From this directory:
 
 ```
 # 1. cipher tables, computed from public constants (no client needed):
@@ -125,25 +131,52 @@ python tools/gen_blowfish_tables.py
 # 2. game tables, extracted from YOUR client install:
 python tools/fmodata_build.py --client "C:\path\to\FRONT MISSION ONLINE"
 
-# 3. the service, in the core's compose project:
-cp .env.example .env      # set POL_ADVERTISE to your server's LAN/VPN IP
-docker compose --project-directory ../openlobby \
-    --env-file ../openlobby/.env --env-file .env \
-    -f ../openlobby/docker-compose.yml -f docker-compose.yml \
-    up -d --build fmo
+# 3. the service, with the core and any other game you have enabled:
+python ../openlobby/tools/stack.py enable fmo
+python ../openlobby/tools/stack.py compose up -d --build
 ```
+
+Step 3 builds the core image, builds this repository's image on it, starts
+`fmo`, and swaps the title plugin (above) into the core's `login` and
+`authsess`. `stack.py` is OpenLobby's launcher for the core and its games
+(OpenLobby's docs/games.md): it remembers which games you enabled, runs
+them in the core's compose project, and when several games plug into
+`login` it builds their images one on another and lists them all in
+`POL_TITLES`. `python ../openlobby/tools/stack.py check` says whether steps
+1 and 2 have been run.
+
+The address handed to clients is `POL_ADVERTISE` in OpenLobby's `.env`. The
+`FMO_*` knobs go in this directory's `.env` (copy `.env.example`), which
+stack.py passes after OpenLobby's, so OpenLobby's `POL_DB_PASSWORD` reaches
+the connection string.
+
+### By hand
 
 `docker-compose.yml` is an override of OpenLobby's compose file, the way
 `docker-compose.title.yml` is: the service joins the core's network and
-starts after its PostgreSQL and Valkey. OpenLobby's `.env` comes first so
-its `POL_DB_PASSWORD` reaches the connection string; this repository's
-`.env` carries the `FMO_*` knobs.
+starts after its PostgreSQL and Valkey. The command stack.py runs for Front
+Mission Online alone, from this directory:
 
-Without building: the image is published to
-`ghcr.io/prettyopenlobby/hippaulfront` on every push (it carries the cipher
-tables, so step 1 is not needed); step 2 still runs on the host, and the
-override mounts your `services/fmodata/` (and the baked board art) into the
-containers:
+```
+docker compose --project-directory ../openlobby \
+    --env-file ../openlobby/.env --env-file .env \
+    -f ../openlobby/docker-compose.yml \
+    -f docker-compose.yml -f docker-compose.title.yml up -d --build
+```
+
+Compose refuses an `--env-file` that does not exist, so leave out the one
+you have not created. Build the core first (`docker compose build` in
+`../openlobby`), since this image is built on `openlobby:latest`.
+
+### Without building
+
+The image is published to `ghcr.io/prettyopenlobby/hippaulfront` on every
+push (it carries the cipher tables, so step 1 is not needed); step 2 still
+runs on the host, and the override mounts your `services/fmodata/` (and the
+baked board art) into the containers.
+`python ../openlobby/tools/stack.py compose --ghcr up -d` uses it; the title
+plugin's small image is still built locally, on the published core. By hand,
+the service alone:
 
 ```
 docker compose --project-directory ../openlobby \
@@ -210,8 +243,9 @@ marks it draws come from step 2.
 
 ## The City Control board (optional)
 
-Add `--profile board` to the compose command above and name `board`
-(`... up -d board`). It serves the war (the nineteen cities, who holds each,
+`python ../openlobby/tools/stack.py compose --profile board up -d` adds the
+`fmoboard` service (by hand: `--profile board` on the compose command above,
+and `... up -d fmoboard`). It serves the war (the nineteen cities, who holds each,
 the phase score and clock) as a web page on port 8792, read-only over the
 war state in the database, and can post
 it to Discord through a webhook or as a bot (`.env`; a bot needs no webhook

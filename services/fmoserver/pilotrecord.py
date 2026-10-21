@@ -18,7 +18,11 @@ class SessionPilotRecord:
             return None
         cur = classes.class_exp_of(char)
         for kind, amount in rows:
-            cur[int(kind)] = cur.get(int(kind), 0) + int(amount)
+            # the level cap (classes.PILOT_LEVEL_CAP): never past the cap
+            # level's threshold, whatever the caller sent
+            top = classes.exp_cap(int(kind))
+            new = cur.get(int(kind), 0) + int(amount)
+            cur[int(kind)] = new if top is None else min(new, top)
         char["class_exp"] = {str(k): v for k, v in sorted(cur.items())}
         try:
             self.commit(f"{why}: class exp "
