@@ -1,6 +1,9 @@
 """The lobby NPC editor hook (FMO_DEVTOOL_PORT)."""
 import os
-from .deps import fedevtool, fmodevtool, fmolayout
+import time
+
+import fmoarena
+from .deps import fedevtool, fmodevtool, fmolayout, fmowar
 from .knobs import _env_int
 from .wirelog import log
 from . import wirelog
@@ -52,6 +55,38 @@ def devtool_ctx():
             "face_sign": npccast.FACE_SIGN, "walked": WALKED}
 
 
+#: the widest range one calendar.json request may ask for, in seconds
+CALENDAR_SPAN = 400 * 86400
+
+
+def calendar(query, actor=None):
+    """GET calendar.json?from=&to= (unix seconds) -> (status, body): what FMO
+    has scheduled in [from, to) for the admin panel's Calendar. The war's
+    phases and ceasefires on this war's own clock (the stored phase 1 start,
+    fmowar.calendar), and the Coliseum's (fmoarena.calendar: the Clash of
+    Iron seasons, the Saturday Heavy Mobile Weapon Orders, the hosted
+    arenas). Reads only: it never creates the process's War or Coliseum."""
+    try:
+        lo, hi = int(query["from"][0]), int(query["to"][0])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 400, {"ok": False, "msg": "calendar.json needs from= and to=, in unix seconds."}
+    if hi <= lo or hi - lo > CALENDAR_SPAN:
+        return 400, {"ok": False, "msg": "Ask for a range of up to %d days." % (CALENDAR_SPAN // 86400)}
+    events = []
+    if fmowar is not None and warstate.WAR != "0":
+        st = warstate._WAR_STATE
+        phase1 = st.phase1() if st is not None else fmowar.War(autosave=False).phase1()
+        events += fmowar.calendar(lo, hi, phase1)
+    if coliseum.COLISEUM:
+        col = coliseum._COLISEUM
+        if col is None:
+            col = coliseum.Coliseum()
+        hosted = coliseumtool._copy(lambda: [dict(a) for a in col.hosted.values()])
+        events += fmoarena.calendar(lo, hi, hosted=hosted)
+    events.sort(key=lambda e: (e["start"], e["end"], e["id"]))
+    return 200, {"ok": True, "from": lo, "to": hi, "now": int(time.time()), "events": events}
+
+
 #: the walked-ground overlay's source: this server's own fmo.log, read
 #: incrementally (fmolayout.WalkedGround) once the editor is up
 WALKED = None
@@ -79,7 +114,8 @@ def devtool_start():
                 devtool_ctx(), band, want_plan=bool(qs and qs.get("plan"))),
             lambda op: fmodevtool.apply_edit(devtool_ctx(), op),
             page=fmodevtool.PAGE, name="fmo-devtool",
-            routes={**gatetool.routes(), **coliseumtool.routes(), **wartool.routes()})
+            routes={**gatetool.routes(), **coliseumtool.routes(), **wartool.routes(),
+                    ("GET", "/calendar.json"): calendar})
     except SystemExit as e:
         log(f"WARNING: lobby NPC editor REFUSED to start: {e} -- the world door "
             f"serves without it")
@@ -104,6 +140,6 @@ def devtool_start():
 
 # Called at run time only; imported last so that import cycles resolve.
 from . import (  # noqa: E402
-    areachange, coliseumtool, gatetool, groupchannel, move, npccast, npcroster, popsweep, roomcast, rooms, wartool,
-    zoneentry,
+    areachange, coliseum, coliseumtool, gatetool, groupchannel, move, npccast, npcroster, popsweep, roomcast, rooms, warstate,
+    wartool, zoneentry,
 )

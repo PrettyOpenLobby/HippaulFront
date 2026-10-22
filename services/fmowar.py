@@ -307,6 +307,30 @@ def phase_at(now=None, first=None):
         y, m, start, n = jy, jm, nxt, n + 1
 
 
+def calendar(lo, hi, first=None):
+    """The war's phases and ceasefires that touch [lo, hi), as the admin
+    panel's calendar entries ({"id", "title", "start", "end", "kind",
+    "about"}, unix seconds). The same clock as phase_at(). Pure."""
+    y, m, d = (int(x) for x in (first or PHASE1_START).split("-")[:3])
+    start, n, out = _ts(y, m, d), 1, []
+    while start < hi:
+        jy, jm = _add_months(y, m, 2)
+        judge, nxt = _ts(jy, jm, 1, 12), _ts(jy, jm, 5)
+        if judge > lo:
+            out.append({"id": "phase-%d" % n, "title": "War phase %d" % n,
+                        "start": start, "end": judge, "kind": "war phase",
+                        "about": "Sorties move city control. The phase is judged "
+                                 "at 12:00 UTC on the day it ends: the side holding "
+                                 "more economic-city ranks wins it."})
+        if nxt > lo and judge < hi:
+            out.append({"id": "ceasefire-%d" % n, "title": "Ceasefire after phase %d" % n,
+                        "start": judge, "end": nxt, "kind": "ceasefire",
+                        "about": "Battles count for nothing until phase %d starts "
+                                 "with a fresh frontline." % (n + 1)})
+        y, m, start, n = jy, jm, nxt, n + 1
+    return out
+
+
 def _parse_date(s):
     """'YYYY-MM-DD' -> the same string, or ValueError."""
     datetime.date(*(int(x) for x in str(s).split("-")[:3]))
@@ -917,6 +941,22 @@ def selftest():
           phase_at(_ts(2026, 11, 5), "2026-09-05")[0] == 2
           and phase_at(_ts(2027, 1, 5), "2026-09-05")[0] == 3
           and phase_at(_ts(2027, 1, 5), "2026-09-05")[2] == _ts(2027, 3, 1, 12))
+    cal = calendar(_ts(2026, 10, 1), _ts(2026, 12, 1), "2026-09-05")
+    check("the calendar in Oct-Nov 2026: phase 1, its ceasefire, phase 2",
+          [(e["id"], e["start"], e["end"], e["kind"]) for e in cal]
+          == [("phase-1", t0, _ts(2026, 11, 1, 12), "war phase"),
+              ("ceasefire-1", _ts(2026, 11, 1, 12), _ts(2026, 11, 5), "ceasefire"),
+              ("phase-2", _ts(2026, 11, 5), _ts(2027, 1, 1, 12), "war phase")])
+    check("the calendar agrees with phase_at at every entry's edges",
+          all(phase_at(e["start"], "2026-09-05")[4] == (e["kind"] == "ceasefire")
+              and phase_at(e["end"] - 1, "2026-09-05")[4] == (e["kind"] == "ceasefire")
+              for e in cal))
+    check("the calendar returns only entries touching the range",
+          [e["id"] for e in calendar(_ts(2026, 11, 2), _ts(2026, 11, 3), "2026-09-05")]
+          == ["ceasefire-1"]
+          and calendar(t0 - 86400, t0, "2026-09-05") == []
+          and [e["id"] for e in calendar(_ts(2027, 1, 1, 12), _ts(2027, 1, 2), "2026-09-05")]
+          == ["ceasefire-2"])
 
     # control model, in memory
     w = War(autosave=False, load=False)

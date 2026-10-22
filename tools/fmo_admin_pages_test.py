@@ -11,7 +11,9 @@ SKIP without Docker or POL_TEST_DATABASE_URL, POL_TEST_REQUIRE_DB=1 makes
 that a failure). Pins: the token gate on every new path; each page renders
 and the old ones (/, /gates) still do; coliseum.json returns the stored
 document the Coliseum wrote and the live registrations and matches, and
-looking writes nothing and does not create the process's Coliseum; war.json
+looking writes nothing and does not create the process's Coliseum; calendar.json
+lists the hosted arenas, the Clash of Iron seasons, the Saturday Heavy Mobile
+Weapon Orders and the war's phases on the stored war's clock; war.json
 is the City Control board's own reading plus the judged phases, the due
 list and every sector; war/tick does exactly what War.tick does on a copy
 of the same state, is logged with the panel's actor, and refuses once
@@ -120,10 +122,12 @@ def _main():
     check("devtool_start brings the tool port up with the new routes",
           srv is not None and {("GET", "/coliseum"), ("GET", "/coliseum.json"), ("GET", "/war"),
                                ("GET", "/war.json"), ("POST", "/war/tick"),
-                               ("GET", "/gates")} <= set(srv.devtool_routes))
+                               ("GET", "/calendar.json"), ("GET", "/gates")}
+          <= set(srv.devtool_routes))
     try:
         print("the token gate")
-        for p in ("/coliseum", "/coliseum.json", "/war", "/war.json?sectors=1"):
+        for p in ("/coliseum", "/coliseum.json", "/war", "/war.json?sectors=1",
+                  "/calendar.json?from=0&to=86400"):
             check("%s with no token is 403" % p, call(p, token=None)[0] == 403)
             check("%s with a wrong token is 403" % p, call(p, token="mira")[0] == 403)
         check("POST /war/tick with no token is 403, and runs nothing",
@@ -173,6 +177,39 @@ def _main():
               and recs[1001]["name"] == "")
         check("looking does not create the process's Coliseum, nor write the document",
               coliseum._COLISEUM is None and fmoarena.read_state() == doc)
+
+        print("calendar.json, for the admin panel's Calendar")
+        lo, hi = int(now) - 86400, int(now) + 90 * 86400
+        st, cal = js("/calendar.json?from=%d&to=%d" % (lo, hi))
+        ev = {e["id"]: e for e in cal.get("events") or []}
+        h = ev.get("arena-1003-%d" % (int(now) + 600)) or {}
+        check("the hosted tournament, from its first battle to its close",
+              st == 200 and h.get("title") == "Marigold Cup" and h.get("kind") == "tournament"
+              and (h.get("start"), h.get("end")) == (int(now) + 600, int(now) + 7800)
+              and "Lex.Arden" in h.get("about", ""), h)
+        want = fmowar.calendar(lo, hi, fmowar.PHASE1_START)
+        check("the war's phases and ceasefires on its clock, every one touching the range",
+              want and [ev.get(e["id"]) for e in want] == want
+              and all(e["end"] > lo and e["start"] < hi for e in cal["events"]), want)
+        coi = [e for e in fmoarena.calendar(lo, hi) if e["id"].startswith("coi-")]
+        check("each Clash of Iron season in range: its nights and final as the sessions",
+              (coi or not fmoarena.COI_SEASONS) and [ev.get(e["id"]) for e in coi] == coi
+              and all(e["times"] and e["start"] == e["times"][0][0] and e["end"] == e["times"][-1][1]
+                      for e in coi), coi)
+        heavy = [e for e in cal["events"] if e["kind"] == "arena rule"]
+        check("Heavy Mobile Weapon Orders every Saturday, 16:00 to 24:00 JST",
+              len(heavy) >= 12 and all(e["end"] - e["start"] == 8 * 3600
+                                       and time.gmtime(e["start"] + 9 * 3600)[3:7] == (16, 0, 0, 5)
+                                       for e in heavy), heavy[:2])
+        check("a range of one quiet hour has only what touches it",
+              all(e["end"] > lo and e["start"] < lo + 3600
+                  for e in js("/calendar.json?from=%d&to=%d" % (lo, lo + 3600))[1]["events"]))
+        for q in ("", "?from=10", "?from=x&to=20", "?from=20&to=10",
+                  "?from=0&to=%d" % (500 * 86400)):
+            check("calendar.json%s is refused (400)" % q, call("/calendar.json" + q)[0] == 400)
+        check("the calendar created neither the Coliseum nor the War, and wrote nothing",
+              coliseum._COLISEUM is None and warstate._WAR_STATE is None
+              and fmoarena.read_state() == doc)
 
         print("coliseum.json, live registrations and matches")
         col = coliseum.coliseum()
@@ -258,6 +295,13 @@ def _main():
         sectorwins.sector_win_record(505, 85102, fmowar.OCU, now=int(now) - 30)
         sectorwins.sector_win_record(513, 112101, fmowar.USN, now=int(now) - 10)
         stored = fmowar.read_state()
+        y, mo, dd = (int(x) for x in start.split("-"))
+        p1 = fmowar._ts(y, mo, dd)
+        st, cal = js("/calendar.json?from=%d&to=%d" % (p1 - 86400, p1 + 30 * 86400))
+        ph = [e for e in cal["events"] if e["kind"] == "war phase"]
+        check("calendar.json follows the restarted war's own clock: phase 1 from %s" % start,
+              st == 200 and ph and ph[0]["id"] == "phase-1" and ph[0]["start"] == p1
+              and ph[0]["end"] == fmowar.phase_at(p1, start)[2], ph[:1])
         board = boardfmo.snapshot(now=now)
         st, w = js("/war.json")
         check("the phase is the board's own (boardfmo.phase)",

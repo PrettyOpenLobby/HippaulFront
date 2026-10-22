@@ -291,6 +291,63 @@ def coi_final_arena(season):
     return v
 
 
+def calendar(lo, hi, seasons=None, official=None, hosted=()):
+    """What the Coliseum has on its calendar in [lo, hi), as the admin panel's
+    entries ({"id", "title", "start", "end", "kind", "about", "times"}, unix
+    seconds): each Clash of Iron season with its preliminary nights and its
+    final as the sessions inside it, the official 5 vs 5 arena's Saturday
+    Heavy Mobile Weapon Orders (SCHEDULE above, when that arena follows the
+    schedule), and the player-hosted arenas `hosted` (stored arena rows, from
+    the moment their battles start until they close). Pure."""
+    seasons = COI_SEASONS if seasons is None else seasons
+    official = OFFICIAL if official is None else official
+    out = []
+    for s in seasons:
+        times = [[int(a), int(b)] for _d, a, b in s.get("nights") or ()]
+        if s.get("final_at"):
+            times.append([int(s["final_at"]), int(s["final_at"]) + COI_FINAL_HOURS * 3600])
+        if not times:
+            continue
+        reg = (REGULATIONS.get(s.get("regulation")) or {}).get("title") or s.get("regulation")
+        about = ("%d preliminary nights in the official 1 vs 1 arena from %02d:00 JST under the "
+                 "%s regulation; each night's most wins goes to the final"
+                 % (len(s.get("nights") or ()), COI_HOUR_JST, reg))
+        about += (", where the %d qualifiers meet on %s." % (COI_FINAL_SIZE, s["final"])
+                  if s.get("final_at") else ".")
+        out.append({"id": "coi-%s" % s["name"], "title": "Clash of Iron %s: %s" % (s["name"], reg),
+                    "start": min(t[0] for t in times), "end": max(t[1] for t in times),
+                    "kind": "tournament", "about": about, "times": sorted(times)})
+    if any(a.get("schedule") and int(a.get("headcount") or 0) == 5 for a in official):
+        # Saturday 16:00-24:00 JST (official_rules), one entry a week
+        day = (int(lo) + SCHEDULE_UTC_OFFSET) // 86400 * 86400 - SCHEDULE_UTC_OFFSET
+        while day < hi:
+            if time.gmtime(day + SCHEDULE_UTC_OFFSET).tm_wday == 5:
+                start, end = day + 16 * 3600, day + 24 * 3600
+                if end > lo and start < hi:
+                    out.append({"id": "heavy-%d" % start, "title": "Heavy Mobile Weapon Orders",
+                                "start": start, "end": end, "kind": "arena rule",
+                                "about": "The official 5 vs 5 arena runs Heavy Mobile Weapon "
+                                         "Orders from 16:00 to 24:00 JST every Saturday."})
+            day += 86400
+    for a in hosted or ():
+        try:
+            start, end = int(a.get("start") or 0), int(a.get("end") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not start or end <= start:
+            continue
+        tour = int(a.get("format") or FORMAT_NORMAL) == FORMAT_TOURNAMENT
+        what = ("a tournament of %d BGs" % int(a.get("req_bgs") or 0) if tour
+                else "an arena")
+        out.append({"id": "arena-%s-%d" % (a.get("id"), start),
+                    "title": str(a.get("name") or "Arena")[:80],
+                    "start": start, "end": end, "kind": "tournament" if tour else "arena",
+                    "about": "%s hosted by %s, %d vs %d." % (
+                        what[:1].upper() + what[1:], a.get("promoter") or "a pilot",
+                        int(a.get("headcount") or 1), int(a.get("headcount") or 1))})
+    return [e for e in out if e["end"] > lo and e["start"] < hi]
+
+
 def parse_official(spec):
     """FMO_COLISEUM_OFFICIAL -> [arena dict]. Raises ValueError on a bad entry."""
     out = []
